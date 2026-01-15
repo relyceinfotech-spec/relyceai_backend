@@ -186,6 +186,9 @@ async def websocket_proxy(websocket: WebSocket):
         print(f"❌ WebSocket error: {e}")
 
 if __name__ == "__main__":
+    # Get port from environment (Render sets PORT automatically)
+    port = int(os.getenv("PORT", 8000))
+    
     print("\n" + "="*50)
     print("   RELYCE AI UNIFIED BACKEND")
     print("="*50)
@@ -193,7 +196,7 @@ if __name__ == "__main__":
     print("  POST /api/library/chat - Library document chat")
     print("  POST /api/chat/chat    - Generic/Business chat")
     print("  WS   /ws/chat          - WebSocket real-time chat")
-    print("\nStarting server on http://0.0.0.0:8000")
+    print(f"\nStarting server on http://0.0.0.0:{port}")
     print("="*50 + "\n")
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=port)
