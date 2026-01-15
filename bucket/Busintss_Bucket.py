@@ -10,8 +10,7 @@ print("DEBUG: 2. Loading configuration...")
 load_dotenv()
 
 if not os.getenv("OPENROUTER_API_KEY"):
-    print("Error: OPENROUTER_API_KEY not found in .env file.")
-    sys.exit()
+    print("Warning: OPENROUTER_API_KEY not found in .env file. RAG features may not work.")
 
 DOCS_DIR = "./documents" 
 DB_DIR = "./chroma_db"
@@ -36,8 +35,7 @@ from langchain_community.document_loaders import PDFPlumberLoader
 from docx import Document as DocxDocument
 from pptx import Presentation
 from openpyxl import load_workbook
-import xlrd
-import mammoth
+# xlrd and mammoth removed - not needed
 from bs4 import BeautifulSoup
 
 print("DEBUG: 4. Imports successful!")
@@ -97,8 +95,8 @@ def load_and_process_documents():
     
     if not os.path.exists(DOCS_DIR):
         os.makedirs(DOCS_DIR)
-        print(f"Created {DOCS_DIR}. Please put your files there and restart.")
-        sys.exit()
+        print(f"Created {DOCS_DIR}. No documents to load.")
+        return []  # Return empty list instead of crashing
 
     raw_documents = []
 
@@ -152,8 +150,8 @@ def load_and_process_documents():
                 print(f"  ! Skipped {filename}: {e}")
 
     if not raw_documents:
-        print("No documents successfully loaded. Please check your files.")
-        sys.exit()
+        print("No documents found. Returning empty list.")
+        return []  # Return empty list instead of crashing
 
     print(f"Successfully loaded {len(raw_documents)} documents. Splitting text...")
     

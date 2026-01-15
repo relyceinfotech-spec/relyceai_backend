@@ -69,8 +69,8 @@ def parse_excel(filepath):
 def load_documents():
     if not os.path.exists(DOCS_DIR):
         os.makedirs(DOCS_DIR)
-        print(f"[System] Created {DOCS_DIR}. Please add documents and restart.")
-        sys.exit()
+        print(f"[System] Created {DOCS_DIR}. No documents to load.")
+        return []  # Return empty list instead of crashing
 
     raw_docs = []
     print(f"[RAG] Scanning {DOCS_DIR}...")
