@@ -1,0 +1,18 @@
+# Environment variables
+.env
+
+# Firebase Admin SDK (SENSITIVE - never commit!)
+admin_sdk/
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Chroma database (can be rebuilt)
+chroma_db/
+
+# IDE
+.vscode/
+.idea/
