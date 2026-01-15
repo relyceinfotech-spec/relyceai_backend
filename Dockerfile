@@ -25,5 +25,5 @@ RUN mkdir -p chroma_db data
 ENV PORT=8000
 EXPOSE 8000
 
-# Use uvicorn directly (simpler than gunicorn)
-CMD uvicorn server:app --host 0.0.0.0 --port $PORT
+# MUST use shell form with sh -c to expand $PORT
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port $PORT"]
