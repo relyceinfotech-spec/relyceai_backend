@@ -1,6 +1,4 @@
 # Optimized Dockerfile for Railway - Python AI Backend
-# Uses slim base image and caching to reduce size
-
 FROM python:3.11-slim
 
 # Set working directory
@@ -14,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy only requirements first (for Docker layer caching)
 COPY requirements.txt .
 
-# Install Python dependencies with cache optimization
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
@@ -23,9 +21,9 @@ COPY . .
 # Create necessary directories
 RUN mkdir -p chroma_db data
 
-# Expose port (Railway sets PORT env var)
+# Railway sets PORT dynamically, default to 8000
 ENV PORT=8000
 EXPOSE 8000
 
-# No CMD - Railway provides start command via dashboard:
-# gunicorn server:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 180
+# Use uvicorn directly (simpler than gunicorn)
+CMD uvicorn server:app --host 0.0.0.0 --port $PORT
