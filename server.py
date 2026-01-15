@@ -1,24 +1,22 @@
 """
 Unified Backend Server - Mounts all API routes for Relyce AI
-- Library Chat API at /api/library
-- Chat API at /api/chat
-- WebSocket at /ws/chat
+CRITICAL: Minimal imports at top level for fast port binding on Render
 """
 import os
-import sys
 
-# CRITICAL: Create FastAPI app FIRST before any imports that might fail
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+# CRITICAL: Only import FastAPI essentials - nothing else at top level!
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# Create main app IMMEDIATELY so port binding happens even if imports fail
+# Create app IMMEDIATELY - this must happen before any heavy imports
 app = FastAPI(
     title="Relyce AI Backend",
     version="1.0.0",
-    description="Unified API server for Relyce AI - Chat and Library features"
+    description="Unified API server for Relyce AI"
 )
 
-# CORS for frontend
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,104 +25,111 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root endpoint - always works
+# Simple endpoints that work immediately (for health checks)
 @app.get("/")
 async def root():
-    return {
-        "service": "Relyce AI Backend",
-        "version": "1.0.0",
-        "status": "running"
-    }
+    return {"service": "Relyce AI Backend", "version": "1.0.0", "status": "running"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "relyce-backend"}
 
-# Now try to load the rest (with error handling)
-print("🚀 Starting Relyce AI Backend...")
+# ============================================================================
+# LAZY LOADING: All heavy modules loaded on first request, not at startup
+# ============================================================================
+_initialized = False
+_library_app = None
+_chat_app = None
 
-try:
-    import uvicorn
-    from dotenv import load_dotenv
+def lazy_init():
+    """Initialize heavy modules on first request"""
+    global _initialized, _library_app, _chat_app
     
-    # Load environment variables
+    if _initialized:
+        return
+    
+    import sys
     backend_dir = os.path.dirname(os.path.abspath(__file__))
-    env_path = os.path.join(backend_dir, '.env')
-    load_dotenv(env_path)
-    print("✅ Environment loaded")
-except Exception as e:
-    print(f"⚠️ Dotenv error: {e}")
-
-# Initialize Firebase
-try:
-    import firebase_admin
-    from firebase_admin import credentials, storage as fb_storage
-    import json
+    sys.path.insert(0, backend_dir)
+    sys.path.insert(0, os.path.join(backend_dir, 'bucket'))
+    sys.path.insert(0, os.path.join(backend_dir, 'chat'))
     
-    if not firebase_admin._apps:
-        storage_bucket = os.getenv('FIREBASE_STORAGE_BUCKET')
-        firebase_sdk_json = os.getenv('FIREBASE_ADMIN_SDK')
+    # Load dotenv
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(backend_dir, '.env'))
+        print("✅ Environment loaded")
+    except Exception as e:
+        print(f"⚠️ Dotenv: {e}")
+    
+    # Firebase
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+        import json
         
-        if firebase_sdk_json:
-            service_account = json.loads(firebase_sdk_json)
-            if 'private_key' in service_account:
-                service_account['private_key'] = service_account['private_key'].replace('\\n', '\n')
-            cred = credentials.Certificate(service_account)
-            firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
-            print(f"🔥 Firebase Admin initialized (bucket: {storage_bucket})")
-        else:
-            backend_dir = os.path.dirname(os.path.abspath(__file__))
-            service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
-            if service_account_path:
-                if not os.path.isabs(service_account_path):
-                    service_account_path = os.path.normpath(os.path.join(backend_dir, service_account_path))
-                if os.path.exists(service_account_path):
-                    cred = credentials.Certificate(service_account_path)
-                    firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
-                    print(f"✅ Firebase Admin initialized from FILE")
-                else:
-                    print(f"⚠️ Firebase SDK not found at: {service_account_path}")
-            else:
-                print("⚠️ No Firebase credentials found")
-except Exception as e:
-    print(f"❌ Firebase init error: {e}")
+        if not firebase_admin._apps:
+            storage_bucket = os.getenv('FIREBASE_STORAGE_BUCKET')
+            firebase_sdk_json = os.getenv('FIREBASE_ADMIN_SDK')
+            
+            if firebase_sdk_json:
+                service_account = json.loads(firebase_sdk_json)
+                if 'private_key' in service_account:
+                    service_account['private_key'] = service_account['private_key'].replace('\\n', '\n')
+                cred = credentials.Certificate(service_account)
+                firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
+                print(f"🔥 Firebase initialized")
+    except Exception as e:
+        print(f"⚠️ Firebase: {e}")
+    
+    # Mount sub-apps
+    try:
+        from library_api import library_app
+        app.mount("/api", library_app)
+        _library_app = library_app
+        print("✅ Library API mounted at /api")
+    except Exception as e:
+        print(f"⚠️ Library API: {e}")
+    
+    try:
+        from chat.server import chat_app
+        app.mount("/chat", chat_app)
+        _chat_app = chat_app
+        print("✅ Chat API mounted at /chat")
+    except Exception as e:
+        print(f"⚠️ Chat API: {e}")
+    
+    _initialized = True
+    print("✅ All modules loaded!")
 
-# Add directories to path for imports
-backend_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, backend_dir)
-sys.path.insert(0, os.path.join(backend_dir, 'bucket'))
-sys.path.insert(0, os.path.join(backend_dir, 'chat'))
+# Middleware to lazy-init on first real request
+@app.middleware("http")
+async def lazy_load_middleware(request: Request, call_next):
+    # Skip lazy init for health checks (so Render can detect port fast)
+    if request.url.path not in ["/", "/health"]:
+        lazy_init()
+    response = await call_next(request)
+    return response
 
-# Import and mount sub-applications
-try:
-    from library_api import library_app
-    app.mount("/api", library_app)
-    print("✅ Library API mounted at /api")
-except Exception as e:
-    print(f"⚠️ Could not import library_api: {e}")
-
-try:
-    from chat.server import chat_app
-    app.mount("/chat", chat_app)
-    print("✅ Chat API mounted at /chat")
-except Exception as e:
-    print(f"⚠️ Could not import chat.server: {e}")
+# Manual init endpoint (optional - call once to warm up)
+@app.get("/init")
+async def init_modules():
+    lazy_init()
+    return {"status": "initialized", "modules_loaded": _initialized}
 
 # WebSocket endpoint
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """Main WebSocket endpoint for real-time chat"""
+    lazy_init()  # Ensure modules are loaded
     await websocket.accept()
     
     session_id = websocket.query_params.get("sessionId", "default")
     user_id = websocket.query_params.get("userId", "anonymous")
-    
-    print(f"🔗 WebSocket connected: user={user_id}, session={session_id}")
+    print(f"🔗 WebSocket: user={user_id}, session={session_id}")
     
     try:
         while True:
             data = await websocket.receive_json()
-            
             message = data.get("message", "")
             chat_mode = data.get("chatMode", "standard")
             
@@ -136,10 +141,9 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
                 continue
             
-            print(f"📨 WS Message: {message[:50]}... (mode={chat_mode})")
+            print(f"📨 WS: {message[:50]}...")
             
             try:
-                # Lazy import to avoid startup issues
                 from chat.server import get_genric_module, get_business_module
                 import concurrent.futures
                 
@@ -159,29 +163,16 @@ async def websocket_chat(websocket: WebSocket):
                     "messageId": data.get("messageId"),
                     "chatId": data.get("chatId")
                 })
-                
             except Exception as e:
                 print(f"❌ Chat error: {e}")
-                await websocket.send_json({
-                    "type": "error",
-                    "text": f"Error: {str(e)}"
-                })
+                await websocket.send_json({"type": "error", "text": str(e)})
                 
     except WebSocketDisconnect:
-        print(f"🔌 WebSocket disconnected: {session_id}")
-    except Exception as e:
-        print(f"❌ WebSocket error: {e}")
+        print(f"🔌 Disconnected: {session_id}")
 
+# Only for local development
 if __name__ == "__main__":
     import uvicorn
-    # Render uses PORT=10000 by default
     port = int(os.getenv("PORT", 10000))
-    
-    print("\n" + "="*50)
-    print("   RELYCE AI UNIFIED BACKEND")
-    print("="*50)
-    print(f"\n🚀 Starting server on http://0.0.0.0:{port}")
-    print(f"📍 PORT from env: {os.getenv('PORT', 'not set (using default 10000)')}")
-    print("="*50 + "\n")
-    
+    print(f"🚀 Starting on http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
