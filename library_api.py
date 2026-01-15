@@ -19,22 +19,35 @@ load_dotenv()
 # Firebase Admin SDK
 import firebase_admin
 from firebase_admin import credentials, storage as fb_storage
+import json
 
 # Initialize Firebase Admin (only once)
 if not firebase_admin._apps:
     try:
-        # Get paths from environment variables
-        service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
         storage_bucket = os.getenv('FIREBASE_STORAGE_BUCKET')
         
-        if service_account_path and os.path.exists(service_account_path):
-            cred = credentials.Certificate(service_account_path)
+        # 🔐 Option 1: Use JSON string from env (secure - no file needed)
+        firebase_sdk_json = os.getenv('FIREBASE_ADMIN_SDK')
+        
+        if firebase_sdk_json:
+            service_account = json.loads(firebase_sdk_json)
+            # Fix newline issue in private_key
+            if 'private_key' in service_account:
+                service_account['private_key'] = service_account['private_key'].replace('\\n', '\n')
+            cred = credentials.Certificate(service_account)
             firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
-            print("Firebase Admin initialized")
+            print("🔥 Firebase Admin initialized from ENV")
         else:
-            print("Set FIREBASE_SERVICE_ACCOUNT_PATH and FIREBASE_STORAGE_BUCKET in ")
+            # 🔐 Option 2: Fallback to file path (legacy)
+            service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
+            if service_account_path and os.path.exists(service_account_path):
+                cred = credentials.Certificate(service_account_path)
+                firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
+                print("✅ Firebase Admin initialized from FILE")
+            else:
+                print("⚠️ Set FIREBASE_ADMIN_SDK or FIREBASE_SERVICE_ACCOUNT_PATH in .env")
     except Exception as e:
-        print(f"Firebase init failed: {e}")
+        print(f"❌ Firebase init failed: {e}")
 
 # Import RAG functions from existing files
 from Bucket import (

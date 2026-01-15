@@ -16,29 +16,40 @@ backend_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(backend_dir, '.env')
 load_dotenv(env_path)
 
-# Fix Firebase service account path to be absolute
-firebase_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
-if firebase_path and not os.path.isabs(firebase_path):
-    # Convert relative path to absolute based on backend directory
-    abs_firebase_path = os.path.normpath(os.path.join(backend_dir, firebase_path))
-    os.environ['FIREBASE_SERVICE_ACCOUNT_PATH'] = abs_firebase_path
-    print(f"📁 Firebase SDK path: {abs_firebase_path}")
-
 # Initialize Firebase BEFORE importing any modules that use it
 import firebase_admin
 from firebase_admin import credentials, storage as fb_storage
+import json
 
 if not firebase_admin._apps:
     try:
-        service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
         storage_bucket = os.getenv('FIREBASE_STORAGE_BUCKET')
         
-        if service_account_path and os.path.exists(service_account_path):
-            cred = credentials.Certificate(service_account_path)
+        # 🔐 Option 1: Use JSON string from env (secure - no file needed)
+        firebase_sdk_json = os.getenv('FIREBASE_ADMIN_SDK')
+        
+        if firebase_sdk_json:
+            service_account = json.loads(firebase_sdk_json)
+            # Fix newline issue in private_key
+            if 'private_key' in service_account:
+                service_account['private_key'] = service_account['private_key'].replace('\\n', '\n')
+            cred = credentials.Certificate(service_account)
             firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
-            print(f"✅ Firebase Admin initialized (bucket: {storage_bucket})")
+            print(f"🔥 Firebase Admin initialized from ENV (bucket: {storage_bucket})")
         else:
-            print(f"⚠️ Firebase SDK not found at: {service_account_path}")
+            # 🔐 Option 2: Fallback to file path (legacy)
+            service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH')
+            if service_account_path:
+                if not os.path.isabs(service_account_path):
+                    service_account_path = os.path.normpath(os.path.join(backend_dir, service_account_path))
+                if os.path.exists(service_account_path):
+                    cred = credentials.Certificate(service_account_path)
+                    firebase_admin.initialize_app(cred, {'storageBucket': storage_bucket})
+                    print(f"✅ Firebase Admin initialized from FILE (bucket: {storage_bucket})")
+                else:
+                    print(f"⚠️ Firebase SDK not found at: {service_account_path}")
+            else:
+                print("⚠️ Set FIREBASE_ADMIN_SDK or FIREBASE_SERVICE_ACCOUNT_PATH in .env")
     except Exception as e:
         print(f"❌ Firebase init failed: {e}")
 
