@@ -7,11 +7,7 @@ import concurrent.futures
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-# --- Selenium Imports ---
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+# Note: Selenium removed for Railway compatibility (no Chrome browser)
 
 # --- LangChain / RAG Imports ---
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -146,14 +142,8 @@ def retrieve_rag_context(query, bm25, chroma):
 # ==========================================
 # 3. MODULE: WEB SEARCH (Serper + Selenium)
 # ==========================================
-def setup_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--log-level=3")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=options)
+# Selenium driver removed for Railway compatibility
+# Deep search feature disabled in cloud deployment
 
 def perform_web_search(query, k_val):
     url = "https://google.serper.dev/search"
@@ -176,27 +166,9 @@ def perform_web_search(query, k_val):
             
         web_context_text = "\n\n".join(snippets)
         
+        # Deep search disabled for cloud deployment (requires Chrome browser)
         if "deep search" in query.lower():
-            print("   [Web] Deep Search Triggered: Scraping top 3 links...")
-            driver = setup_driver()
-            scraped_content = []
-            
-            for link in links[:3]:
-                try:
-                    driver.get(link)
-                    time.sleep(1.5)
-                    soup = BeautifulSoup(driver.page_source, "html.parser")
-                    for tag in soup(["script", "style", "nav", "footer"]): tag.extract()
-                    text = soup.get_text(" ", strip=True)
-                    clean_text = text[:4000] 
-                    # --- UPDATED: Explicit Source Labeling for Deep Search ---
-                    scraped_content.append(f"Source: {link}\nContent: {clean_text}")
-                except:
-                    pass
-            driver.quit()
-            
-            if scraped_content:
-                web_context_text += "\n\n=== DEEP SEARCH CONTENT ===\n" + "\n\n".join(scraped_content)
+            print("   [Web] Deep Search requested but disabled in cloud mode")
                 
     except Exception as e:
         print(f"   [Web] Error during search: {e}")

@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Environment
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Firebase credentials (sensitive!)
+admin_sdk/
+*.json
+
+# Chroma database (rebuilt at runtime)
+chroma_db/
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+*.md
+!README.md
+
+# Render config (not needed for Railway)
+render.yaml
+
+# Temp files
+temp/
+tmp/
+*.tmp
+*.log
