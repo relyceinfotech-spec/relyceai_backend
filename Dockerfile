@@ -24,7 +24,8 @@ COPY . .
 RUN mkdir -p chroma_db data
 
 # Expose port (Railway sets PORT env var)
+ENV PORT=8000
 EXPOSE 8000
 
-# Start command - 2 workers for 3 vCPU / 4GB RAM
-CMD ["sh", "-c", "gunicorn server:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8000} --timeout 180"]
+# No CMD - Railway provides start command via dashboard:
+# gunicorn server:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 180

@@ -2,20 +2,24 @@
 Relyce AI Backend - Unified Server
 All endpoints in one file with lazy loading for fast startup
 """
+print("🚀 Starting Relyce AI Backend...")
 import os
 import sys
+print("✅ Basic imports OK")
 
 # CRITICAL: Only import FastAPI essentials at top level!
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+print("✅ FastAPI imports OK")
 
 # Setup paths
 backend_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, backend_dir)
 sys.path.insert(0, os.path.join(backend_dir, 'bucket'))
 sys.path.insert(0, os.path.join(backend_dir, 'chat'))
+print(f"✅ Paths configured: {backend_dir}")
 
 # ============================================================================
 # APP SETUP - Created immediately for fast health check response
@@ -25,6 +29,7 @@ app = FastAPI(
     version="1.0.0",
     description="Unified API server for Relyce AI"
 )
+print("✅ FastAPI app created")
 
 app.add_middleware(
     CORSMiddleware,
