@@ -210,6 +210,7 @@ async def websocket_chat(websocket: WebSocket):
             data = await websocket.receive_json()
             message = data.get("message", "")
             chat_mode = data.get("chatMode", "standard")
+            is_web_search = data.get("isWebSearch", False)  # Pro mode flag
             
             if message == "STOP_PROCESSING":
                 await websocket.send_json({"type": "stopped"})
@@ -219,24 +220,34 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
                 continue
             
-            print(f"📨 WS: {message[:50]}...")
+            # Log mode info
+            mode_label = "Pro" if is_web_search else "Lite"
+            print(f"📨 WS [{mode_label}]: {message[:50]}...")
             
             try:
                 if chat_mode == "plus":
+                    # Business mode
                     bm = _get_business()
                     response = bm.generate_final_response(message, "", "")
                 else:
+                    # Generic mode - Lite or Pro based on isWebSearch
                     gm = _get_genric()
+                    
+                    # Pro mode: More search results (k=10), Lite mode: Standard (k=5)
+                    k_results = 10 if is_web_search else 5
+                    
                     with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future_web = executor.submit(gm.perform_web_search, message, 5)
+                        future_web = executor.submit(gm.perform_web_search, message, k_results)
                         web_text = future_web.result()
+                    
                     response = gm.generate_final_response(message, "", web_text)
                 
                 await websocket.send_json({
                     "type": "bot",
                     "text": response,
                     "messageId": data.get("messageId"),
-                    "chatId": data.get("chatId")
+                    "chatId": data.get("chatId"),
+                    "mode": mode_label
                 })
             except Exception as e:
                 print(f"❌ Chat error: {e}")
