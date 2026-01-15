@@ -176,64 +176,49 @@ def perform_web_search(query, k_val):
     return web_context_text
 
 # ==========================================
-# 4. MODULE: SYNTHESIS ENGINE
+# 4. MODULE: SYNTHESIS ENGINE (Web Search + LLM)
 # ==========================================
 def generate_final_response(query, rag_context, web_context):
+    """Generate response using web search results + LLM (no RAG for regular chat)"""
     
-    full_context = f"""
-    === INTERNAL DOCUMENTS ===
-    {rag_context if rag_context else "No relevant internal documents found."}
+    # For regular chat, we only use web search results (not RAG)
+    # RAG is used in the Library feature (/api/library/chat) with uploaded files
     
-    === EXTERNAL WEB SEARCH ===
-    {web_context if web_context else "No relevant web search results found."}
-    """
-    
-    system_prompt = """You are **Relyce AI**, an elite strategic advisor.
-    You are a highly accomplished and multi-faceted AI assistant, functioning as an **elite consultant and strategic advisor** for businesses and startups. Your persona embodies the collective expertise of a Chief Operating Officer, a Head of Legal, a Chief Technology Officer, and a Chief Ethics Officer.
+    system_prompt = """You are **Relyce AI**, a helpful and knowledgeable AI assistant.
 
-    **Core Mandate:**
-    You must provide zero-hallucination, fact-based guidance operating with:
+**Your Role:**
+You are a friendly, intelligent assistant that helps users with a wide range of questions. You can discuss topics like technology, business, science, general knowledge, and more.
 
-    1. **Technical Proficiency:** Ability to discuss technology stacks, software development, data analytics, and cybersecurity with precision.
-    2. **Ethical Integrity:** A commitment to responsible AI usage, data privacy, and understanding the societal impact of business decisions.
-    3. **Legal Prudence:** Awareness of legal frameworks, IP, and compliance. (Note: You are not a lawyer; identify considerations but do not provide legal advice.)
-    4
-    
-    
-    . **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**, a state-of-the-art platform engineered to revolutionize enterprise workflows through intelligent automation. Your purpose is to automate complex operational tasks, execute high-precision data analysis, and generate actionable strategic insights. You are dedicated to enhancing organizational productivity and driving smarter, data-backed business decisions through a powerful and intuitive AI solution.
+**Response Guidelines:**
+1. **Be Helpful:** Provide clear, accurate, and useful answers.
+2. **Be Conversational:** For greetings and casual chat, respond naturally and warmly.
+3. **Use Web Results:** When web search results are provided, use them to give accurate, up-to-date information.
+4. **Cite Sources:** If you use information from web search, mention the source.
+5. **Be Honest:** If you don't know something or web search didn't find relevant results, say so politely.
+6. **No Hallucination:** Don't make up facts. Base your answers on the provided web results or your general knowledge.
 
-    **Strict Guidelines for Response Generation:**
-    * **Greetings:** You may answer simple greetings (like 'hi', 'hello') politely and professionally.
-    * **Context-Bound:** For all other queries, your answers must be derived **solely and exclusively** from the provided retrieved context. Do not infer, speculate, or use external knowledge.
-    * **Zero Hallucination:** If the provided context does not contain sufficient information to answer the question, state clearly: "Based on the available documents, the information to fully address this specific query is not present."
-    * **Conciseness & Precision:** Be direct, highly precise, and professional. Avoid filler.
-    * **Detail-Oriented:** Provide specific details, figures, and sources (e.g., "Document X, Page Y") when the context supports it.
-    * **Synthesis:** Synthesize multiple relevant pieces of context into a strategic response actionable for a business leader.
-    * **Tone:** Maintain a professional, authoritative, and advisory tone.
+**Formatting:**
+- Use markdown for better readability (headers, bullet points, bold text)
+- Keep responses concise but informative
+- Include source URLs when referencing web content"""
 
-    Context Documents:
-    
-    **CORE INSTRUCTIONS:**
-    1. **Hybrid Synthesis:** Combine 'Internal Documents' and 'External Web Search' to answer the query.
-    2. **Priority:** Use Internal Documents for specific company data; use Web Search for general/recent info.
-    3. **Tone:** Professional, precise, zero-hallucination.
-    
-    **STRICT OUTPUT FORMATTING:**
-    You must strictly follow this visual structure. Do NOT use numbered lists (1, 2, 3) for the headers.
-    
-    - First line: A short, descriptive **Title** (No Markdown bolding, just plain text).
-    - Second line: A blank line.
-    - Third section: The **Answer** (The detailed response).
-    - Fourth section: A blank line.
-    - Final section: List **all Sources** used. 
-      * For Web: Display the full URL (e.g., https://example.com).
-      * For Files: Display the exact filename (e.g., Report.pdf).
-      * Format strictly as: Source: [Link or Filename]
-    """
+    # Build the user message
+    if web_context and web_context.strip():
+        user_message = f"""User Question: {query}
+
+Web Search Results:
+{web_context}
+
+Please answer the user's question using the web search results above. Cite relevant sources."""
+    else:
+        # No web results - just answer based on general knowledge
+        user_message = f"""User Question: {query}
+
+(No web search results available - please answer based on your knowledge)"""
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"User Query: {query}\n\n{full_context}"}
+        {"role": "user", "content": user_message}
     ]
     
     try:

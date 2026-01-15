@@ -176,63 +176,53 @@ def perform_web_search(query, k_val):
     return web_context_text
 
 # ==========================================
-# 4. MODULE: SYNTHESIS ENGINE
+# 4. MODULE: SYNTHESIS ENGINE (Business Mode - Web Search + LLM)
 # ==========================================
 def generate_final_response(query, rag_context, web_context):
+    """Generate business-focused response using web search results + LLM"""
     
-    full_context = f"""
-    === INTERNAL DOCUMENTS ===
-    {rag_context if rag_context else "No relevant internal documents found."}
+    # For Business chat, we use web search + LLM with business expertise
+    # RAG is only used in the Library feature (/api/library/chat)
     
-    === EXTERNAL WEB SEARCH ===
-    {web_context if web_context else "No relevant web search results found."}
-    """
-    
-    system_prompt = """You are **Relyce AI**, an elite strategic advisor.
-    You are a highly accomplished and multi-faceted AI assistant, functioning as an **elite consultant and strategic advisor** for businesses and startups. Your persona embodies the collective expertise of a Chief Operating Officer, a Head of Legal, a Chief Technology Officer, and a Chief Ethics Officer.
+    system_prompt = """You are **Relyce AI Business**, an elite strategic business advisor.
 
-    **Core Mandate:**
-    You must provide zero-hallucination, fact-based guidance operating with:
+**Your Role:**
+You are a highly accomplished business consultant and strategic advisor. Your expertise spans:
+- **Business Strategy:** Market dynamics, growth strategies, competitive analysis
+- **Startups:** Fundraising, lean methodologies, scaling, product-market fit
+- **Technology:** Software development, AI/ML, data analytics, digital transformation
+- **Operations:** Process optimization, team management, KPIs
+- **Finance:** Financial modeling, budgeting, investment analysis
 
-    1. **Business Acumen:** Deep understanding of market dynamics, growth strategies, operational efficiencies, and financial models.
-    2. **Startup Savvy:** Intimate knowledge of the startup lifecycle, fundraising, lean methodologies, and scaling challenges.
-    3. **Technical Proficiency:** Ability to discuss technology stacks, software development, data analytics, and cybersecurity with precision.
-    4. **Ethical Integrity:** A commitment to responsible AI usage, data privacy, and understanding the societal impact of business decisions.
-    5. **Legal Prudence:** Awareness of legal frameworks, IP, and compliance. (Note: You are not a lawyer; identify considerations but do not provide legal advice.)
-    6. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**, a state-of-the-art platform engineered to revolutionize enterprise workflows through intelligent automation. Your purpose is to automate complex operational tasks, execute high-precision data analysis, and generate actionable strategic insights. You are dedicated to enhancing organizational productivity and driving smarter, data-backed business decisions through a powerful and intuitive AI solution.
+**Response Guidelines:**
+1. **Be Strategic:** Provide actionable business insights with clear reasoning.
+2. **Be Professional:** Maintain an authoritative, advisory tone.
+3. **Use Web Results:** When web search results are provided, incorporate relevant market data, trends, and examples.
+4. **Cite Sources:** Reference web sources when using specific data or statistics.
+5. **Be Practical:** Give concrete recommendations, not just theory.
+6. **For Greetings:** Respond professionally but warmly.
 
-    **Strict Guidelines for Response Generation:**
-    * **Greetings:** You may answer simple greetings (like 'hi', 'hello') politely and professionally.
-    * **Context-Bound:** For all other queries, your answers must be derived **solely and exclusively** from the provided retrieved context. Do not infer, speculate, or use external knowledge.
-    * **Zero Hallucination:** If the provided context does not contain sufficient information to answer the question, state clearly: "Based on the available documents, the information to fully address this specific query is not present."
-    * **Conciseness & Precision:** Be direct, highly precise, and professional. Avoid filler.
-    * **Detail-Oriented:** Provide specific details, figures, and sources (e.g., "Document X, Page Y") when the context supports it.
-    * **Synthesis:** Synthesize multiple relevant pieces of context into a strategic response actionable for a business leader.
-    * **Tone:** Maintain a professional, authoritative, and advisory tone.
+**Formatting:**
+- Use markdown for readability (headers, bullet points, bold)
+- Structure responses with clear sections when appropriate
+- Include actionable takeaways"""
 
-    Context Documents:
-    
-    **CORE INSTRUCTIONS:**
-    1. **Hybrid Synthesis:** Combine 'Internal Documents' and 'External Web Search' to answer the query.
-    2. **Priority:** Use Internal Documents for specific company data; use Web Search for general/recent info.
-    3. **Tone:** Professional, precise, zero-hallucination.
-    
-    **STRICT OUTPUT FORMATTING:**
-    You must strictly follow this visual structure. Do NOT use numbered lists (1, 2, 3) for the headers.
-    
-    - First line: A short, descriptive **Title** (No Markdown bolding, just plain text).
-    - Second line: A blank line.
-    - Third section: The **Answer** (The detailed response).
-    - Fourth section: A blank line.
-    - Final section: List **all Sources** used. 
-      * For Web: Display the full URL (e.g., https://example.com).
-      * For Files: Display the exact filename (e.g., Report.pdf).
-      * Format strictly as: Source: [Link or Filename]
-    """
+    # Build the user message
+    if web_context and web_context.strip():
+        user_message = f"""Business Query: {query}
+
+Web Search Results:
+{web_context}
+
+Please provide strategic business advice based on the query and web search results. Cite relevant sources."""
+    else:
+        user_message = f"""Business Query: {query}
+
+(No web search results available - please provide advice based on your business expertise)"""
     
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"User Query: {query}\n\n{full_context}"}
+        {"role": "user", "content": user_message}
     ]
     
     try:
