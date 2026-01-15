@@ -174,12 +174,14 @@ async def websocket_chat(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    # Render uses PORT=10000 by default
+    port = int(os.getenv("PORT", 10000))
     
     print("\n" + "="*50)
     print("   RELYCE AI UNIFIED BACKEND")
     print("="*50)
-    print(f"\nStarting server on http://0.0.0.0:{port}")
+    print(f"\n🚀 Starting server on http://0.0.0.0:{port}")
+    print(f"📍 PORT from env: {os.getenv('PORT', 'not set (using default 10000)')}")
     print("="*50 + "\n")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
