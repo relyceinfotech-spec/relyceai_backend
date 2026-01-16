@@ -231,9 +231,64 @@ Please provide strategic business advice based on the query and web search resul
     except Exception as e:
         return f"Error generating response: {e}"
 
+def generate_streaming_response(query, rag_context, web_context):
+    """Generate streaming business-focused response using web search results + LLM"""
+    
+    system_prompt = """You are **Relyce AI Business**, an elite strategic business advisor.
+
+**Your Role:**
+You are a highly accomplished business consultant and strategic advisor. Your expertise spans:
+- **Business Strategy:** Market dynamics, growth strategies, competitive analysis
+- **Startups:** Fundraising, lean methodologies, scaling, product-market fit
+- **Technology:** Software development, AI/ML, data analytics, digital transformation
+- **Operations:** Process optimization, team management, KPIs
+- **Finance:** Financial modeling, budgeting, investment analysis
+
+**Response Guidelines:**
+1. **Be Strategic:** Provide actionable business insights with clear reasoning.
+2. **Be Professional:** Maintain an authoritative, advisory tone.
+3. **Use Web Results:** When web search results are provided, incorporate relevant market data, trends, and examples.
+4. **Cite Sources:** Reference web sources when using specific data or statistics.
+5. **Be Practical:** Give concrete recommendations, not just theory.
+6. **For Greetings:** Respond professionally but warmly.
+
+**Formatting:**
+- Use markdown for readability (headers, bullet points, bold)
+- Structure responses with clear sections when appropriate
+- Include actionable takeaways"""
+
+    # Build the user message
+    if web_context and web_context.strip():
+        user_message = f"""Business Query: {query}
+
+Web Search Results:
+{web_context}
+
+Please provide strategic business advice based on the query and web search results. Cite relevant sources."""
+    else:
+        user_message = f"""Business Query: {query}
+
+(No web search results available - please provide advice based on your business expertise)"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message}
+    ]
+    
+    try:
+        print(f"   🤖 [LLM] Starting business streaming response...")
+        for chunk in llm.stream(messages):
+            if hasattr(chunk, 'content') and chunk.content:
+                yield chunk.content
+        print(f"   ✅ [LLM] Business streaming complete")
+    except Exception as e:
+        print(f"   ❌ [LLM] Business streaming error: {e}")
+        yield f"Error: {e}"
+
 # Functions exported for server use:
 # - perform_web_search(query, k_val)
 # - retrieve_rag_context(query, bm25, chroma)
 # - generate_final_response(query, rag_context, web_context) - Business mode prompt
+# - generate_streaming_response(query, rag_context, web_context) - STREAMING Business mode
 # - setup_rag_system()
 # - setup_driver()

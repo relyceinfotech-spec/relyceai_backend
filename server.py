@@ -46,14 +46,30 @@ import time
 import asyncio
 from collections import defaultdict
 
-# Rate limiting configuration
-RATE_LIMIT_REQUESTS = 20  # Max requests per window
-RATE_LIMIT_WINDOW = 60    # Window in seconds (1 minute)
-REQUEST_TIMEOUT = 30      # Max seconds for a request
+# Rate limiting configuration (configurable via environment variables)
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "20"))  # Max requests per window
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))      # Window in seconds
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))          # Max seconds for LLM request
+
+# PRODUCTION: Connection limits (configurable - scale based on server resources)
+# For 4GB RAM: ~2000 connections is safe, adjust based on your needs
+MAX_CONNECTIONS_PER_USER = int(os.getenv("MAX_CONNECTIONS_PER_USER", "5"))    # Max per user
+MAX_TOTAL_CONNECTIONS = int(os.getenv("MAX_TOTAL_CONNECTIONS", "2000"))       # 4GB RAM = ~2000
+MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "5000"))             # Max chars per message
 
 # In-memory rate limiter (for production, use Redis)
 user_request_times = defaultdict(list)
 user_warnings = defaultdict(int)  # Track warnings per user
+user_connections = defaultdict(set)  # Track active connection IDs per user
+total_connections = 0  # Global connection counter
+
+def get_connection_stats():
+    """Get current connection statistics"""
+    return {
+        "total_connections": total_connections,
+        "unique_users": len(user_connections),
+        "connections_by_user": {uid[:8] + "...": len(conns) for uid, conns in user_connections.items()}
+    }
 
 def check_rate_limit(user_id: str) -> tuple[bool, int]:
     """
@@ -209,6 +225,21 @@ async def root():
 async def health():
     return {"status": "healthy", "service": "relyce-backend"}
 
+@app.get("/stats")
+async def stats():
+    """Get server statistics for monitoring (use behind auth in production)"""
+    return {
+        "status": "running",
+        "connections": get_connection_stats(),
+        "limits": {
+            "max_connections_per_user": MAX_CONNECTIONS_PER_USER,
+            "max_total_connections": MAX_TOTAL_CONNECTIONS,
+            "rate_limit_requests": RATE_LIMIT_REQUESTS,
+            "rate_limit_window_seconds": RATE_LIMIT_WINDOW,
+            "max_message_length": MAX_MESSAGE_LENGTH
+        }
+    }
+
 # ============================================================================
 # CHAT ENDPOINTS - Web search powered chat
 # ============================================================================
@@ -305,8 +336,10 @@ def verify_firebase_token(token: str) -> str:
 async def websocket_chat(websocket: WebSocket):
     """WebSocket endpoint for real-time chat with token-based auth"""
     import concurrent.futures
+    global total_connections
     
     await websocket.accept()
+    connection_id = id(websocket)  # Unique ID for this connection
     
     # SECURITY: Get token and session from query params
     # Token is verified to extract real UID - never trust userId from client
@@ -323,6 +356,18 @@ async def websocket_chat(websocket: WebSocket):
     else:
         print(f"🔗 WebSocket: verified user={user_id[:8]}..., session={session_id[:8]}...")
     
+    # PRODUCTION: Check global connection limit
+    if total_connections >= MAX_TOTAL_CONNECTIONS:
+        await websocket.send_json({"type": "error", "text": "Server is at capacity. Please try again later."})
+        await websocket.close()
+        return
+    
+    # PRODUCTION: Check per-user connection limit
+    if len(user_connections[user_id]) >= MAX_CONNECTIONS_PER_USER:
+        await websocket.send_json({"type": "error", "text": "Too many active connections. Please close other tabs."})
+        await websocket.close()
+        return
+    
     # Validate session ID
     if not validate_session_id(session_id) and session_id != "default":
         await websocket.send_json({"type": "error", "text": "Invalid session ID"})
@@ -334,6 +379,9 @@ async def websocket_chat(websocket: WebSocket):
     locked_user_id = user_id
     locked_session_id = session_id
     
+    # Track this connection
+    user_connections[user_id].add(connection_id)
+    total_connections += 1
     active_connections[session_id] = websocket
     
     try:
@@ -371,6 +419,14 @@ async def websocket_chat(websocket: WebSocket):
             if not message.strip():
                 continue
             
+            # PRODUCTION: Reject overly long messages
+            if len(message) > MAX_MESSAGE_LENGTH:
+                await websocket.send_json({
+                    "type": "error", 
+                    "text": f"Message too long. Maximum {MAX_MESSAGE_LENGTH} characters allowed."
+                })
+                continue
+            
             # SECURITY: Rate limiting check
             allowed, remaining = check_rate_limit(locked_user_id)
             if not allowed:
@@ -388,53 +444,110 @@ async def websocket_chat(websocket: WebSocket):
             print(f"📨 WS [{mode_label}]: {message[:30]}...")
             
             try:
-                # Run with timeout to prevent hanging requests
-                async def process_chat():
-                    if chat_mode == "plus":
-                        # Business mode
-                        bm = _get_business()
-                        return bm.generate_final_response(message, "", "")
-                    else:
-                        # Generic mode - Lite or Pro based on isWebSearch
-                        gm = _get_genric()
-                        
-                        # Pro mode: More search results (k=10), Lite mode: Standard (k=5)
-                        k_results = 10 if is_web_search else 5
-                        
-                        loop = asyncio.get_event_loop()
-                        web_text = await loop.run_in_executor(
-                            None, 
-                            lambda: gm.perform_web_search(message, k_results)
-                        )
-                        
-                        return gm.generate_final_response(message, "", web_text)
+                print(f"   🔄 [Server] Processing chat_mode={chat_mode}, is_web_search={is_web_search}")
                 
-                response = await run_with_timeout(process_chat(), REQUEST_TIMEOUT)
+                # ALWAYS do web search - Pro mode gets more results
+                # Pro (isWebSearch=true): 10 results, Lite (isWebSearch=false): 5 results
+                k_results = 10 if is_web_search else 5
                 
-                if response is None:
-                    await websocket.send_json({
-                        "type": "error",
-                        "text": "Request timed out. Please try a simpler query."
-                    })
-                    continue
+                print(f"   🔄 [Server] Loading genric module for web search (k={k_results})...")
+                gm = _get_genric()
                 
+                message_id = data.get("messageId")
+                chat_id = data.get("chatId")
+                
+                # Send "searching" status to frontend so it can show skeleton loader
                 await websocket.send_json({
-                    "type": "bot",
-                    "text": response,
-                    "messageId": data.get("messageId"),
-                    "chatId": data.get("chatId"),
-                    "mode": mode_label,
-                    "remaining": remaining  # Show remaining quota
+                    "type": "searching",
+                    "messageId": message_id,
+                    "chatId": chat_id,
+                    "query": message[:100],
+                    "mode": mode_label
                 })
+                
+                # Perform web search (in thread pool to not block)
+                loop = asyncio.get_event_loop()
+                web_text, sources = await loop.run_in_executor(
+                    None, 
+                    lambda: gm.perform_web_search(message, k_results)
+                )
+                print(f"   🔄 [Server] Web search done, got {len(web_text) if web_text else 0} chars, {len(sources)} sources")
+                
+                # Send sources to frontend for display
+                await websocket.send_json({
+                    "type": "sources",
+                    "messageId": message_id,
+                    "chatId": chat_id,
+                    "sources": sources,
+                    "mode": mode_label
+                })
+                
+                # Get the streaming generator based on mode
+                if chat_mode == "plus":
+                    bm = _get_business()
+                    stream_generator = bm.generate_streaming_response(message, "", web_text)
+                else:
+                    stream_generator = gm.generate_streaming_response(message, "", web_text)
+                
+                # Stream response chunks to client
+                full_response = ""
+                
+                # Send initial streaming start signal
+                await websocket.send_json({
+                    "type": "stream_start",
+                    "messageId": message_id,
+                    "chatId": chat_id,
+                    "mode": mode_label,
+                    "sources": sources  # Include sources in stream_start too
+                })
+                
+                # Stream each chunk
+                for chunk in stream_generator:
+                    if chunk:
+                        full_response += chunk
+                        await websocket.send_json({
+                            "type": "stream",
+                            "text": chunk,
+                            "messageId": message_id,
+                            "chatId": chat_id
+                        })
+                
+                # Send stream end signal with full response
+                await websocket.send_json({
+                    "type": "stream_end",
+                    "text": full_response,
+                    "messageId": message_id,
+                    "chatId": chat_id,
+                    "mode": mode_label,
+                    "sources": sources,
+                    "remaining": remaining
+                })
+                print(f"   ✅ [Server] Streaming complete ({len(full_response)} chars)")
+                
             except Exception as e:
                 # SECURITY: Don't expose internal error details
                 print(f"❌ Chat error: {e}")
+                import traceback
+                traceback.print_exc()
                 await websocket.send_json({"type": "error", "text": "Something went wrong. Please try again."})
                 
     except WebSocketDisconnect:
         print(f"🔌 Disconnected: {session_id[:8]}...")
+        # Clean up connection tracking
         if session_id in active_connections:
             del active_connections[session_id]
+        if connection_id in user_connections.get(locked_user_id, set()):
+            user_connections[locked_user_id].discard(connection_id)
+            if not user_connections[locked_user_id]:
+                del user_connections[locked_user_id]
+        total_connections = max(0, total_connections - 1)
+    except Exception as e:
+        print(f"❌ WebSocket error: {e}")
+        # Clean up on any error
+        if session_id in active_connections:
+            del active_connections[session_id]
+        user_connections.get(locked_user_id, set()).discard(connection_id)
+        total_connections = max(0, total_connections - 1)
 
 # ============================================================================
 # LIBRARY ENDPOINTS - Document Q&A with RAG

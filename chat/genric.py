@@ -146,34 +146,75 @@ def retrieve_rag_context(query, bm25, chroma):
 # Deep search feature disabled in cloud deployment
 
 def perform_web_search(query, k_val):
+    """
+    Perform web search using Serper API.
+    Returns: tuple (web_context_text, sources)
+    - web_context_text: formatted string for LLM context
+    - sources: list of dicts with {title, link, snippet} for frontend display
+    """
     url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": os.getenv("SERPER_API_KEY"), "Content-Type": "application/json"}
+    api_key = os.getenv("SERPER_API_KEY")
+    
+    print(f"   🔍 [Web] Starting Serper search for: '{query[:50]}...'")
+    print(f"   🔑 [Web] API Key present: {bool(api_key)} (first 8 chars: {api_key[:8] if api_key else 'NONE'}...)")
+    
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
     payload = {"q": query, "num": k_val}
     
     web_context_text = ""
+    sources = []  # List of source info for frontend
     
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        print(f"   📡 [Web] Sending request to Serper API...")
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        print(f"   📥 [Web] Response status: {response.status_code}")
+        
         data = response.json()
         
-        snippets = []
-        links = []
+        # Check for errors in response
+        if "error" in data:
+            print(f"   ❌ [Web] Serper API error: {data.get('error')}")
+            return "", []
         
-        for item in data.get("organic", []):
-            # --- UPDATED: Explicit Source Labeling ---
-            snippets.append(f"Source: {item.get('link')}\nTitle: {item.get('title')}\nSnippet: {item.get('snippet')}")
-            links.append(item.get('link'))
+        snippets = []
+        
+        organic_results = data.get("organic", [])
+        print(f"   ✅ [Web] Got {len(organic_results)} search results")
+        
+        for item in organic_results:
+            title = item.get('title', '')
+            link = item.get('link', '')
+            snippet = item.get('snippet', '')
+            
+            # Build context for LLM
+            snippets.append(f"Source: {link}\nTitle: {title}\nSnippet: {snippet}")
+            
+            # Build source info for frontend
+            sources.append({
+                "title": title,
+                "link": link,
+                "snippet": snippet
+            })
             
         web_context_text = "\n\n".join(snippets)
+        
+        if web_context_text:
+            print(f"   📝 [Web] Context length: {len(web_context_text)} chars, {len(sources)} sources")
+        else:
+            print(f"   ⚠️ [Web] No snippets extracted from results!")
         
         # Deep search disabled for cloud deployment (requires Chrome browser)
         if "deep search" in query.lower():
             print("   [Web] Deep Search requested but disabled in cloud mode")
                 
+    except requests.exceptions.Timeout:
+        print(f"   ⏰ [Web] Serper API timeout!")
     except Exception as e:
-        print(f"   [Web] Error during search: {e}")
+        print(f"   ❌ [Web] Error during search: {e}")
+        import traceback
+        traceback.print_exc()
         
-    return web_context_text
+    return web_context_text, sources
 
 # ==========================================
 # 4. MODULE: SYNTHESIS ENGINE (Web Search + LLM)
@@ -222,14 +263,68 @@ Please answer the user's question using the web search results above. Cite relev
     ]
     
     try:
+        print(f"   🤖 [LLM] Calling OpenRouter GPT-4o-mini...")
         response = llm.invoke(messages)
+        print(f"   ✅ [LLM] Response received ({len(response.content)} chars)")
         return response.content
     except Exception as e:
+        print(f"   ❌ [LLM] Error: {e}")
         return f"Error generating response: {e}"
+
+def generate_streaming_response(query, rag_context, web_context):
+    """Generate streaming response using web search results + LLM"""
+    
+    system_prompt = """You are **Relyce AI**, a helpful and knowledgeable AI assistant.
+
+**Your Role:**
+You are a friendly, intelligent assistant that helps users with a wide range of questions. You can discuss topics like technology, business, science, general knowledge, and more.
+
+**Response Guidelines:**
+1. **Be Helpful:** Provide clear, accurate, and useful answers.
+2. **Be Conversational:** For greetings and casual chat, respond naturally and warmly.
+3. **Use Web Results:** When web search results are provided, use them to give accurate, up-to-date information.
+4. **Cite Sources:** If you use information from web search, mention the source.
+5. **Be Honest:** If you don't know something or web search didn't find relevant results, say so politely.
+6. **No Hallucination:** Don't make up facts. Base your answers on the provided web results or your general knowledge.
+
+**Formatting:**
+- Use markdown for better readability (headers, bullet points, bold text)
+- Keep responses concise but informative
+- Include source URLs when referencing web content"""
+
+    # Build the user message
+    if web_context and web_context.strip():
+        user_message = f"""User Question: {query}
+
+Web Search Results:
+{web_context}
+
+Please answer the user's question using the web search results above. Cite relevant sources."""
+    else:
+        user_message = f"""User Question: {query}
+
+(No web search results available - please answer based on your knowledge)"""
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message}
+    ]
+    
+    try:
+        print(f"   🤖 [LLM] Starting streaming response...")
+        # Use streaming with langchain
+        for chunk in llm.stream(messages):
+            if hasattr(chunk, 'content') and chunk.content:
+                yield chunk.content
+        print(f"   ✅ [LLM] Streaming complete")
+    except Exception as e:
+        print(f"   ❌ [LLM] Streaming error: {e}")
+        yield f"Error: {e}"
 
 # Functions exported for server use:
 # - perform_web_search(query, k_val)
 # - retrieve_rag_context(query, bm25, chroma)
 # - generate_final_response(query, rag_context, web_context)
+# - generate_streaming_response(query, rag_context, web_context) - STREAMING version
 # - setup_rag_system()
 # - setup_driver()
