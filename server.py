@@ -40,6 +40,62 @@ app.add_middleware(
 )
 
 # ============================================================================
+# SECURITY: Rate Limiting & Timeout
+# ============================================================================
+import time
+import asyncio
+from collections import defaultdict
+
+# Rate limiting configuration
+RATE_LIMIT_REQUESTS = 20  # Max requests per window
+RATE_LIMIT_WINDOW = 60    # Window in seconds (1 minute)
+REQUEST_TIMEOUT = 30      # Max seconds for a request
+
+# In-memory rate limiter (for production, use Redis)
+user_request_times = defaultdict(list)
+user_warnings = defaultdict(int)  # Track warnings per user
+
+def check_rate_limit(user_id: str) -> tuple[bool, int]:
+    """
+    Check if user is rate limited.
+    Returns: (allowed: bool, remaining: int)
+    """
+    if not user_id or user_id == "anonymous":
+        return True, RATE_LIMIT_REQUESTS  # Don't rate limit anonymous
+    
+    now = time.time()
+    # Clean old entries outside the window
+    user_request_times[user_id] = [
+        t for t in user_request_times[user_id] 
+        if now - t < RATE_LIMIT_WINDOW
+    ]
+    
+    current_count = len(user_request_times[user_id])
+    remaining = RATE_LIMIT_REQUESTS - current_count
+    
+    if current_count >= RATE_LIMIT_REQUESTS:
+        user_warnings[user_id] += 1
+        return False, 0
+    
+    user_request_times[user_id].append(now)
+    return True, remaining - 1
+
+def get_rate_limit_reset(user_id: str) -> int:
+    """Get seconds until rate limit resets"""
+    if not user_request_times[user_id]:
+        return 0
+    oldest = min(user_request_times[user_id])
+    reset_time = oldest + RATE_LIMIT_WINDOW - time.time()
+    return max(0, int(reset_time))
+
+async def run_with_timeout(coro, timeout: int = REQUEST_TIMEOUT):
+    """Run a coroutine with timeout protection"""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+
+# ============================================================================
 # REQUEST/RESPONSE MODELS
 # ============================================================================
 class ChatRequest(BaseModel):
@@ -53,6 +109,7 @@ class ChatResponse(BaseModel):
     status: str = "success"
     mode: str = "generic"
     processing_time: Optional[float] = None
+    remaining_requests: Optional[int] = None  # Show remaining quota
 
 class LibraryChatRequest(BaseModel):
     userId: str
@@ -190,27 +247,117 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
-# WEBSOCKET CHAT - Real-time streaming
+# WEBSOCKET CHAT - Real-time streaming with security
 # ============================================================================
 active_connections: dict = {}
 
+# Security: Max message length to prevent DoS
+MAX_MESSAGE_LENGTH = 10000
+
+def sanitize_input(text: str) -> str:
+    """Sanitize user input - remove control characters, limit length"""
+    if not isinstance(text, str):
+        return ""
+    # Remove control characters except newline/tab
+    sanitized = ''.join(c for c in text if c >= ' ' or c in '\n\t')
+    # Limit length
+    return sanitized[:MAX_MESSAGE_LENGTH]
+
+def validate_user_id(user_id: str) -> bool:
+    """Validate userId format (Firebase UID is 28 chars)"""
+    if not isinstance(user_id, str):
+        return False
+    if len(user_id) < 10 or len(user_id) > 128:
+        return False
+    # Only allow alphanumeric and common UID characters
+    return all(c.isalnum() or c in '-_' for c in user_id)
+
+def validate_session_id(session_id: str) -> bool:
+    """Validate sessionId format"""
+    if not isinstance(session_id, str):
+        return False
+    if len(session_id) < 5 or len(session_id) > 128:
+        return False
+    return all(c.isalnum() or c in '-_' for c in session_id)
+
+def verify_firebase_token(token: str) -> str:
+    """
+    Verify Firebase ID token and extract UID
+    Returns: verified UID or None if invalid
+    SECURITY: This is the ONLY way to get trusted user identity
+    """
+    if not token or not isinstance(token, str):
+        return None
+    
+    try:
+        _init_firebase()
+        from firebase_admin import auth
+        decoded_token = auth.verify_id_token(token)
+        uid = decoded_token.get('uid')
+        if uid and validate_user_id(uid):
+            return uid
+        return None
+    except Exception as e:
+        print(f"⚠️ Token verification failed: {e}")
+        return None
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """WebSocket endpoint for real-time chat"""
+    """WebSocket endpoint for real-time chat with token-based auth"""
     import concurrent.futures
     
     await websocket.accept()
+    
+    # SECURITY: Get token and session from query params
+    # Token is verified to extract real UID - never trust userId from client
+    token = websocket.query_params.get("token", "")
     session_id = websocket.query_params.get("sessionId", "default")
-    user_id = websocket.query_params.get("userId", "anonymous")
+    
+    # SECURITY: Verify token and extract real UID
+    user_id = verify_firebase_token(token) if token else None
+    
+    # If no valid token, allow anonymous (limited features)
+    if not user_id:
+        user_id = "anonymous"
+        print(f"🔗 WebSocket: anonymous user, session={session_id[:8]}...")
+    else:
+        print(f"🔗 WebSocket: verified user={user_id[:8]}..., session={session_id[:8]}...")
+    
+    # Validate session ID
+    if not validate_session_id(session_id) and session_id != "default":
+        await websocket.send_json({"type": "error", "text": "Invalid session ID"})
+        await websocket.close()
+        return
+    
+    # SECURITY: Lock this connection to the verified user/session
+    # UID came from verified token - can't be faked
+    locked_user_id = user_id
+    locked_session_id = session_id
+    
     active_connections[session_id] = websocket
-    print(f"🔗 WebSocket: user={user_id}, session={session_id}")
     
     try:
         while True:
             data = await websocket.receive_json()
-            message = data.get("message", "")
+            
+            # SECURITY: Validate message structure
+            if not isinstance(data, dict):
+                await websocket.send_json({"type": "error", "text": "Invalid request"})
+                continue
+            
+            # SECURITY: Check if client is trying to impersonate different user
+            msg_user_id = data.get("userId", "")
+            if msg_user_id and msg_user_id != locked_user_id:
+                await websocket.send_json({"type": "error", "text": "Session mismatch"})
+                continue
+            
+            message = sanitize_input(data.get("message", ""))
             chat_mode = data.get("chatMode", "standard")
-            is_web_search = data.get("isWebSearch", False)  # Pro mode flag
+            is_web_search = data.get("isWebSearch", False)
+            
+            # Validate chat_mode
+            if chat_mode not in ["standard", "plus"]:
+                chat_mode = "standard"
             
             if message == "STOP_PROCESSING":
                 await websocket.send_json({"type": "stopped"})
@@ -220,41 +367,72 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
                 continue
             
-            # Log mode info
+            # SECURITY: Reject empty messages
+            if not message.strip():
+                continue
+            
+            # SECURITY: Rate limiting check
+            allowed, remaining = check_rate_limit(locked_user_id)
+            if not allowed:
+                reset_time = get_rate_limit_reset(locked_user_id)
+                await websocket.send_json({
+                    "type": "error",
+                    "text": f"Rate limit exceeded. Try again in {reset_time} seconds.",
+                    "rateLimited": True,
+                    "resetIn": reset_time
+                })
+                continue
+            
+            # Log mode info (truncated for privacy)
             mode_label = "Pro" if is_web_search else "Lite"
-            print(f"📨 WS [{mode_label}]: {message[:50]}...")
+            print(f"📨 WS [{mode_label}]: {message[:30]}...")
             
             try:
-                if chat_mode == "plus":
-                    # Business mode
-                    bm = _get_business()
-                    response = bm.generate_final_response(message, "", "")
-                else:
-                    # Generic mode - Lite or Pro based on isWebSearch
-                    gm = _get_genric()
-                    
-                    # Pro mode: More search results (k=10), Lite mode: Standard (k=5)
-                    k_results = 10 if is_web_search else 5
-                    
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future_web = executor.submit(gm.perform_web_search, message, k_results)
-                        web_text = future_web.result()
-                    
-                    response = gm.generate_final_response(message, "", web_text)
+                # Run with timeout to prevent hanging requests
+                async def process_chat():
+                    if chat_mode == "plus":
+                        # Business mode
+                        bm = _get_business()
+                        return bm.generate_final_response(message, "", "")
+                    else:
+                        # Generic mode - Lite or Pro based on isWebSearch
+                        gm = _get_genric()
+                        
+                        # Pro mode: More search results (k=10), Lite mode: Standard (k=5)
+                        k_results = 10 if is_web_search else 5
+                        
+                        loop = asyncio.get_event_loop()
+                        web_text = await loop.run_in_executor(
+                            None, 
+                            lambda: gm.perform_web_search(message, k_results)
+                        )
+                        
+                        return gm.generate_final_response(message, "", web_text)
+                
+                response = await run_with_timeout(process_chat(), REQUEST_TIMEOUT)
+                
+                if response is None:
+                    await websocket.send_json({
+                        "type": "error",
+                        "text": "Request timed out. Please try a simpler query."
+                    })
+                    continue
                 
                 await websocket.send_json({
                     "type": "bot",
                     "text": response,
                     "messageId": data.get("messageId"),
                     "chatId": data.get("chatId"),
-                    "mode": mode_label
+                    "mode": mode_label,
+                    "remaining": remaining  # Show remaining quota
                 })
             except Exception as e:
+                # SECURITY: Don't expose internal error details
                 print(f"❌ Chat error: {e}")
-                await websocket.send_json({"type": "error", "text": str(e)})
+                await websocket.send_json({"type": "error", "text": "Something went wrong. Please try again."})
                 
     except WebSocketDisconnect:
-        print(f"🔌 Disconnected: {session_id}")
+        print(f"🔌 Disconnected: {session_id[:8]}...")
         if session_id in active_connections:
             del active_connections[session_id]
 
