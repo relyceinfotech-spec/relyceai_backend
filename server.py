@@ -453,41 +453,108 @@ async def websocket_chat(websocket: WebSocket):
             try:
                 print(f"   🔄 [Server] Processing chat_mode={chat_mode}, is_web_search={is_web_search}")
                 
-                # ALWAYS do web search - Pro mode gets more results
-                # Pro (isWebSearch=true): 10 results, Lite (isWebSearch=false): 5 results
-                k_results = 10 if is_web_search else 5
+                # SMART QUERY CLASSIFICATION - Determine if web search is needed
+                def needs_web_search(query: str) -> bool:
+                    """
+                    Classify if a query needs real-time web search or can be answered by LLM directly.
+                    Returns: True if web search needed, False for direct LLM response
+                    """
+                    query_lower = query.lower().strip()
+                    
+                    # Patterns that DON'T need web search (direct LLM)
+                    no_search_patterns = [
+                        # Greetings and casual
+                        'hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening',
+                        'how are you', 'what\'s up', 'thanks', 'thank you', 'bye', 'goodbye',
+                        'ok', 'okay', 'sure', 'yes', 'no', 'please', 'help',
+                        # Simple questions about the AI
+                        'who are you', 'what are you', 'what can you do', 'your name',
+                        # General knowledge (LLM already knows)
+                        'what is', 'explain', 'define', 'meaning of', 'how does', 'why is',
+                        'tell me about', 'describe', 'difference between',
+                        # Creative/conversational
+                        'write a', 'create a', 'make a', 'generate', 'compose',
+                        'joke', 'story', 'poem', 'code', 'script', 'function',
+                        # Opinions and advice (no real-time data needed)
+                        'should i', 'what do you think', 'recommend', 'suggest', 'advice',
+                    ]
+                    
+                    # Patterns that NEED web search (real-time/factual data)
+                    search_patterns = [
+                        # Current events/news
+                        'latest', 'recent', 'news', 'today', 'yesterday', 'this week',
+                        'current', 'now', '2024', '2025', '2026',
+                        # Real-time data
+                        'price', 'stock', 'weather', 'score', 'result', 'live',
+                        # Specific lookups
+                        'who won', 'how much', 'when did', 'where is', 'statistics',
+                        # Research topics
+                        'research', 'study', 'report', 'data', 'statistics', 'trends',
+                        # Comparisons requiring current info
+                        'best', 'top', 'compare', 'vs', 'versus', 'review',
+                    ]
+                    
+                    # Check if it's a simple greeting/short query
+                    if len(query_lower.split()) <= 3:
+                        for pattern in no_search_patterns[:15]:  # Check greetings first
+                            if pattern in query_lower:
+                                return False
+                    
+                    # Check if query explicitly needs search
+                    for pattern in search_patterns:
+                        if pattern in query_lower:
+                            return True
+                    
+                    # Check if query is conversational/creative (no search needed)
+                    for pattern in no_search_patterns:
+                        if query_lower.startswith(pattern) or pattern in query_lower:
+                            # Exception: if query also has search patterns, still search
+                            has_search_term = any(sp in query_lower for sp in search_patterns)
+                            if not has_search_term:
+                                return False
+                    
+                    # Default: do web search for longer, complex queries
+                    return len(query_lower.split()) > 5
                 
-                print(f"   🔄 [Server] Loading genric module for web search (k={k_results})...")
+                # Determine if we need web search
+                should_search = needs_web_search(message) or is_web_search  # Force search if Pro mode
+                
                 gm = _get_genric()
-                
                 message_id = data.get("messageId")
                 chat_id = data.get("chatId")
+                web_text = ""
+                sources = []
+                k_results = 10 if is_web_search else 5
                 
-                # Send "searching" status to frontend so it can show skeleton loader
-                await websocket.send_json({
-                    "type": "searching",
-                    "messageId": message_id,
-                    "chatId": chat_id,
-                    "query": message[:100],
-                    "mode": mode_label
-                })
-                
-                # Perform web search (in thread pool to not block)
-                loop = asyncio.get_event_loop()
-                web_text, sources = await loop.run_in_executor(
-                    None, 
-                    lambda: gm.perform_web_search(message, k_results)
-                )
-                print(f"   🔄 [Server] Web search done, got {len(web_text) if web_text else 0} chars, {len(sources)} sources")
-                
-                # Send sources to frontend for display
-                await websocket.send_json({
-                    "type": "sources",
-                    "messageId": message_id,
-                    "chatId": chat_id,
-                    "sources": sources,
-                    "mode": mode_label
-                })
+                if should_search:
+                    # Send "searching" status to frontend so it can show skeleton loader
+                    await websocket.send_json({
+                        "type": "searching",
+                        "messageId": message_id,
+                        "chatId": chat_id,
+                        "query": message[:100],
+                        "mode": mode_label
+                    })
+                    
+                    # Perform web search (in thread pool to not block)
+                    loop = asyncio.get_event_loop()
+                    web_text, sources = await loop.run_in_executor(
+                        None, 
+                        lambda: gm.perform_web_search(message, k_results)
+                    )
+                    print(f"   🔄 [Server] Web search done, got {len(web_text) if web_text else 0} chars, {len(sources)} sources")
+                    
+                    # Send sources to frontend for display
+                    await websocket.send_json({
+                        "type": "sources",
+                        "messageId": message_id,
+                        "chatId": chat_id,
+                        "sources": sources,
+                        "mode": mode_label
+                    })
+                else:
+                    # Skip web search - direct LLM response
+                    print(f"   ⚡ [Server] Smart skip - no web search needed for: {message[:30]}...")
                 
                 # Get the streaming generator based on mode
                 if chat_mode == "plus":
