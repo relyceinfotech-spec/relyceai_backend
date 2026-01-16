@@ -453,68 +453,44 @@ async def websocket_chat(websocket: WebSocket):
             try:
                 print(f"   🔄 [Server] Processing chat_mode={chat_mode}, is_web_search={is_web_search}")
                 
-                # SMART QUERY CLASSIFICATION - Determine if web search is needed
+                # SMART QUERY CLASSIFICATION - Intent Lock (Strict Keywords)
                 def needs_web_search(query: str) -> bool:
                     """
-                    Classify if a query needs real-time web search or can be answered by LLM directly.
-                    Returns: True if web search needed, False for direct LLM response
+                    Classify if a query needs real-time web search using strict keyword rules.
+                    Default = NO SEARCH (LLM only) unless a keyword forces it.
                     """
-                    query_lower = query.lower().strip()
+                    q = query.lower()
                     
-                    # Patterns that DON'T need web search (direct LLM)
-                    no_search_patterns = [
-                        # Greetings and casual
-                        'hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening',
-                        'how are you', 'what\'s up', 'thanks', 'thank you', 'bye', 'goodbye',
-                        'ok', 'okay', 'sure', 'yes', 'no', 'please', 'help',
-                        # Simple questions about the AI
-                        'who are you', 'what are you', 'what can you do', 'your name',
-                        # General knowledge (LLM already knows)
-                        'what is', 'explain', 'define', 'meaning of', 'how does', 'why is',
-                        'tell me about', 'describe', 'difference between',
-                        # Creative/conversational
-                        'write a', 'create a', 'make a', 'generate', 'compose',
-                        'joke', 'story', 'poem', 'code', 'script', 'function',
-                        # Opinions and advice (no real-time data needed)
-                        'should i', 'what do you think', 'recommend', 'suggest', 'advice',
-                    ]
-                    
-                    # Patterns that NEED web search (real-time/factual data)
-                    search_patterns = [
-                        # Current events/news
-                        'latest', 'recent', 'news', 'today', 'yesterday', 'this week',
-                        'current', 'now', '2024', '2025', '2026',
-                        # Real-time data
-                        'price', 'stock', 'weather', 'score', 'result', 'live',
+                    # 🔐 GUARD 1: Intent Lock (Strict Keywords)
+                    # Only these words FORCE a web search. No ambiguity.
+                    FORCE_SEARCH = [
+                        # Time-sensitive
+                        "latest", "recent", "today", "now", "current", "live", "breaking",
+                        # News & events
+                        "news", "headline", "update",
+                        # Prices & numbers that change
+                        "price", "cost", "rate", "stock", "market", "crypto",
+                        # Sports / results
+                        "score", "result", "who won", "match",
+                        # Weather / location real-time
+                        "weather", "temperature", "rain", "forecast",
+                        # Reviews & rankings
+                        "best", "top", "review", "rating",
+                        # Explicit lookup intent
+                        "where can i buy", "availability", "release date",
                         # Specific lookups
-                        'who won', 'how much', 'when did', 'where is', 'statistics',
-                        # Research topics
-                        'research', 'study', 'report', 'data', 'statistics', 'trends',
-                        # Comparisons requiring current info
-                        'best', 'top', 'compare', 'vs', 'versus', 'review',
+                        "how much", "when did", "where is", "statistics",
+                        "2024", "2025", "2026"
                     ]
                     
-                    # Check if it's a simple greeting/short query
-                    if len(query_lower.split()) <= 3:
-                        for pattern in no_search_patterns[:15]:  # Check greetings first
-                            if pattern in query_lower:
-                                return False
-                    
-                    # Check if query explicitly needs search
-                    for pattern in search_patterns:
-                        if pattern in query_lower:
+                    # Check if ANY keyword matches
+                    for kw in FORCE_SEARCH:
+                        if kw in q:
+                            print(f"   🔐 [Server] Intent Lock: SEARCH triggers on '{kw}'")
                             return True
-                    
-                    # Check if query is conversational/creative (no search needed)
-                    for pattern in no_search_patterns:
-                        if query_lower.startswith(pattern) or pattern in query_lower:
-                            # Exception: if query also has search patterns, still search
-                            has_search_term = any(sp in query_lower for sp in search_patterns)
-                            if not has_search_term:
-                                return False
-                    
-                    # Default: do web search for longer, complex queries
-                    return len(query_lower.split()) > 5
+                            
+                    print(f"   ⚡ [Server] Intent Lock: No search keywords found -> LLM Direct")
+                    return False
                 
                 # Determine if we need web search
                 should_search = needs_web_search(message) or is_web_search  # Force search if Pro mode

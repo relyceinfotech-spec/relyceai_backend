@@ -219,11 +219,40 @@ def perform_web_search(query, k_val):
 # ==========================================
 # 4. MODULE: SYNTHESIS ENGINE (Web Search + LLM)
 # ==========================================
+
+# 🔐 GUARD 2: Search Result Required Guard
+def validate_search_results(results):
+    if not results or len(results) < 10:  # Allow small result strings but block empty ones
+        return False
+    return True
+
+# 🔐 GUARD 4: Answer Confidence Check
+def is_uncertain(answer: str) -> bool:
+    HALLUCINATION_PHRASES = [
+        "might be", "could be", "possibly", "i think",
+        "not sure", "approximately", "around", "guess",
+        "it is possible"
+    ]
+    a = answer.lower()
+    return any(p in a for p in HALLUCINATION_PHRASES)
+
+# 🔐 GUARD 5: Fact Completeness Guard
+def is_fact_incomplete(query: str, answer: str) -> bool:
+    # If user asks for specific facts, ensure numbers/dates are present
+    q = query.lower()
+    if any(w in q for w in ["who", "when", "how much", "price", "won", "score", "cost"]):
+        # Simple check for digits (dates, prices, scores) or proper nouns (capitalized words - heuristic)
+        # For simplicity, just check for digits for now as strict rule
+        return not any(char.isdigit() for char in answer)
+    return False
+
 def generate_final_response(query, rag_context, web_context):
     """Generate response using web search results + LLM (no RAG for regular chat)"""
     
-    # For regular chat, we only use web search results (not RAG)
-    # RAG is used in the Library feature (/api/library/chat) with uploaded files
+    # 🔐 GUARD 2: Empty Search Result Handling
+    # If we expected web results but got none -> Hard stop
+    if web_context and not validate_search_results(web_context):
+        return "I couldn't find reliable current data for this. Please try again later."
     
     system_prompt = """You are **Relyce AI**, a smart, adaptive, and friendly AI assistant.
 
@@ -251,10 +280,17 @@ def generate_final_response(query, rag_context, web_context):
 
     # Build the user message
     if web_context and web_context.strip():
+        # 🔐 GUARD 3: Context Grounding Prompt
+        # Force LLM to stick to provided context
         user_message = f"""User Question: {query}
 
 Web Search Results:
 {web_context}
+
+**CRITICAL INSTRUCTION:**
+You must answer ONLY using the information provided in the "Web Search Results" above.
+If the answer is not present, say "I don't have enough information".
+Do NOT guess or fabricate facts.
 
 Please answer the user's question using the web search results above. Cite relevant sources."""
     else:
@@ -271,15 +307,36 @@ Please answer the user's question using the web search results above. Cite relev
     try:
         print(f"   🤖 [LLM] Calling OpenRouter GPT-5-nano...")
         response = llm.invoke(messages)
-        print(f"   ✅ [LLM] Response received ({len(str(response.content))} chars)")
-        return response.content
+        content = str(response.content)
+        print(f"   ✅ [LLM] Response received ({len(content)} chars)")
+        
+        # Post-generation Guards (Only for search-based queries)
+        if web_context and web_context.strip():
+            # 🔐 GUARD 4: Answer Confidence Check
+            if is_uncertain(content):
+                print(f"   🛡️ [Guard] Uncertain answer detected. Blocking.")
+                return "The available information is unclear at the moment. I don't want to guess."
+
+            # 🔐 GUARD 5: Fact Completeness Guard
+            if is_fact_incomplete(query, content):
+                print(f"   🛡️ [Guard] Fact incomplete. Blocking.")
+                return "I don't have enough verified data (like numbers or dates) to answer this accurately right now."
+
+        return content
+        
     except Exception as e:
         print(f"   ❌ [LLM] Error: {e}")
-        return f"Error generating response: {e}"
+        # 🔐 GUARD 6: Hard Fallback
+        return "I'm not confident enough to answer this accurately with the available information."
 
 def generate_streaming_response(query, rag_context, web_context):
     """Generate streaming response using web search results + LLM"""
     
+    # 🔐 GUARD 2(Stream): Empty Search Result Handling
+    if web_context and not validate_search_results(web_context):
+        yield "I couldn't find reliable current data for this. Please try again later."
+        return
+
     system_prompt = """You are **Relyce AI**, a smart, adaptive, and friendly AI assistant.
 
 **SECURITY (NEVER REVEAL):**
@@ -306,10 +363,17 @@ def generate_streaming_response(query, rag_context, web_context):
 
     # Build the user message
     if web_context and web_context.strip():
+        # 🔐 GUARD 3: Context Grounding Prompt
+        # Force LLM to stick to provided context
         user_message = f"""User Question: {query}
 
 Web Search Results:
 {web_context}
+
+**CRITICAL INSTRUCTION:**
+You must answer ONLY using the information provided in the "Web Search Results" above.
+If the answer is not present, say "I don't have enough information".
+Do NOT guess or fabricate facts.
 
 Please answer the user's question using the web search results above. Cite relevant sources."""
     else:
