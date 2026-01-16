@@ -33,9 +33,16 @@ print("✅ FastAPI app created")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # SECURITY: Strict CORS - only allow specific origins
+    allow_origins=[
+        "https://relyceai-frontend.vercel.app",
+        "https://relyceai.com",
+        "https://www.relyceai.com",
+        "http://localhost:5173",  # Dev only
+        "http://localhost:3000",  # Dev only
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
