@@ -197,7 +197,7 @@ def hybrid_retrieval_func(query, bm25_retriever, chroma_retriever):
 def create_advanced_rag_chain(vectorstore, splits):
     print("Setting up LLM and Chains...")
     llm = ChatOpenAI(
-        model_name="openai/gpt-4o-mini", 
+        model_name="openai/gpt-5-nano", 
         
         # Configuration for OpenRouter
         openai_api_key=os.getenv("OPENROUTER_API_KEY"),

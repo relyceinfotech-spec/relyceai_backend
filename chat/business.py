@@ -33,7 +33,7 @@ DOCS_DIR = "./documents"
 DB_DIR = "./chroma_db"
 
 llm = ChatOpenAI(
-    model_name="openai/gpt-4o-mini",
+    model_name="openai/gpt-5-nano",
     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     openai_api_base="https://openrouter.ai/api/v1",
     temperature=0,
