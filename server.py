@@ -379,10 +379,10 @@ async def websocket_chat(websocket: WebSocket):
     locked_user_id = user_id
     locked_session_id = session_id
     
-    # Track this connection
+    # Track this connection - use connection_id as key to allow multiple devices
     user_connections[user_id].add(connection_id)
     total_connections += 1
-    active_connections[session_id] = websocket
+    active_connections[connection_id] = websocket  # Use connection_id, not session_id!
     
     try:
         while True:
@@ -533,9 +533,9 @@ async def websocket_chat(websocket: WebSocket):
                 
     except WebSocketDisconnect:
         print(f"🔌 Disconnected: {session_id[:8]}...")
-        # Clean up connection tracking
-        if session_id in active_connections:
-            del active_connections[session_id]
+        # Clean up connection tracking - use connection_id as key
+        if connection_id in active_connections:
+            del active_connections[connection_id]
         if connection_id in user_connections.get(locked_user_id, set()):
             user_connections[locked_user_id].discard(connection_id)
             if not user_connections[locked_user_id]:
@@ -543,9 +543,9 @@ async def websocket_chat(websocket: WebSocket):
         total_connections = max(0, total_connections - 1)
     except Exception as e:
         print(f"❌ WebSocket error: {e}")
-        # Clean up on any error
-        if session_id in active_connections:
-            del active_connections[session_id]
+        # Clean up on any error - use connection_id as key
+        if connection_id in active_connections:
+            del active_connections[connection_id]
         user_connections.get(locked_user_id, set()).discard(connection_id)
         total_connections = max(0, total_connections - 1)
 
