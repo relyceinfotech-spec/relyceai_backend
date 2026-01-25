@@ -1,25 +1,26 @@
 # Relyce AI Backend - Dependencies
-# Production-grade 
+# Production-grade Latest Versions
+
 # FastAPI & Server
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
 
 # Environment & Config
-python-dotenv==1.0.0
-pydantic==2.6.0
-pydantic-settings==2.1.0
+python-dotenv>=1.0.1
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
 
 # OpenAI
-openai==1.12.0
+openai>=1.59.0
 
 # Firebase Admin SDK
-firebase-admin==6.4.0
+firebase-admin>=6.6.0
 
 # HTTP Requests (for Serper API)
-requests==2.31.0
+requests>=2.32.0
 
 # File uploads
-python-multipart==0.0.9
+python-multipart>=0.0.12
 
 # WebSocket support (included in uvicorn[standard])
-websockets==12.0
+websockets>=13.0
