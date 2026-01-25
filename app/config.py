@@ -27,11 +27,11 @@ PORT = int(os.getenv("PORT", 8000))
 
 # CORS Origins (add your frontend URLs)
 CORS_ORIGINS = [
+    "*", # Allow all for deployment ease
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:3000",
-    # Add production URLs here
 ]
 
 # Serper Tool Endpoints

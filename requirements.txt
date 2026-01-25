@@ -1,6 +1,5 @@
 # Relyce AI Backend - Dependencies
-# Production-grade ChatGPT-style architecture
-
+# Production-grade 
 # FastAPI & Server
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
