@@ -23,7 +23,7 @@ FIREBASE_CLIENT_CERT_URL = os.getenv("FIREBASE_CLIENT_CERT_URL")
 
 # Server Configuration
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 8080))
 
 # CORS Origins (add your frontend URLs)
 CORS_ORIGINS = [

@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from app.config import HOST, PORT, CORS_ORIGINS
 from app.models import (
-    ChatRequest, ChatResponse, SearchRequest, 
+    ChatRequest, ChatResponse, SearchRequest,
     HealthResponse, WebSocketMessage, Personality
 )
 from app.auth import verify_token, initialize_firebase
