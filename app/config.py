@@ -29,11 +29,6 @@ PORT = int(os.getenv("PORT", 8080))
 CORS_ORIGINS = [
     "https://relyceai.com",
     "https://www.relyceai.com",
-    "https://relyceai-frontend.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
 ]
 
 # Regex pattern for Vercel preview deployments

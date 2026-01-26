@@ -11,7 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Quer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from app.config import HOST, PORT, CORS_ORIGINS
+from app.config import HOST, PORT, CORS_ORIGINS, CORS_ORIGIN_REGEX
 from app.models import (
     ChatRequest, ChatResponse, SearchRequest,
     HealthResponse, WebSocketMessage, Personality
@@ -57,7 +57,8 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://relyceai.com", "https://www.relyceai.com"],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

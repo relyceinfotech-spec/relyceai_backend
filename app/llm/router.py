@@ -299,7 +299,7 @@ async def analyze_and_route_query(user_query: str, mode: str, context_messages: 
                 {"role": "user", "content": user_query}
             ],
             response_format={"type": "json_object"},
-            max_tokens=80
+            max_completion_tokens=80
         )
         
         result = json.loads(response.choices[0].message.content)
