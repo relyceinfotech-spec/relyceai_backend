@@ -203,8 +203,3 @@ def delete_custom_personality(user_id: str, personality_id: str) -> bool:
     except Exception as e:
         print(f"[Personalities] Error deleting: {e}")
         return False
-
-
-    except Exception as e:
-        print(f"[Personalities] Error deleting: {e}")
-        return False
