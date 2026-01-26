@@ -164,12 +164,24 @@ class LLMProcessor:
         if intent == "INTERNAL" or not selected_tools:
             # Stream internal response
             if personality:
-                 system_prompt = get_internal_system_prompt_for_personality(personality, user_settings)
+                 # 🎭 Advanced Routing: Dynamic Persona Switching (ONLY for Generic/Normal + Relyce AI)
+                 # If sub_intent is detected (debugging, sql, etc.), use that specific prompt overlay
+                 sub_intent = analysis.get("sub_intent", "general")
+                 from app.llm.router import INTERNAL_MODE_PROMPTS
+                 
+                 base_prompt = get_internal_system_prompt_for_personality(personality, user_settings)
+                 
+                 # Dynamic Overlay: If mode is generic/normal and we have a specialized sub-intent
+                 if mode == "normal" and sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
+                     specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
+                     system_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
+                 else:
+                     system_prompt = base_prompt
             else:
                  from app.llm.router import _build_user_context_string
                  system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
                  
-            print(f"[LATENCY] Starting Internal Stream: {time.time() - start_time:.4f}s")
+            print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
             
             # 🚀 IMMEDIATELY yield a signal token to hide the loader on frontend
             yield " " 

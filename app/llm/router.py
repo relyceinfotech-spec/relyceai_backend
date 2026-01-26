@@ -207,37 +207,85 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     return selected_tools
 
 
+# ============================================
+# INTERNAL MODES & PROMPTS
+# ============================================
+INTERNAL_MODE_PROMPTS = {
+    "reasoning": "You are a Logic & Reasoning Engine. Break down the problem step-by-step to reach the correct conclusion. Be analytical and precise.",
+    "code_explanation": "You are a Senior Tech Lead. Explain the code clearly, focusing on flow, key components, and design patterns. Simplify complex concepts.",
+    "debugging": "You are an Expert Debugger. Identify the error, explain WHY it happened, and provide the corrected code. Focus on the fix.",
+    "system_design": "You are a System Architect. Design scalable, efficient, and robust systems. Discuss trade-offs, database choices, and high-level architecture.",
+    "sql": "You are a Database Expert. Write optimized SQL queries. Explain the execution plan and any necessary indexes.",
+    "casual_chat": "You are a friendly, witty AI companion. Use emojis, reflect the user's energy, and be supportive. 🌟 interact like a human friend.",
+    "career_guidance": "You are a Tech Career Coach. Provide actionable advice for resume building, interviews, and career growth paths.",
+    "content_creation": "You are a Creative Content Strategist. Write engaging, viral-ready content tailored to the requested platform and audience.",
+    "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
+}
+
 async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
     """
-    Combined Intent + Tool Selection to reduce latency.
-    Returns: {"intent": "INTERNAL"|"EXTERNAL", "tools": [...]}
+    Combined Intent + Tool Selection + Sub-Intent Detection.
+    Returns: {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
     """
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
     
-    # 1. Greetings (Strict Internal)
+    # 1. Greetings (Strict Internal -> Casual)
     greeting_list = ["hi", "hello", "hey", "test", "ping", "hola", "greetings", "hii", "hiii", "yo", "sup"]
     if q in greeting_list:
-        return {"intent": "INTERNAL", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
-    # 2. technical keywords (Internal)
-    tech_keywords = ["code", "mkdir", "terminal", "npm", "git", "python", "javascript", "how to", "create", "write", "fix", "error", "command", "bash", "linux", "windows", "mac"]
+    # 4. Personal/Conversational Questions (Strict Internal -> Casual)
+    if mode == "normal" and ("you" in q or "your" in q) and len(q) < 80:
+         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+
+    # 2. Tech Keywords / Patterns (Heuristic Classification)
+    
+    # SQL
+    if any(k in q for k in ["select *", "join table", "sql query", "write sql", "database schema"]):
+        return {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
+        
+    # Debugging
+    if any(k in q for k in ["fix this error", "debug this", "why is this failing", "exception:", "error:"]):
+        return {"intent": "INTERNAL", "sub_intent": "debugging", "tools": []}
+        
+    # Code Explanation
+    if any(k in q for k in ["explain this code", "how does this work", "walk me through"]):
+        return {"intent": "INTERNAL", "sub_intent": "code_explanation", "tools": []}
+
+    # General Tech (Fallback to generic Internal)
+    tech_keywords = ["code", "mkdir", "terminal", "npm", "git", "python", "javascript", "bash", "linux"]
     if len(q) < 150 and any(kw in q for kw in tech_keywords):
-        return {"intent": "INTERNAL", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
 
-    # 3. Starts with greeting (Strict Internal)
-    if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you", "what's up", "hii ", "yo "]):
-         return {"intent": "INTERNAL", "tools": []}
+    # 3. Starts with greeting
+    if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you ", "what's up "]):
+         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # Define tool schema
     tools_list = ", ".join(get_tools_for_mode(mode).keys())
 
-    system_prompt = (
-        "Router: Output JSON.\n"
-        "1. Intent: 'INTERNAL' (code, basic logic) or 'EXTERNAL' (search needed).\n"
-        "2. Tools: Select tools from [" + tools_list + "].\n"
-        "Format: {\"intent\": \"...\", \"tools\": []}"
-    )
+    # Enhanced Router Prompt for Generic Mode
+    if mode == "normal":
+        system_prompt = (
+            "Router: Output JSON.\n"
+            "Classify INTENT as 'INTERNAL' (bot can answer) or 'EXTERNAL' (needs web search).\n"
+            "If INTERNAL, also classify SUB_INTENT: [reasoning, code_explanation, debugging, system_design, sql, casual_chat, career_guidance, content_creation, general].\n"
+            "If EXTERNAL, select Tools from [" + tools_list + "].\n\n"
+            "Examples:\n"
+            "- 'Write a poem' -> {intent: 'INTERNAL', sub_intent: 'content_creation'}\n"
+            "- 'Why is my react app crashing?' -> {intent: 'INTERNAL', sub_intent: 'debugging'}\n"
+            "- 'Stock price of Tesla' -> {intent: 'EXTERNAL', tools: ['Search', 'News']}\n"
+            "Format: {\"intent\": \"...\", \"sub_intent\": \"...\", \"tools\": []}"
+        )
+    else:
+        # Standard router for other modes
+        system_prompt = (
+            "Router: Output JSON.\n"
+            "1. Intent: 'INTERNAL' or 'EXTERNAL'.\n"
+            "2. Tools: Select tools from [" + tools_list + "].\n"
+            "Format: {\"intent\": \"...\", \"tools\": []}"
+        )
 
     try:
         # 🏎️ Use gpt-5-nano for ultra-fast classification
@@ -248,10 +296,15 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
                 {"role": "user", "content": user_query}
             ],
             response_format={"type": "json_object"},
-            max_tokens=60
+            max_tokens=80
         )
         
         result = json.loads(response.choices[0].message.content)
+        
+        # Ensure sub_intent exists for INTERNAL
+        if result.get("intent") == "INTERNAL" and "sub_intent" not in result:
+             result["sub_intent"] = "general"
+             
         return result
     except Exception as e:
         print(f"Router Error: {e}")
