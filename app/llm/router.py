@@ -215,17 +215,18 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
     
-    # 1. Greetings
-    if q in ["hi", "hello", "hey", "test", "ping", "hola", "greetings"]:
+    # 1. Greetings (Strict Internal)
+    greeting_list = ["hi", "hello", "hey", "test", "ping", "hola", "greetings", "hii", "hiii", "yo", "sup"]
+    if q in greeting_list:
         return {"intent": "INTERNAL", "tools": []}
-    
+
     # 2. technical keywords (Internal)
     tech_keywords = ["code", "mkdir", "terminal", "npm", "git", "python", "javascript", "how to", "create", "write", "fix", "error", "command", "bash", "linux", "windows", "mac"]
     if len(q) < 150 and any(kw in q for kw in tech_keywords):
         return {"intent": "INTERNAL", "tools": []}
 
-    # 3. Starts with greeting
-    if len(q) < 50 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you", "what's up"]):
+    # 3. Starts with greeting (Strict Internal)
+    if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you", "what's up", "hii ", "yo "]):
          return {"intent": "INTERNAL", "tools": []}
 
     # Define tool schema
