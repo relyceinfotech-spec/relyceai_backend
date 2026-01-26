@@ -8,7 +8,6 @@ from typing import AsyncGenerator, List, Dict, Any, Optional
 from openai import OpenAI
 from app.config import OPENAI_API_KEY, LLM_MODEL
 from app.llm.router import (
-    analyze_query_intent,
     select_tools_for_mode,
     analyze_and_route_query,
     execute_serper_batch,
@@ -116,8 +115,9 @@ class LLMProcessor:
         Main entry point - routes to appropriate handler.
         Returns complete response dict.
         """
-        # Analyze intent
-        intent = await analyze_query_intent(user_query)
+        # Analyze intent using the consolidated router
+        analysis = await analyze_and_route_query(user_query, mode)
+        intent = analysis.get("intent", "EXTERNAL")
         
         if intent == "INTERNAL":
             response_text = await self.process_internal_query(user_query, personality, user_settings)
