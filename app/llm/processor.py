@@ -18,7 +18,8 @@ from app.llm.router import (
     get_system_prompt_for_personality,
     get_internal_system_prompt_for_personality,
     INTERNAL_SYSTEM_PROMPT,
-    client
+    INTERNAL_SYSTEM_PROMPT,
+    get_openai_client
 )
 
 class LLMProcessor:
@@ -28,7 +29,6 @@ class LLMProcessor:
     """
     
     def __init__(self):
-        self.client = client
         self.model = LLM_MODEL
     
     async def process_internal_query(self, user_query: str, personality: Optional[Dict] = None, user_settings: Optional[Dict] = None) -> str:
@@ -42,7 +42,7 @@ class LLMProcessor:
             from app.llm.router import _build_user_context_string
             system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
             
-        response = await self.client.chat.completions.create(
+        response = await get_openai_client().chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -97,7 +97,7 @@ class LLMProcessor:
             "content": f"Search Data:\n{context_str}\n\nUser Query: {user_query}"
         })
         
-        response = await self.client.chat.completions.create(
+        response = await get_openai_client().chat.completions.create(
             model=self.model,
             messages=messages
         )
@@ -186,7 +186,7 @@ class LLMProcessor:
             # 🚀 IMMEDIATELY yield a signal token to hide the loader on frontend
             yield " " 
 
-            stream = await self.client.chat.completions.create(
+            stream = await get_openai_client().chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -248,7 +248,7 @@ class LLMProcessor:
             # 🚀 Signal frontend to show message bubble
             yield " "
 
-            stream = await self.client.chat.completions.create(
+            stream = await get_openai_client().chat.completions.create(
                 model=self.model,
                 messages=messages,
                 stream=True

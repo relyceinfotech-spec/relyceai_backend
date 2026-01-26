@@ -9,8 +9,16 @@ from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
 from app.config import OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS
 
-# Initialize OpenAI client
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI client lazily
+_client: Optional[AsyncOpenAI] = None
+
+def get_openai_client() -> AsyncOpenAI:
+    global _client
+    if _client is None:
+        if not OPENAI_API_KEY:
+             raise RuntimeError("OPENAI_API_KEY not set")
+        _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    return _client
 
 # ============================================
 # TOOLS CONFIGURATION (from existing files)
@@ -140,25 +148,7 @@ def get_headers() -> Dict[str, str]:
     }
 
 
-async def analyze_query_intent(user_query: str) -> str:
-    """
-    Decides if the query is INTERNAL (Math/Code/Logic) or EXTERNAL (Needs Data).
-    """
-    system_prompt = (
-        "You are a router. Analyze the user's query.\n"
-        "1. If the query is simple math (e.g. '50*3'), coding, basic logic, or a greeting, return 'INTERNAL'.\n"
-        "2. If the query requires real-world data, news, places, specific facts, or deep research, return 'EXTERNAL'.\n"
-        "Output ONLY 'INTERNAL' or 'EXTERNAL'."
-    )
-    
-    response = await client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
-        ]
-    )
-    return response.choices[0].message.content.strip()
+
 
 
 async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
@@ -193,7 +183,7 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     else:
         system_prompt = f"Select {mode_descriptor} from [{tools_list}] for: '{user_query}'. Return comma-separated list."
     
-    response = await client.chat.completions.create(
+    response = await get_openai_client().chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": system_prompt}]
     )
@@ -243,13 +233,13 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
 
     # 2. Tech Keywords / Patterns (Heuristic Classification)
     
-    # SQL
-    if any(k in q for k in ["select *", "join table", "sql query", "write sql", "database schema"]):
-        return {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
-        
-    # Debugging
-    if any(k in q for k in ["fix this error", "debug this", "why is this failing", "exception:", "error:"]):
+    # Debugging (Priority 1: Catch errors before creations)
+    if any(k in q for k in ["fix this error", "debug this", "why is this failing", "exception:", "error:", "traceback", "stack trace"]):
         return {"intent": "INTERNAL", "sub_intent": "debugging", "tools": []}
+
+    # SQL (Priority 2)
+    if any(k in q for k in ["select *", "join table", "sql query", "write sql", "database schema", "insert into"]):
+        return {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
         
     # Code Explanation
     if any(k in q for k in ["explain this code", "how does this work", "walk me through"]):
@@ -291,7 +281,7 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
 
     try:
         # 🏎️ Use gpt-5-nano for ultra-fast classification
-        response = await client.chat.completions.create(
+        response = await get_openai_client().chat.completions.create(
             model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": system_prompt},
