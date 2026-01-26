@@ -57,8 +57,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    # Combined regex for all allowed origins (Production + Localhost)
-    allow_origin_regex=r"https://.*\.vercel\.app|https://.*\.up\.railway\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+",
+    allow_origins=["https://relyceai.com", "https://www.relyceai.com"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
