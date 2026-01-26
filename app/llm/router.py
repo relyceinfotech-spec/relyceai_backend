@@ -236,7 +236,9 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
-    if mode == "normal" and ("you" in q or "your" in q) and len(q) < 80:
+    # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"
+    convo_triggers = ["you", "your", " we ", " we?", " we.", " us ", " us?", "myself", "can we", "shall we"]
+    if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers):
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # 2. Tech Keywords / Patterns (Heuristic Classification)
