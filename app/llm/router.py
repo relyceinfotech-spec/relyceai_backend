@@ -102,6 +102,7 @@ Provide fact-based, high-level guidance operating with:
 **Guidelines:**
 * **Synthesis:** Combine search data with internal knowledge.
 * **Tone:** Professional, authoritative, and advisory.
+* **Emoji Usage:** STRICTLY RESTRICTED. Use a maximum of 1 emoji per response, or none at all. Maintain executive professionalism.
 
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
@@ -212,9 +213,10 @@ INTERNAL_MODE_PROMPTS = {
     "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
 }
 
-async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
+async def analyze_and_route_query(user_query: str, mode: str, context_messages: Optional[List[Dict]] = None) -> Dict[str, Any]:
     """
     Combined Intent + Tool Selection + Sub-Intent Detection.
+    Now Context-Aware: Uses recent chat history to deterime intent (Sticky Mode).
     Returns: {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
     """
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
@@ -264,6 +266,7 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
             "Classify INTENT as 'INTERNAL' (bot can answer) or 'EXTERNAL' (needs web search).\n"
             "If INTERNAL, also classify SUB_INTENT: [reasoning, code_explanation, debugging, system_design, sql, casual_chat, career_guidance, content_creation, general].\n"
             "If EXTERNAL, select Tools from [" + tools_list + "].\n\n"
+            "CONTEXT AWARENESS: Use the provided [Recent History] to determine intent. If the previous user request was 'code_explanation' or 'debugging', and the new query is a follow-up (e.g. 'what about this?', 'why?'), MAINTAIN the same sub_intent.\n\n"
             "Examples:\n"
             "- 'Write a poem' -> {intent: 'INTERNAL', sub_intent: 'content_creation'}\n"
             "- 'Why is my react app crashing?' -> {intent: 'INTERNAL', sub_intent: 'debugging'}\n"
@@ -280,11 +283,19 @@ async def analyze_and_route_query(user_query: str, mode: str) -> Dict[str, Any]:
         )
 
     try:
+        # Build prompt with history
+        history_str = ""
+        if context_messages and len(context_messages) > 0:
+            # Take last 2 exchanges max
+            recent = context_messages[-2:] 
+            history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
+            history_str = f"\n\n[Recent History]\n{history_str}\n"
+
         # 🏎️ Use gpt-5-nano for ultra-fast classification
         response = await get_openai_client().chat.completions.create(
             model="gpt-5-nano",
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system_prompt + history_str},
                 {"role": "user", "content": user_query}
             ],
             response_format={"type": "json_object"},

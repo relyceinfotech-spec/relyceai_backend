@@ -155,7 +155,8 @@ class LLMProcessor:
         print(f"[LATENCY] Start processing: {0:.4f}s")
         
         # Combined Analysis (Intent + Tools)
-        analysis = await analyze_and_route_query(user_query, mode)
+        # Pass context_messages for sticky routing (history awareness)
+        analysis = await analyze_and_route_query(user_query, mode, context_messages)
         intent = analysis.get("intent", "EXTERNAL")
         selected_tools = analysis.get("tools", [])
         
