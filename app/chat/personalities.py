@@ -15,7 +15,8 @@ SYSTEM_PERSONALITIES = [
         "description": "Professional, helpful, and empathetic AI assistant.",
         "prompt": DEFAULT_PERSONA,
         "is_default": True,
-        "is_system": True # Locked
+        "is_system": True,  # Locked
+        "content_mode": "hybrid"  # Uses intent classification
     }
 ]
 
@@ -27,7 +28,8 @@ TEMPLATE_PERSONALITIES = [
         "description": "A casual, friendly companion who speaks like a close friend.",
         "prompt": "You are a friendly, casual companion named Buddy. Speak like a close friend, use slang where appropriate, and keep it chill. 🤙",
         "is_default": True,
-        "is_system": False # Editable
+        "is_system": False,  # Editable
+        "content_mode": "hybrid"  # Default mode
     }
 ]
 
@@ -79,10 +81,16 @@ def get_all_personalities(user_id: str) -> List[Dict]:
     
     return personalities
 
-def create_custom_personality(user_id: str, name: str, description: str, prompt: str) -> Optional[Dict]:
+def create_custom_personality(user_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid") -> Optional[Dict]:
     """
     Create a new custom personality for a user.
+    content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
     """
+    # Validate content_mode
+    valid_modes = ["hybrid", "web_search", "llm_only"]
+    if content_mode not in valid_modes:
+        content_mode = "hybrid"
+    
     try:
         db = get_firestore_db()
         if not db:
@@ -92,6 +100,7 @@ def create_custom_personality(user_id: str, name: str, description: str, prompt:
             "name": name,
             "description": description,
             "prompt": prompt,
+            "content_mode": content_mode,
             "createdAt": str(uuid.uuid4())
         }
         
@@ -133,13 +142,19 @@ def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
             
     return None
 
-def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str) -> bool:
+def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid") -> bool:
     """
     Update a personality. 
     If it's a Template ID (like 'buddy') and doesn't exist in DB, create it (Shadowing).
     If it's a System ID, fail.
+    content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
     """
-    # explicit check for system locked
+    # Validate content_mode
+    valid_modes = ["hybrid", "web_search", "llm_only"]
+    if content_mode not in valid_modes:
+        content_mode = "hybrid"
+    
+    # Explicit check for system locked
     if any(p['id'] == personality_id for p in SYSTEM_PERSONALITIES):
         return False
         
@@ -159,18 +174,20 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
                     "name": name,
                     "description": description,
                     "prompt": prompt,
+                    "content_mode": content_mode,
                     "is_shadow": True,
                     "createdAt": str(uuid.uuid4())
                 })
                 return True
             else:
-                return False # Cannot update non-existent random ID
+                return False  # Cannot update non-existent random ID
         else:
             # Normal update
             doc_ref.update({
                 "name": name,
                 "description": description,
-                "prompt": prompt
+                "prompt": prompt,
+                "content_mode": content_mode
             })
             return True
         

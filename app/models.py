@@ -10,6 +10,9 @@ import uuid
 # Chat Modes
 ChatMode = Literal["normal", "business", "deepsearch"]
 
+# Content Mode for Personas - Controls how queries are processed
+ContentMode = Literal["hybrid", "web_search", "llm_only"]
+
 class Personality(BaseModel):
     """Chat Personality configuration"""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -17,6 +20,8 @@ class Personality(BaseModel):
     description: Optional[str] = None
     prompt: str
     is_default: bool = False
+    is_system: bool = False  # System personas (like Relyce AI) cannot be edited
+    content_mode: ContentMode = "hybrid"  # Controls query processing behavior
 
 class ChatMessage(BaseModel):
     """Single chat message"""

@@ -97,7 +97,8 @@ async def create_personality(request: Personality, user_id: str = Query(...)):
         user_id, 
         request.name, 
         request.description, 
-        request.prompt
+        request.prompt,
+        request.content_mode  # Pass content_mode
     )
     if result:
         return {"success": True, "personality": result}
@@ -114,7 +115,8 @@ async def update_personality(personality_id: str, request: Personality, user_id:
         personality_id,
         request.name,
         request.description,
-        request.prompt
+        request.prompt,
+        request.content_mode  # Pass content_mode
     )
     
     if success:

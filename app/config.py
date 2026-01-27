@@ -29,6 +29,10 @@ PORT = int(os.getenv("PORT", 8080))
 CORS_ORIGINS = [
     "https://relyceai.com",
     "https://www.relyceai.com",
+    "http://localhost:5173",      # Vite dev server
+    "http://localhost:3000",      # Alternative dev port
+    "http://127.0.0.1:5173",      # Vite dev server (IP)
+    "http://127.0.0.1:3000",      # Alternative dev port (IP)
 ]
 
 # Regex pattern for Vercel preview deployments
