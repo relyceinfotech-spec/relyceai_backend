@@ -30,6 +30,46 @@ class LLMProcessor:
     def __init__(self):
         self.model = LLM_MODEL
     
+    async def summarize_context(self, messages: List[Dict], existing_summary: str = "") -> str:
+        """
+        Summarize a list of messages into a concise context string.
+        Used for Option-2 Context Strategy.
+        Refines existing summary if provided.
+        """
+        if not messages and not existing_summary: return ""
+        
+        conversation_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+        
+        # improved prompt for cumulative memory
+        prompt_content = ""
+        if existing_summary:
+            prompt_content += f"EXISTING SUMMARY:\n{existing_summary}\n\n"
+        
+        prompt_content += f"NEW MESSAGES TO INTEGRATE:\n{conversation_text}\n\n"
+        
+        prompt_content += (
+            "INSTRUCTIONS:\n"
+            "Update the summary to include the new messages. \n"
+            "Summarize the conversation into 5–7 bullet points.\n"
+            "Preserve:\n"
+            "- Technical decisions\n"
+            "- User intent\n"
+            "- Constraints (privacy, admin rules)\n"
+            "- Important entities (Firestore, Redis, etc.)\n"
+            "Do NOT add new info. Keep it concise."
+        )
+        
+        try:
+            response = await get_openai_client().chat.completions.create(
+                model="gpt-3.5-turbo", # Use cheaper model for summary
+                messages=[{"role": "user", "content": prompt_content}],
+                max_tokens=400
+            )
+            return response.choices[0].message.content
+        except Exception:
+            return existing_summary # Return old summary if update fails
+
+    
     async def process_internal_query(self, user_query: str, personality: Optional[Dict] = None, user_settings: Optional[Dict] = None) -> str:
         """
         Handle internal queries (greetings, math, code, logic).
@@ -181,18 +221,27 @@ class LLMProcessor:
             else:
                  from app.llm.router import _build_user_context_string
                  system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
-                 
+
             print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
             
             # 🚀 IMMEDIATELY yield a signal token to hide the loader on frontend
             yield " " 
 
+            # Construct messages with Context (Option 2 Support)
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Inject context messages (including potential Summary system message)
+            if context_messages:
+                # If we have a summary system message injected by websocket.py, it will be first
+                # We simply append all context messages. 
+                # Note: Logic to prune/summarize is handled in websocket.py/main.py before calling this.
+                messages.extend(context_messages)
+            
+            messages.append({"role": "user", "content": user_query})
+
             stream = await get_openai_client().chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_query}
-                ],
+                messages=messages,
                 stream=True
             )
             

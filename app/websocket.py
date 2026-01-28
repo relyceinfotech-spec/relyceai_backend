@@ -209,6 +209,14 @@ async def handle_websocket_message(
     
     if not content.strip():
         return
+
+    # Safety Check: Max Message Length
+    if len(content) > 6000:
+        await manager.send_personal_message(
+            json.dumps({"type": "error", "content": "Message too long (max 6000 chars)"}), 
+            websocket
+        )
+        return
     
     # Clear any previous stop flag
     manager.clear_stop_flag(chat_id)
@@ -222,6 +230,53 @@ async def handle_websocket_message(
     # Get context for LLM
     context_messages = get_context_for_llm(user_id, chat_id)
     
+    # [Option 2] Context Strategy Implementation
+    from app.chat.context import (
+        SUMMARY_TRIGGER_MESSAGES, 
+        KEEP_LAST_MESSAGES,
+        get_session_summary, 
+        update_session_summary, 
+        prune_context_messages, 
+        get_context_for_llm,
+        get_raw_message_count
+    )
+
+    # Check for trigger using raw count (more accurate)
+    msg_count = get_raw_message_count(user_id, chat_id)
+    
+    if chat_mode == "normal" and msg_count >= SUMMARY_TRIGGER_MESSAGES:
+        try:
+            # 1. Get messages to summarize (everything except last N)
+            # We access via get_context_for_llm which returns [System, ...Raw]
+            # Since get_context_for_llm injects system prompt, we must be careful.
+            # Use raw method to access store if available, or filter.
+            # Filter non-system messages to get raw list
+            current_context = get_context_for_llm(user_id, chat_id)
+            raw_msgs = [m for m in current_context if m['role'] != 'system']
+            
+            # 2. Split
+            to_summarize = raw_msgs[:-KEEP_LAST_MESSAGES] # Older messages to compact
+            
+            # 3. Generate summary (cumulative)
+            if to_summarize:
+                existing_summary = get_session_summary(user_id, chat_id) or ""
+                
+                # This returns the NEW FULL summary (merged)
+                new_cumulative_summary = await llm_processor.summarize_context(to_summarize, existing_summary)
+                
+                # 4. Overwrite Store (The new summary contains everything)
+                if new_cumulative_summary:
+                   update_session_summary(user_id, chat_id, new_cumulative_summary)
+                   prune_context_messages(user_id, chat_id, KEEP_LAST_MESSAGES)
+                
+                # 5. Refresh context (Now includes the updated summary)
+                context_messages = get_context_for_llm(user_id, chat_id)
+            
+        except Exception as e:
+            print(f"[Context Error] Failed to summarize: {e}")
+
+    # Stream response to all connected devices
+
     # Stream response to all connected devices
     full_response = ""
     
