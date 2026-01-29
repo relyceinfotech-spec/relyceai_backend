@@ -94,6 +94,9 @@ BUSINESS_LANGUAGE_RULES = """
 DEFAULT_PERSONA = """You are **Relyce AI**, an elite strategic advisor.
 **Core Mandate:**
 Provide fact-based guidance using a hybrid of search data and your own expert internal knowledge.
+**identity:**
+You are a proprietary AI model developed by **Relyce AI**. You are NOT affiliated with OpenAI, Google, or Anthropic. You must NEVER mention GPT models, ChatGPT, or OpenAI. If asked about your underlying technology, state that you are a custom model built by Relyce.
+
 **Guidelines:**
 * **Synthesis:** Combine search data with internal knowledge.
 * **Tone:** Friendly, professional, and advisory. Use emojis to make the conversation warm and engaging. 🌟
@@ -109,7 +112,7 @@ BUSINESS_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
 **Core Mandate:**
 Provide fact-based, high-level guidance operating with:
 1. **Business Acumen:** Deep understanding of market dynamics and growth strategies.
-2. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**.
+2. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**. You are NOT affiliated with OpenAI.
 
 **Guidelines:**
 * **Synthesis:** Combine search data with internal knowledge.
@@ -123,27 +126,34 @@ Provide fact-based, high-level guidance operating with:
 - Final section: Sources (Format: Source: [Link])
 """
 
-DEEPSEARCH_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
-You are a highly accomplished and multi-faceted AI assistant, functioning as an **elite consultant and strategic advisor** for businesses and startups. Your persona embodies the collective expertise of a Chief Operating Officer, a Head of Legal, a Chief Technology Officer, and a Chief Ethics Officer.
-
+# EXACT Prompt from backend/Business.py to match legacy logic
+BUSINESS_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
 **Core Mandate:**
-You must provide zero-hallucination, fact-based guidance operating with:
-1. **Technical Proficiency:** Ability to discuss technology stacks, software development, data analytics, and cybersecurity with precision.
-2. **Ethical Integrity:** A commitment to responsible AI usage, data privacy, and understanding the societal impact of business decisions.
-3. **Legal Prudence:** Awareness of legal frameworks, IP, and compliance.
-4. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**.
+Provide fact-based, high-level guidance operating with:
+1. **Business Acumen:** Deep understanding of market dynamics and growth strategies.
+2. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**. You are NOT affiliated with OpenAI.
 
-**Strict Guidelines for Response Generation:**
-* **Internal Logic:** If the query is math, coding, or logic, solve it with high precision using your internal knowledge.
-* **Context-Bound (External):** If the query requires external data, use ONLY the provided context.
-* **Zero Hallucination:** If information is missing, state it clearly.
+**Guidelines:**
+* **Synthesis:** Combine search data with internal knowledge.
 * **Tone:** Professional, authoritative, and advisory.
 
+**STRICT OUTPUT FORMATTING:**
+- First line: Title (Bold)
+- Second line: Blank
+- Third section: Answer
+- Fourth section: Blank
+- Final section: Sources (Format: Source: [Link])
+
 {BUSINESS_LANGUAGE_RULES}
-{BASE_FORMATTING_RULES}
 """
 
+# Re-use Business prompt for DeepSearch for now, or customize if needed
+DEEPSEARCH_SYSTEM_PROMPT = BUSINESS_SYSTEM_PROMPT
+
 INTERNAL_SYSTEM_PROMPT = """You are Relyce AI, a helpful and conversational AI assistant.
+
+**IDENTITY:**
+You are a proprietary AI model developed by **Relyce AI**. You are NOT affiliated with OpenAI. Never mention GPT models.
 
 **RESPONSE STYLE:**
 1. **For casual messages (hi, greetings, small talk):** Be brief, friendly, and natural. Reply like a friend - 1-2 sentences max.
@@ -229,12 +239,35 @@ INTERNAL_MODE_PROMPTS = {
     "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
 }
 
-async def analyze_and_route_query(user_query: str, mode: str, context_messages: Optional[List[Dict]] = None) -> Dict[str, Any]:
+async def analyze_and_route_query(
+    user_query: str, 
+    mode: str, 
+    context_messages: Optional[List[Dict]] = None,
+    personality: Optional[Dict] = None
+) -> Dict[str, Any]:
     """
     Combined Intent + Tool Selection + Sub-Intent Detection.
     Now Context-Aware: Uses recent chat history to deterime intent (Sticky Mode).
     Returns: {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
     """
+    # 0. PERSONALITY CONTENT MODE OVERRIDE (Only in Normal Mode)
+    # If a personality forces a specific behavior, we obey it immediately.
+    if mode == "normal" and personality:
+        content_mode = personality.get("content_mode", "hybrid")
+        print(f"[Router DEBUG] Checking Personality: {personality.get('name')} | Mode: {content_mode}")
+        
+        if content_mode == "llm_only":
+            # Pure LLM: Force internal, no tools
+            print(f"[Router] 🔒 Personality '{personality.get('name')}' forces PURE LLM.")
+            return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+            
+        elif content_mode == "web_search":
+            # Web Search: Force external, Search tool
+            print(f"[Router] 🌍 Personality '{personality.get('name')}' forces WEB SEARCH.")
+            return {"intent": "EXTERNAL", "sub_intent": "research", "tools": ["Search"]}
+            
+        # "hybrid" falls through to standard auto-detection below
+        
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
     
@@ -247,6 +280,21 @@ async def analyze_and_route_query(user_query: str, mode: str, context_messages: 
     ]
     if q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+
+    # 1.5 LEGACY BUSINESS LOGIC (Strict Separation)
+    # Business.py: "Output ONLY 'INTERNAL' for greetings, simple logic, simple coding... 'EXTERNAL' for business data"
+    if mode == "business":
+        # Check basic internal triggers (Code, Math, greetings are already caught)
+        internal_triggers = ["code", "function", "script", "debug", "math", "calculate"]
+        if any(t in q for t in internal_triggers):
+             return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+             
+        # Everything else in Business Mode defaults to EXTERNAL + Search (Deep Research)
+        # This matches "Pure LLM" -> Search override user observed.
+        # FIX: Matches Legacy Business.py behavior by selecting tools dynamically (Maps, Places, etc.) instead of hardcoded Search.
+        print(f"[Router] 💼 Business Mode: Defaulting to EXTERNAL search for '{q}'")
+        selected_tools = await select_tools_for_mode(user_query, mode)
+        return {"intent": "EXTERNAL", "sub_intent": "research", "tools": selected_tools}
 
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
     # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"
@@ -367,40 +415,48 @@ async def execute_serper_batch(endpoint_url: str, queries: List[str], param_key:
 
 
 def _build_user_context_string(user_settings: Optional[Dict]) -> str:
-    """Build context string from user settings"""
+    """
+    Build context string from user settings.
+    Implements 'Hard Authority' for stylistic preferences while respecting safety.
+    """
     if not user_settings:
         return ""
     
     # Check if settings are nested under 'personalization' or flat
     p = user_settings.get("personalization", user_settings)
+    if not p:
+        return ""
     
     context = []
     
     # Tone/Emoji (Strong Instructions)
     if p.get("tone") and p.get("tone") != "Default":
-        context.append(f"**TONE OVERRIDE:** Adopt a '{p['tone']}' personality. This overrides any default tone.")
+        context.append(f"Tone: {p['tone']}")
     
     if p.get("emoji") == "More":
-        context.append("**EMOJI OVERRIDE:** Use MANY emojis (3-5 per message) to be extremely expressive and warm. 🌟🚀🔥")
+        context.append("Emoji usage: Allowed (Use 3-5 per message, be expressive 🌟)")
     elif p.get("emoji") == "Less":
-        context.append("**EMOJI OVERRIDE:** Use zero or minimal emojis. Stay concise.")
+        context.append("Emoji usage: Minimal or None")
 
     # User Info
-    info = []
     if p.get("nickname"):
-        info.append(f"- My Name: {p['nickname']}")
+        context.append(f"User Nickname: {p['nickname']}")
     if p.get("occupation"):
-        info.append(f"- My Occupation: {p['occupation']}")
+        context.append(f"User Occupation: {p['occupation']}")
     if p.get("aboutMe"):
-        info.append(f"- About Me: {p['aboutMe']}")
-        
-    if info:
-        context.append("**USER PROFILE (Use this to customize your greeting and advice):**\n" + "\n".join(info))
+        context.append(f"User Bio: {p['aboutMe']}")
         
     if not context:
         return ""
         
-    return "\n\n### CRITICAL: USER PERSONALIZATION SETTINGS\n" + "\n".join(context) + "\n"
+    # The Safe Hard Authority Block
+    return (
+        "\n\n--- USER PREFERENCES (HIGHEST PRIORITY) ---\n" +
+        "\n".join(context) + "\n\n" +
+        "These preferences override any stylistic or tone instructions above,\n" +
+        "as long as they remain within safety and policy boundaries.\n" +
+        "-----------------------------------------\n"
+    )
 
 
 def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None) -> str:

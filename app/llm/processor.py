@@ -120,11 +120,16 @@ class LLMProcessor:
         context_str = json.dumps(aggregated_context, indent=2)
         
         # Determine system prompt
+        # Determine system prompt
         if personality and mode == "normal":
+            # 🎭 Personalities are ONLY honored in Normal Mode
             from app.llm.router import get_system_prompt_for_personality
             system_prompt = get_system_prompt_for_personality(personality, user_settings)
         else:
+            # Business / Deep Search / Normal (without persona) -> Use default System Prompt defined in router.py
+            # This ensures Business Mode uses the EXACT "Elite Strategic Advisor" prompt from Business.py
             system_prompt = get_system_prompt_for_mode(mode, user_settings)
+
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -156,7 +161,7 @@ class LLMProcessor:
         Returns complete response dict.
         """
         # Analyze intent using the consolidated router
-        analysis = await analyze_and_route_query(user_query, mode)
+        analysis = await analyze_and_route_query(user_query, mode, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
         
         if intent == "INTERNAL":
@@ -196,7 +201,8 @@ class LLMProcessor:
         
         # Combined Analysis (Intent + Tools)
         # Pass context_messages for sticky routing (history awareness)
-        analysis = await analyze_and_route_query(user_query, mode, context_messages)
+        # Pass personality for Content Mode overrides (Pure LLM / Web Search)
+        analysis = await analyze_and_route_query(user_query, mode, context_messages, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
         selected_tools = analysis.get("tools", [])
         

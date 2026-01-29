@@ -206,7 +206,20 @@ async def handle_websocket_message(
     # Process chat message
     content = data.get("content", "")
     chat_mode = data.get("chat_mode", "normal")
+    personality_id = data.get("personality_id")
+    user_settings = data.get("user_settings")
     
+    # Resolve personality if provided
+    personality = None
+    if personality_id:
+        conn_info = manager.connection_info.get(connection_id, {})
+        user_id = conn_info.get("user_id")
+        if user_id:
+            from app.chat.personalities import get_personality_by_id
+            p_data = get_personality_by_id(user_id, personality_id)
+            if p_data:
+                personality = p_data
+
     if not content.strip():
         return
 
@@ -276,15 +289,15 @@ async def handle_websocket_message(
             print(f"[Context Error] Failed to summarize: {e}")
 
     # Stream response to all connected devices
-
-    # Stream response to all connected devices
     full_response = ""
     
     try:
         async for token in llm_processor.process_message_stream(
             content, 
             mode=chat_mode,
-            context_messages=context_messages
+            context_messages=context_messages,
+            personality=personality,
+            user_settings=user_settings
         ):
             # Check stop flag
             if manager.should_stop(chat_id):
