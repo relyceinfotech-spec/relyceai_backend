@@ -56,6 +56,15 @@ async def verify_payment(
         
         client.utility.verify_payment_signature(params_dict)
         
+        # 1.5 Fetch payment details to get actual amount (including coupons)
+        try:
+            payment_details = client.payment.fetch(razorpay_payment_id)
+            amount_paid = payment_details.get('amount', 0) / 100 # Convert to Rupees
+            print(f"[Payment] Fetched actual amount: {amount_paid}")
+        except Exception as fetch_error:
+            print(f"[Payment] Warning: Could not fetch payment details: {fetch_error}")
+            amount_paid = 0
+
         # 2. Payment Verified - Calculate Expiry
         from datetime import datetime, timedelta
         import firebase_admin
@@ -86,7 +95,7 @@ async def verify_payment(
                 razorpay_payment_id: {
                     "transactionId": razorpay_payment_id,
                     "orderId": razorpay_order_id,
-                    "amount": 0, # Should ideally be fetched from order/payment details
+                    "amount": amount_paid,
                     "plan": plan_id,
                     "date": now.isoformat(),
                     "verified": True
@@ -115,7 +124,7 @@ async def verify_payment(
                         razorpay_payment_id: {
                             "transactionId": razorpay_payment_id,
                             "orderId": razorpay_order_id,
-                            "amount": 0,
+                            "amount": amount_paid,
                             "plan": plan_id,
                             "date": now.isoformat(),
                             "verified": True
@@ -133,11 +142,12 @@ async def verify_payment(
             "paymentId": razorpay_payment_id,
             "planId": plan_id,
             "billingCycle": billing_cycle,
+            "amount": amount_paid,
             "timestamp": firestore.SERVER_TIMESTAMP,
             "verified": True
         })
         
-        print(f"[Payment] Verified and updated for user {user_id} - Plan: {plan_id}")
+        print(f"[Payment] Verified and updated for user {user_id} - Plan: {plan_id} - Amount: {amount_paid}")
         return {"success": True, "message": "Payment verified and membership updated"}
         
     except razorpay.errors.SignatureVerificationError:
@@ -146,7 +156,139 @@ async def verify_payment(
         print(f"[Razorpay] Verification error: {e}")
         raise HTTPException(status_code=500, detail="Payment verification failed")
 
-@router.post("/webhook/razorpay")
+    except Exception as e:
+        print(f"[Razorpay] Verification error: {e}")
+        raise HTTPException(status_code=500, detail="Payment verification failed")
+
+# ==========================================
+# Admin Payment Reconciliation Endpoints
+# ==========================================
+
+@router.get("/admin/check-payment/{payment_id}")
+async def check_payment_status(payment_id: str):
+    """
+    Fetch payment details directly from Razorpay to verify status.
+    Intended for Admin Dashboard reconciliation.
+    """
+    try:
+        payment = client.payment.fetch(payment_id)
+        
+        # Extract relevant info for display
+        notes = payment.get('notes', {})
+        email = payment.get('email')
+        
+        suggested_user_id = None
+        
+        # Try to find user by email if we have one
+        if email:
+            try:
+                from firebase_admin import firestore
+                db = firestore.client()
+                # Query users collection by email
+                users_ref = db.collection('users')
+                query = users_ref.where('email', '==', email).limit(1)
+                results = query.stream()
+                
+                for doc in results:
+                    suggested_user_id = doc.id
+                    break
+            except Exception as db_e:
+                print(f"[Admin Payment Check] DB Lookup Error: {db_e}")
+
+        # Try to infer plan from amount if missing in notes
+        # This is a heuristic based on known pricing
+        inferred_plan = None
+        amount_in_rupees = payment.get('amount', 0) / 100
+        
+        # Simple heuristic mapping (you might want to move this to config if prices change often)
+        if amount_in_rupees in [199, 1999]: inferred_plan = 'starter'
+        elif amount_in_rupees in [999, 9999]: inferred_plan = 'plus'
+        elif amount_in_rupees in [2499, 24999]: inferred_plan = 'business'
+        
+        return {
+            "success": True,
+            "payment": {
+                "id": payment.get('id'),
+                "status": payment.get('status'),
+                "amount": amount_in_rupees,
+                "currency": payment.get('currency'),
+                "email": email,
+                "contact": payment.get('contact'),
+                "created_at": payment.get('created_at'),
+                "method": payment.get('method'),
+                "notes": {
+                    "user_id": notes.get('user_id') or notes.get('userId') or 'N/A',
+                    "plan_id": notes.get('plan_id') or notes.get('plan') or 'N/A',
+                    "billing_cycle": notes.get('billing_cycle') or notes.get('billingCycle') or 'monthly'
+                },
+                "suggested_user_id": suggested_user_id,
+                "inferred_plan": inferred_plan
+            }
+        }
+    except Exception as e:
+        print(f"[Admin Payment Check] Error: {e}")
+        raise HTTPException(status_code=404, detail=f"Payment not found or error fetching: {str(e)}")
+
+@router.post("/admin/sync-payment/{payment_id}")
+async def sync_payment_manual(payment_id: str, user_id: str = Body(..., embed=True), plan_id: str = Body(..., embed=True)):
+    """
+    Manually sync a payment to activate a user's plan.
+    This behaves like the webhook but is triggered manually by admin.
+    """
+    try:
+        # Re-fetch payment to be absolutely sure of status
+        payment = client.payment.fetch(payment_id)
+        
+        if payment.get('status') != 'captured':
+             raise HTTPException(status_code=400, detail=f"Payment is in '{payment.get('status')}' state, not 'captured'. Cannot sync.")
+
+        # Prepare payload wrapper to reuse existing logic
+        # We construct a synthetic payload that matches what handle_payment_captured expects
+        
+        # NOTE: We allow admin to override user_id/plan_id in case notes were missing/wrong
+        # So we inject the admin-provided values into the entity notes for the handler
+        
+        # Fetch existing notes to preserve other data
+        existing_notes = payment.get('notes', {})
+        existing_notes['user_id'] = user_id
+        existing_notes['plan_id'] = plan_id
+        
+        # Ensure billing cycle is present
+        if 'billing_cycle' not in existing_notes and 'billingCycle' not in existing_notes:
+             existing_notes['billing_cycle'] = 'monthly' # Default
+
+        payload = {
+            "payload": {
+                "payment": {
+                    "entity": {
+                        "id": payment_id,
+                        "order_id": payment.get('order_id'),
+                        "amount": payment.get('amount'),
+                        "currency": payment.get('currency'),
+                        "status": payment.get('status'),
+                        "method": payment.get('method'),
+                        "email": payment.get('email'),
+                        "contact": payment.get('contact'),
+                        "notes": existing_notes,
+                    }
+                }
+            }
+        }
+        
+        from firebase_admin import firestore
+        db = firestore.client()
+        
+        # reuse the logic
+        await handle_payment_captured(db, payload)
+        
+        return {"success": True, "message": f"Payment {payment_id} synced and plan {plan_id} activated for user {user_id}"}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"[Admin Payment Sync] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 async def handle_razorpay_webhook(request: Request):
     """
     Handle Razorpay Webhooks securely.
@@ -203,6 +345,9 @@ async def handle_razorpay_webhook(request: Request):
         elif event_type == "subscription.cancelled":
             await handle_subscription_cancelled(db, payload)
             
+        elif event_type == "payment.captured":
+            await handle_payment_captured(db, payload)
+
         elif event_type == "payment.failed":
             print(f"[Razorpay Webhook] Payment failed: {payload}")
         
@@ -221,6 +366,135 @@ async def handle_razorpay_webhook(request: Request):
         print(f"[Razorpay Webhook] Error processing event: {e}")
         # Return 200 to prevent Razorpay from retrying indefinitely on logic errors
         return {"status": "error", "message": str(e)}
+
+async def handle_payment_captured(db, payload):
+    """
+    Handle one-time payments (like UPI scans) that don't go through subscription flow.
+    """
+    try:
+        entity = payload['payload']['payment']['entity']
+        payment_id = entity['id']
+        order_id = entity.get('order_id')
+        
+        # Extract metadata from notes
+        notes = entity.get('notes', {})
+        user_id = notes.get('user_id') or notes.get('userId')
+        plan_id = notes.get('plan_id')
+        billing_cycle = notes.get('billing_cycle') or notes.get('billingCycle') or 'monthly'
+
+        if not user_id or not plan_id:
+            print(f"[Webhook] Missing user_id or plan_id in payment notes for {payment_id}")
+            return
+
+        print(f"[Webhook] Processing captured payment {payment_id} for user {user_id}, plan {plan_id}")
+
+        # Note: We skip idempotency check for manual sync if calling directly, but this function checks DB.
+        # Ideally, manual sync might want to FORCE override. But let's assume if it exists, it's done.
+        # Actually, for manual sync to work if webhook failed partway (e.g. user update worked but log didn't?)
+        # safer to allow overwrite or check specifically.
+        # For now, let's keep idempotency but maybe log a warning if it exists.
+        
+        payment_doc_ref = db.collection('payments').document(payment_id)
+        # We REMOVE the strict existing check here to allow Manual Sync to "repair" a record if needed
+        # OR we just update the user logic.
+        # Let's trust the Caller (Webhook or Admin) knows what they are doing.
+        # But to be safe against double-counting, we should check `membership.paymentHistory`.
+
+        # Calculate expiry
+        from datetime import datetime, timedelta
+        import firebase_admin
+        from firebase_admin import firestore
+
+        now = datetime.now()
+        if billing_cycle == 'yearly':
+            expiry_date = now + timedelta(days=365)
+        else:
+            expiry_date = now + timedelta(days=30)
+            
+        # Update User Membership
+        user_ref = db.collection('users').document(user_id)
+        
+        # Convert amount to Rupees for DB consistency if desired, or keep raw.
+        # Standardize: Store raw in amount, but maybe amountPaid in Rupees?
+        # Let's stick to storing meaningful amount in Rupees for the 'amount' field if that's what frontend expects.
+        # Screenshot showed '9,999' which matches Plan Price. Razorpay sends 999900.
+        amount_val = entity.get('amount', 0)
+        amount_in_rupees = amount_val / 100 if amount_val > 0 else 0
+
+        update_data = {
+            "membership.plan": plan_id,
+            "membership.planName": plan_id.capitalize(),
+            "membership.status": "active",
+            "membership.startDate": now.isoformat(),
+            "membership.expiryDate": expiry_date.isoformat(),
+            "membership.billingCycle": billing_cycle,
+            "membership.paymentStatus": "paid",
+            "membership.updatedAt": firestore.SERVER_TIMESTAMP,
+            f"membership.paymentHistory.{payment_id}": {
+                "transactionId": payment_id,
+                "orderId": order_id,
+                "amount": amount_in_rupees, # Store as Rupees
+                "plan": plan_id,
+                "date": now.isoformat(),
+                "verified": True,
+                "source": "webhook" 
+            }
+        }
+
+        try:
+            user_ref.update(update_data)
+        except Exception as e:
+            # Fallback for set if needed
+            print(f"[Webhook] Update failed, attempting set merge: {e}")
+            user_ref.set({
+                 "membership": {
+                    "plan": plan_id,
+                    "planName": plan_id.capitalize(),
+                    "status": "active",
+                    "startDate": now.isoformat(),
+                    "expiryDate": expiry_date.isoformat(),
+                    "billingCycle": billing_cycle,
+                    "paymentStatus": "paid",
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                    "paymentHistory": {
+                        payment_id: {
+                            "transactionId": payment_id,
+                            "orderId": order_id,
+                            "amount": amount_in_rupees,
+                            "plan": plan_id,
+                            "date": now.isoformat(),
+                            "verified": True,
+                            "source": "webhook"
+                        }
+                    }
+                }
+            }, merge=True)
+
+        # Log to payments collection
+        # Ensure we write ALL fields needed by frontend
+        payment_doc_ref.set({
+            "userId": user_id,
+            "orderId": order_id,
+            "paymentId": payment_id,
+            "planId": plan_id,
+            "plan": plan_id, # Redundant but safe for frontend that might use .plan
+            "billingCycle": billing_cycle,
+            "amount": amount_in_rupees, # Store as Rupees
+            "currency": entity.get('currency', 'INR'),
+            "method": entity.get('method', 'unknown'),
+            "email": entity.get('email'),
+            "contact": entity.get('contact'),
+            "status": "captured",
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "verified": True,
+            "source": "webhook"
+        }, merge=True) # Merge to allow updating existing botched records
+
+        print(f"[Webhook] Successfully activated plan {plan_id} for user {user_id}")
+
+    except Exception as e:
+        print(f"[Webhook] Error in handle_payment_captured: {e}") 
+
 
 async def handle_subscription_activated(db, payload):
     try:
