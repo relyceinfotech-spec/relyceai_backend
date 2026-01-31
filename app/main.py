@@ -21,6 +21,7 @@ from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
 from app.chat.history import save_message_to_firebase, load_chat_history
 from app.websocket import manager, handle_websocket_message
+from app.payment import router as payment_router
 
 
 @asynccontextmanager
@@ -28,22 +29,22 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     print("=" * 60)
-    print("   🚀 RELYCE AI BACKEND - Starting Up")
+    print("   [RELYCE-AI] BACKEND - Starting Up")
     print("=" * 60)
     
     try:
         initialize_firebase()
-        print("[Startup] ✅ Firebase initialized")
+        print("[Startup] - Firebase initialized")
     except Exception as e:
-        print(f"[Startup] ⚠️ Firebase init failed: {e}")
+        print(f"[Startup] ! Firebase init failed: {e}")
     
-    print(f"[Startup] ✅ Server ready on {HOST}:{PORT}")
+    print(f"[Startup] - Server ready on {HOST}:{PORT}")
     print("=" * 60)
     
     yield
     
     # Shutdown
-    print("[Shutdown] 👋 Relyce AI Backend shutting down...")
+    print("[Shutdown] - Relyce AI Backend shutting down...")
 
 
 # Create FastAPI app
@@ -303,6 +304,10 @@ async def get_history(user_id: str, session_id: str, limit: int = 50):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Payment Router
+app.include_router(payment_router, prefix="/payment", tags=["Payment"])
+
+
 
 # ============================================
 # WEBSOCKET ENDPOINT
@@ -338,7 +343,7 @@ async def websocket_endpoint(
             user_id = user_info.get("uid", "anonymous")
         else:
             # For development, allow connection without valid token
-            print("[WS] ⚠️ Invalid token, using anonymous mode")
+            print("[WS] ! Invalid token, using anonymous mode")
     
     # Use provided chat_id or generate one
     if not chat_id:
