@@ -19,8 +19,9 @@ from app.models import (
 from app.auth import verify_token, initialize_firebase
 from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
-from app.chat.history import save_message_to_firebase, load_chat_history
+from app.chat.history import save_message_to_firebase, load_chat_history, increment_message_count
 from app.websocket import manager, handle_websocket_message
+
 from app.payment import router as payment_router
 
 
@@ -191,6 +192,9 @@ async def chat(request: ChatRequest):
                 request.user_id, request.session_id, "assistant", result["response"]
             )
             result["message_id"] = msg_id
+            
+            # Increment Usage
+            increment_message_count(request.user_id)
         
         return ChatResponse(**result)
         
@@ -254,6 +258,10 @@ async def chat_stream(request: ChatRequest):
                 save_message_to_firebase(
                     request.user_id, request.session_id, "assistant", full_response
                 )
+                
+                # Increment Usage
+                increment_message_count(request.user_id)
+
 
                 
         except Exception as e:
@@ -306,6 +314,12 @@ async def get_history(user_id: str, session_id: str, limit: int = 50):
 
 # Payment Router
 app.include_router(payment_router, prefix="/payment", tags=["Payment"])
+
+# Admin & User Management
+from app.routers import admin, users, files
+app.include_router(admin.router, prefix="/admin", tags=["Admin"])
+app.include_router(users.router, prefix="/users", tags=["Users"])
+app.include_router(files.router, prefix="", tags=["Files"]) # Mount at root to match /upload expectation or /files
 
 
 

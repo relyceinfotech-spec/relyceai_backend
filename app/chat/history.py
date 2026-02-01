@@ -5,6 +5,8 @@ Saves/loads chat history with Firebase Firestore
 from typing import List, Dict, Optional
 from datetime import datetime
 from app.auth import get_firestore_db, initialize_firebase
+from firebase_admin import firestore
+
 
 def save_message_to_firebase(
     user_id: str,
@@ -145,3 +147,34 @@ def get_user_sessions(user_id: str, limit: int = 50) -> List[Dict]:
     except Exception as e:
         print(f"[History] Error getting sessions: {e}")
         return []
+        return sessions
+        
+    except Exception as e:
+        print(f"[History] Error getting sessions: {e}")
+        return []
+
+def increment_message_count(user_id: str):
+    """
+    Increment the totalMessages count for a user in Firestore.
+    Securely tracked on backend.
+    """
+    try:
+        db = get_firestore_db()
+        if not db: return
+
+        user_ref = db.collection('users').document(user_id)
+        user_ref.update({
+            "usage.totalMessages": firestore.Increment(1),
+            "usage.lastActivity": firestore.SERVER_TIMESTAMP
+        })
+    except Exception as e:
+        # If usage map doesn't exist, try set merge
+        try:
+             db.collection('users').document(user_id).set({
+                "usage": {
+                    "totalMessages": firestore.Increment(1),
+                    "lastActivity": firestore.SERVER_TIMESTAMP
+                }
+            }, merge=True)
+        except Exception as inner_e:
+            print(f"[History] Failed to increment message count: {inner_e}")

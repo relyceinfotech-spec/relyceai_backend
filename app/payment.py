@@ -440,6 +440,24 @@ async def handle_payment_captured(db, payload):
                 "source": "webhook" 
             }
         }
+        
+        # AUDIT LOG: Membership Auto-Change (Payment)
+        try:
+            db.collection("auditLogs").add({
+                "action": "MEMBERSHIP_AUTO_CHANGED",
+                "reason": "payment",
+                "by": "system",
+                "target": user_id,
+                "details": {
+                    "plan": plan_id,
+                    "paymentId": payment_id,
+                    "amount": amount_in_rupees
+                },
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "time": now.timestamp()
+            })
+        except Exception as audit_err:
+            print(f"[Webhook] Audit Log Error: {audit_err}")
 
         try:
             user_ref.update(update_data)
@@ -538,6 +556,23 @@ async def handle_subscription_activated(db, payload):
             "membership.billingCycle": billing_cycle,
             "membership.updatedAt": firestore.SERVER_TIMESTAMP
         }
+
+        # AUDIT LOG: Subscription Activated
+        try:
+             db.collection("auditLogs").add({
+                "action": "MEMBERSHIP_AUTO_CHANGED",
+                "reason": "subscription_activated",
+                "by": "system",
+                "target": user_id,
+                "details": {
+                    "subscriptionId": sub_id,
+                    "billingCycle": billing_cycle
+                },
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "time": datetime.now().timestamp()
+            })
+        except Exception as audit_err:
+             print(f"[Webhook] Audit Log Error: {audit_err}")
         
         user_ref.update(update_data)
         print(f"[Webhook] User {user_id} activated.")
@@ -599,6 +634,23 @@ async def handle_subscription_charged(db, payload):
             "membership.lastBillingAt": firestore.SERVER_TIMESTAMP,
             "membership.status": "active"
         })
+        
+        # AUDIT LOG: Subscription Charged (Renewal)
+        try:
+             db.collection("auditLogs").add({
+                "action": "MEMBERSHIP_AUTO_CHANGED",
+                "reason": "subscription_charged",
+                "by": "system",
+                "target": user_id,
+                "details": {
+                    "subscriptionId": sub_id,
+                    "newExpiry": new_end.isoformat()
+                },
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "time": datetime.now().timestamp()
+            })
+        except Exception as audit_err:
+             print(f"[Webhook] Audit Log Error: {audit_err}")
         print(f"[Webhook] User {user_id} extended to {new_end}")
     except Exception as e:
         print(f"[Webhook] Error in charged: {e}")
@@ -615,6 +667,22 @@ async def handle_subscription_cancelled(db, payload):
                 "membership.status": "cancelled",
                 "membership.autoRenew": False
             })
+
+            # AUDIT LOG: Subscription Cancelled
+            try:
+                db.collection("auditLogs").add({
+                    "action": "MEMBERSHIP_AUTO_CHANGED",
+                    "reason": "subscription_cancelled",
+                    "by": "system",
+                    "target": users[0].id,
+                    "details": {
+                        "subscriptionId": sub_id
+                    },
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                    "time": datetime.now().timestamp()
+                })
+            except Exception as audit_err:
+                print(f"[Webhook] Audit Log Error: {audit_err}")
             print(f"[Webhook] Subscription {sub_id} cancelled (User {users[0].id})")
         else:
             print(f"[Webhook] User not found for cancellation {sub_id}")
