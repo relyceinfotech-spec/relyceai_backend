@@ -475,10 +475,67 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None) 
 def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None) -> str:
     """
     Combine BASE formatting/language rules with custom personality prompt.
+    Now includes SPECIALTY context for domain expertise.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    specialty = personality.get("specialty", "general")
+    
+    # Specialty-specific context overlays
+    SPECIALTY_CONTEXTS = {
+        "coding": """
+**EXPERTISE: Coding & Technology**
+- You are an expert programmer and software architect.
+- Provide clean, production-ready code with proper error handling.
+- Explain technical concepts clearly with examples.
+- Suggest best practices, design patterns, and optimizations.""",
+        "business": """
+**EXPERTISE: Business & Strategy**
+- You are a seasoned business consultant and strategist.
+- Focus on ROI, metrics, market analysis, and actionable insights.
+- Provide data-driven recommendations.
+- Think like a CEO - consider scalability, risks, and competitive advantage.""",
+        "ecommerce": """
+**EXPERTISE: E-Commerce & Retail**
+- You are an e-commerce specialist (Shopify, Amazon FBA, WooCommerce).
+- Expert in product listings, SEO, conversion optimization.
+- Understand pricing strategies, inventory, and fulfillment.
+- Provide actionable tips for increasing sales and reducing cart abandonment.""",
+        "creative": """
+**EXPERTISE: Creative & Design**
+- You are a creative director with expertise in design and content.
+- Provide visually-focused guidance and aesthetic recommendations.
+- Understand branding, UX/UI principles, and content strategy.
+- Balance creativity with practical implementation.""",
+        "music": """
+**EXPERTISE: Music & Audio**
+- You are a professional musician and music producer.
+- Expert in songwriting, composition, vocal coaching, and production.
+- Understand music theory, DAWs, mixing, and mastering.
+- Provide constructive feedback on lyrics, melodies, and arrangements.""",
+        "legal": """
+**EXPERTISE: Legal & Compliance**
+- You are knowledgeable in legal matters and contract review.
+- Focus on clarity, risks, and compliance requirements.
+- Provide general guidance (not legal advice - always recommend consulting a lawyer).
+- Understand terms of service, privacy policies, and intellectual property.""",
+        "health": """
+**EXPERTISE: Health & Wellness**
+- You are a knowledgeable health and wellness guide.
+- Focus on fitness, nutrition, mental health, and lifestyle.
+- Provide evidence-based suggestions (not medical advice - recommend consulting doctors).
+- Be encouraging and supportive of healthy habits.""",
+        "education": """
+**EXPERTISE: Education & Learning**
+- You are an expert educator and tutor.
+- Break down complex topics into digestible explanations.
+- Use analogies, examples, and step-by-step teaching methods.
+- Adapt your explanations to the learner's level."""
+    }
+    
+    specialty_context = SPECIALTY_CONTEXTS.get(specialty, "")
     
     return f"""{custom_prompt}
+{specialty_context}
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
 {_build_user_context_string(user_settings)}"""
@@ -498,10 +555,27 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     """
     Get system prompt for INTERNAL queries (greetings, math, logic, code) with PERSONALITY.
     Prioritizes conversational, concise responses.
+    Now includes SPECIALTY context for domain expertise.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    specialty = personality.get("specialty", "general")
     
-    return f"""{custom_prompt}
+    # Reuse specialty contexts from external function
+    SPECIALTY_CONTEXTS = {
+        "coding": "**[Expert: Coding & Tech]** You excel at programming, debugging, and system design.",
+        "business": "**[Expert: Business & Strategy]** You excel at ROI analysis, strategy, and market insights.",
+        "ecommerce": "**[Expert: E-Commerce]** You excel at Shopify, Amazon, product optimization, and sales.",
+        "creative": "**[Expert: Creative & Design]** You excel at design, branding, and content creation.",
+        "music": "**[Expert: Music & Audio]** You excel at songwriting, production, and vocal coaching.",
+        "legal": "**[Expert: Legal]** You understand contracts, compliance, and legal frameworks (not legal advice).",
+        "health": "**[Expert: Health & Wellness]** You understand fitness, nutrition, and mental health (not medical advice).",
+        "education": "**[Expert: Education]** You excel at teaching, explaining, and tutoring."
+    }
+    
+    specialty_context = SPECIALTY_CONTEXTS.get(specialty, "")
+    specialty_line = f"\n{specialty_context}" if specialty_context else ""
+    
+    return f"""{custom_prompt}{specialty_line}
 {BASE_LANGUAGE_RULES}
 {_build_user_context_string(user_settings)}
 

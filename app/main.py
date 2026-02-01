@@ -100,7 +100,8 @@ async def create_personality(request: Personality, user_id: str = Query(...)):
         request.name, 
         request.description, 
         request.prompt,
-        request.content_mode  # Pass content_mode
+        request.content_mode,  # Pass content_mode
+        request.specialty  # Pass specialty
     )
     if result:
         return {"success": True, "personality": result}
@@ -118,7 +119,8 @@ async def update_personality(personality_id: str, request: Personality, user_id:
         request.name,
         request.description,
         request.prompt,
-        request.content_mode  # Pass content_mode
+        request.content_mode,  # Pass content_mode
+        request.specialty  # Pass specialty
     )
     
     if success:

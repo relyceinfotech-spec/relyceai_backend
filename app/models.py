@@ -22,6 +22,7 @@ class Personality(BaseModel):
     is_default: bool = False
     is_system: bool = False  # System personas (like Relyce AI) cannot be edited
     content_mode: ContentMode = "hybrid"  # Controls query processing behavior
+    specialty: str = "general"  # Expertise area: coding, ecommerce, music, legal, etc.
 
 class ChatMessage(BaseModel):
     """Single chat message"""

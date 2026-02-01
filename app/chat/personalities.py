@@ -96,10 +96,11 @@ def get_all_personalities(user_id: str) -> List[Dict]:
     
     return personalities
 
-def create_custom_personality(user_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid") -> Optional[Dict]:
+def create_custom_personality(user_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid", specialty: str = "general") -> Optional[Dict]:
     """
     Create a new custom personality for a user.
     content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
+    specialty: Expertise area like 'coding', 'ecommerce', 'music', etc.
     """
     # Validate content_mode
     valid_modes = ["hybrid", "web_search", "llm_only"]
@@ -116,6 +117,7 @@ def create_custom_personality(user_id: str, name: str, description: str, prompt:
             "description": description,
             "prompt": prompt,
             "content_mode": content_mode,
+            "specialty": specialty,
             "createdAt": str(uuid.uuid4())
         }
         
@@ -157,12 +159,13 @@ def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
             
     return None
 
-def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid") -> bool:
+def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid", specialty: str = "general") -> bool:
     """
     Update a personality. 
     If it's a Template ID (like 'buddy') and doesn't exist in DB, create it (Shadowing).
     If it's a System ID, fail.
     content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
+    specialty: Expertise area like 'coding', 'ecommerce', 'music', etc.
     """
     # Validate content_mode
     valid_modes = ["hybrid", "web_search", "llm_only"]
@@ -190,6 +193,7 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
                     "description": description,
                     "prompt": prompt,
                     "content_mode": content_mode,
+                    "specialty": specialty,
                     "is_shadow": True,
                     "createdAt": str(uuid.uuid4())
                 })
@@ -202,7 +206,8 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
                 "name": name,
                 "description": description,
                 "prompt": prompt,
-                "content_mode": content_mode
+                "content_mode": content_mode,
+                "specialty": specialty
             })
             return True
         
