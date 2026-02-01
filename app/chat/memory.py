@@ -131,14 +131,15 @@ Use this information naturally. Don't repeat it back unless asked.
 import re
 
 FACT_PATTERNS = [
-    # Name patterns
-    (r"(?:my name is|i[' ]?m|call me|name\'?s)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)", "name"),
+    # Name patterns - case-insensitive for user convenience
+    (r"(?:my name is|i[' ]?m|call me|name\'?s)\s+([A-Za-z][A-Za-z]+(?:\s+[A-Za-z][A-Za-z]+)?)", "name"),
     (r"(?:en peru|ena peru|en peyar)\s+(\w+)", "name"),  # Tamil: my name is
     (r"(?:mera naam|mera name)\s+(\w+)", "name"),  # Hindi: my name is
+    (r"(?:naan|na|naa)\s+(\w+)", "name"),  # Tamil casual: I am [name]
     
-    # Location patterns
-    (r"(?:i live in|i[' ]?m from|based in|located in)\s+([A-Z][a-z]+(?:[\s,]+[A-Z][a-z]+)?)", "location"),
-    (r"(?:i[' ]?m in)\s+([A-Z][a-z]+)", "location"),
+    # Location patterns - case-insensitive
+    (r"(?:i live in|i[' ]?m from|based in|located in)\s+([A-Za-z][A-Za-z]+(?:[\s,]+[A-Za-z][A-Za-z]+)?)", "location"),
+    (r"(?:i[' ]?m in)\s+([A-Za-z][A-Za-z]+)", "location"),
     
     # Profession patterns
     (r"(?:i work as|i[' ]?m a|my job is|my profession is)\s+(?:a\s+)?([a-z]+(?:\s+[a-z]+)?)", "profession"),
