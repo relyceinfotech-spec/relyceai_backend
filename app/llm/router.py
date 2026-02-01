@@ -322,7 +322,10 @@ async def analyze_and_route_query(
         "your name", "what's your name", "whats your name", "who are you",
         "tell me about yourself", "introduce yourself",
         # Short personal questions
-        "name tamizh", "name tamil", "en peyar", "na yaru", "nee yaaru"
+        "name tamizh", "name tamil", "en peyar", "na yaru", "nee yaaru",
+        # Common status/well-being
+        "nalla irruke", "nalla iruken", "nalla iruka", "saptiya", "saptacha",
+        "eppadi iruka", "nalama", "soukyama", "sughama", "yenna panra"
     ]
     if any(tp in q for tp in tamil_casual_patterns):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
