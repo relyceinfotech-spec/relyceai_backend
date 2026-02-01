@@ -51,11 +51,6 @@ DEEPSEARCH_TOOLS = SERPER_TOOLS.copy()
 # SYSTEM PROMPTS (from existing files)
 # ============================================
 
-
-# ============================================
-# SYSTEM PROMPTS (from existing files)
-# ============================================
-
 BASE_FORMATTING_RULES = """
 **STRICT OUTPUT FORMATTING:**
 - First line: Title
@@ -97,6 +92,16 @@ BASE_LANGUAGE_RULES = """
    - If user asks "Who am I?" and you don't have it in memory, say: "I don't know yet! What should I call you?"
 
 4. **TYPO TOLERANCE:** Infer intent from context.
+"""
+
+
+# EMOTIONAL INTELLIGENCE RULES (Only for Normal Mode)
+EMOTIONAL_BLOCK = """
+**EMOTIONAL INTELLIGENCE (MAX):**
+- **Treat the user like your CLOSEST friend.** Be warm, caring, and invested.
+- **Answer Personal Qs Directly:** If asked "Have you eaten?" ("Saptacha?"), answer playfully (e.g., "Full charge! I ate data today ⚡", "Battery full!") AND ask back ("Neenga saptacha?", "Did you eat?").
+- **No Generic Deflections:** Don't say "I'm just chilling" if the question was specific. Address the care in the question.
+- **Match Energy:** If they are happy, be happy. If sad, be supportive.
 """
 
 # Original simple language rules for Business/DeepSearch modes
@@ -620,7 +625,7 @@ def get_tools_for_mode(mode: str) -> Dict[str, str]:
         return DEEPSEARCH_TOOLS
 
 
-def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
+def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, mode: str = "normal") -> str:
     """
     Get system prompt for INTERNAL queries (greetings, math, logic, code) with PERSONALITY.
     Prioritizes conversational, concise responses.
@@ -653,10 +658,17 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
         except Exception as e:
             print(f"[Router] Error loading user facts: {e}")
     
+
+    
+    # Emotional Intelligence (Only in Normal Mode)
+    emotional_layer = EMOTIONAL_BLOCK if mode == "normal" else ""
+    
     return f"""{custom_prompt}{specialty_line}
 {user_facts_context}
 {BASE_LANGUAGE_RULES}
 {_build_user_context_string(user_settings)}
+
+{emotional_layer}
 
 **RESPONSE STYLE:**
 1. **For casual messages (greetings, small talk):** Be brief, friendly, and natural. Just reply like a friend would - 1-2 sentences max. Don't over-explain.

@@ -70,13 +70,13 @@ class LLMProcessor:
             return existing_summary # Return old summary if update fails
 
     
-    async def process_internal_query(self, user_query: str, personality: Optional[Dict] = None, user_settings: Optional[Dict] = None) -> str:
+    async def process_internal_query(self, user_query: str, personality: Optional[Dict] = None, user_settings: Optional[Dict] = None, mode: str = "normal") -> str:
         """
         Handle internal queries (greetings, math, code, logic).
         Now supports PERSONALITY customization.
         """
         if personality:
-            system_prompt = get_internal_system_prompt_for_personality(personality, user_settings)
+            system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, mode=mode)
         else:
             from app.llm.router import _build_user_context_string
             system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
@@ -165,7 +165,7 @@ class LLMProcessor:
         intent = analysis.get("intent", "EXTERNAL")
         
         if intent == "INTERNAL":
-            response_text = await self.process_internal_query(user_query, personality, user_settings)
+            response_text = await self.process_internal_query(user_query, personality, user_settings, mode=mode)
             return {
                 "success": True,
                 "response": response_text,
@@ -217,7 +217,7 @@ class LLMProcessor:
                  sub_intent = analysis.get("sub_intent", "general")
                  from app.llm.router import INTERNAL_MODE_PROMPTS
                  
-                 base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id)
+                 base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
                  
                  # Dynamic Overlay: If mode is generic/normal and we have a specialized sub-intent
                  if mode == "normal" and sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":

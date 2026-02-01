@@ -213,6 +213,10 @@ async def chat_stream(request: ChatRequest):
     """
     async def generate():
         try:
+            # 🚀 Force flush buffer immediately with padding (1KB)
+            # This helps in environments like Vercel/Nginx/Render that buffer responses
+            yield ": " + (" " * 1024) + "\n\n"
+
             # Get context if session exists
             context_messages = []
             if request.user_id and request.session_id:
@@ -238,7 +242,8 @@ async def chat_stream(request: ChatRequest):
                 mode=request.chat_mode,
                 context_messages=context_messages,
                 personality=personality,
-                user_settings=request.user_settings
+                user_settings=request.user_settings,
+                user_id=request.user_id # Pass User ID for facts
             ):
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
@@ -263,8 +268,6 @@ async def chat_stream(request: ChatRequest):
                 
                 # Increment Usage
                 increment_message_count(request.user_id)
-
-
                 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
@@ -275,7 +278,8 @@ async def chat_stream(request: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
+            "X-Accel-Buffering": "no", # Critical for Nginx/Vercel
+            "Content-Type": "text/event-stream"
         }
     )
 
