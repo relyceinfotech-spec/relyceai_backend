@@ -10,6 +10,14 @@ from datetime import datetime
 from app.auth import verify_token
 from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
+from app.chat.context import (
+    SUMMARY_TRIGGER_MESSAGES, 
+    KEEP_LAST_MESSAGES,
+    get_session_summary, 
+    update_session_summary, 
+    prune_context_messages, 
+    get_raw_message_count
+)
 from app.chat.history import save_message_to_firebase
 
 class ConnectionManager:
@@ -223,11 +231,22 @@ async def handle_websocket_message(
     if not content.strip():
         return
     
-    # Extract and store user facts (for cross-session memory)
+    # Clear any previous stop flag
+    manager.clear_stop_flag(chat_id)
+    
+    # Notify all devices - processing started (IMMEDIATE FEEDBACK)
+    await manager.broadcast_to_chat(
+        chat_id,
+        json.dumps({"type": "info", "content": "processing"})
+    )
+    
+    # Extract and store user facts (Run in background to not block)
     if user_id and user_id != "anonymous":
         try:
             from app.chat.memory import process_and_store_facts
-            process_and_store_facts(user_id, content)
+            from starlette.concurrency import run_in_threadpool
+            # Fire and forget fact extraction
+            asyncio.create_task(run_in_threadpool(process_and_store_facts, user_id, content))
         except Exception as e:
             print(f"[WS] Fact extraction error (non-blocking): {e}")
 
@@ -239,63 +258,9 @@ async def handle_websocket_message(
         )
         return
     
-    # Clear any previous stop flag
-    manager.clear_stop_flag(chat_id)
-    
-    # Notify all devices - processing started
-    await manager.broadcast_to_chat(
-        chat_id,
-        json.dumps({"type": "info", "content": "processing"})
-    )
-    
     # Get context for LLM
     context_messages = get_context_for_llm(user_id, chat_id)
     
-    # [Option 2] Context Strategy Implementation
-    from app.chat.context import (
-        SUMMARY_TRIGGER_MESSAGES, 
-        KEEP_LAST_MESSAGES,
-        get_session_summary, 
-        update_session_summary, 
-        prune_context_messages, 
-        get_context_for_llm,
-        get_raw_message_count
-    )
-
-    # Check for trigger using raw count (more accurate)
-    msg_count = get_raw_message_count(user_id, chat_id)
-    
-    if chat_mode == "normal" and msg_count >= SUMMARY_TRIGGER_MESSAGES:
-        try:
-            # 1. Get messages to summarize (everything except last N)
-            # We access via get_context_for_llm which returns [System, ...Raw]
-            # Since get_context_for_llm injects system prompt, we must be careful.
-            # Use raw method to access store if available, or filter.
-            # Filter non-system messages to get raw list
-            current_context = get_context_for_llm(user_id, chat_id)
-            raw_msgs = [m for m in current_context if m['role'] != 'system']
-            
-            # 2. Split
-            to_summarize = raw_msgs[:-KEEP_LAST_MESSAGES] # Older messages to compact
-            
-            # 3. Generate summary (cumulative)
-            if to_summarize:
-                existing_summary = get_session_summary(user_id, chat_id) or ""
-                
-                # This returns the NEW FULL summary (merged)
-                new_cumulative_summary = await llm_processor.summarize_context(to_summarize, existing_summary)
-                
-                # 4. Overwrite Store (The new summary contains everything)
-                if new_cumulative_summary:
-                   update_session_summary(user_id, chat_id, new_cumulative_summary)
-                   prune_context_messages(user_id, chat_id, KEEP_LAST_MESSAGES)
-                
-                # 5. Refresh context (Now includes the updated summary)
-                context_messages = get_context_for_llm(user_id, chat_id)
-            
-        except Exception as e:
-            print(f"[Context Error] Failed to summarize: {e}")
-
     # Stream response to all connected devices
     full_response = ""
     
@@ -333,6 +298,37 @@ async def handle_websocket_message(
         # Save to Firebase (async, don't block)
         save_message_to_firebase(user_id, chat_id, "user", content)
         save_message_to_firebase(user_id, chat_id, "assistant", full_response)
+        
+        # =========================================================================
+        # Post-Processing: Context Summarization (Deferred to improve latency)
+        # =========================================================================
+        msg_count = get_raw_message_count(user_id, chat_id)
+        if chat_mode == "normal" and msg_count >= SUMMARY_TRIGGER_MESSAGES:
+            try:
+                print(f"[WS] Triggering background summarization for {chat_id}")
+                # 1. Get messages to summarize (everything except last N)
+                # We access via get_context_for_llm which returns [System, ...Raw]
+                current_context = get_context_for_llm(user_id, chat_id)
+                raw_msgs = [m for m in current_context if m['role'] != 'system']
+                
+                # 2. Split
+                to_summarize = raw_msgs[:-KEEP_LAST_MESSAGES] # Older messages to compact
+                
+                # 3. Generate summary (cumulative)
+                if to_summarize:
+                    existing_summary = get_session_summary(user_id, chat_id) or ""
+                    
+                    # This returns the NEW FULL summary (merged)
+                    new_cumulative_summary = await llm_processor.summarize_context(to_summarize, existing_summary)
+                    
+                    # 4. Overwrite Store (The new summary contains everything)
+                    if new_cumulative_summary:
+                       update_session_summary(user_id, chat_id, new_cumulative_summary)
+                       prune_context_messages(user_id, chat_id, KEEP_LAST_MESSAGES)
+                       print(f"[WS] Summarization complete for {chat_id}")
+                
+            except Exception as e:
+                print(f"[Context Error] Failed to summarize: {e}")
         
     except Exception as e:
         error_msg = f"Error processing message: {str(e)}"
