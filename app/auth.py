@@ -11,8 +11,11 @@ from app.config import (
     FIREBASE_PRIVATE_KEY,
     FIREBASE_CLIENT_EMAIL,
     FIREBASE_CLIENT_ID,
-    FIREBASE_CLIENT_CERT_URL
+    FIREBASE_CLIENT_ID,
+    FIREBASE_CLIENT_CERT_URL,
+    FIREBASE_DATABASE_ID
 )
+from google.cloud import firestore as google_firestore
 
 # Initialize Firebase Admin SDK
 _firebase_initialized = False
@@ -42,7 +45,16 @@ def initialize_firebase():
         
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
-        _db = firestore.client()
+        if FIREBASE_DATABASE_ID and FIREBASE_DATABASE_ID != "(default)":
+            _db = google_firestore.Client(
+                credentials=cred.get_credential(),
+                project=FIREBASE_PROJECT_ID,
+                database=FIREBASE_DATABASE_ID
+            )
+            print(f"[Firebase] Connected to named DB: {FIREBASE_DATABASE_ID}")
+        else:
+            _db = firestore.client()
+            print("[Firebase] Connected to default DB")
         _firebase_initialized = True
         print("[Firebase] ✅ Initialized successfully")
         
