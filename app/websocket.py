@@ -283,8 +283,6 @@ async def handle_websocket_message(
             
             full_response += token
             await manager.stream_to_chat(chat_id, token)
-            # Small delay for smoother streaming
-            await asyncio.sleep(0.01)
         
         # Send completion signal
         await manager.broadcast_to_chat(
