@@ -189,7 +189,8 @@ class LLMProcessor:
         mode: str = "normal",
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
-        user_settings: Optional[Dict] = None
+        user_settings: Optional[Dict] = None,
+        user_id: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
         """
         Streaming version of process_message.
@@ -216,7 +217,7 @@ class LLMProcessor:
                  sub_intent = analysis.get("sub_intent", "general")
                  from app.llm.router import INTERNAL_MODE_PROMPTS
                  
-                 base_prompt = get_internal_system_prompt_for_personality(personality, user_settings)
+                 base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id)
                  
                  # Dynamic Overlay: If mode is generic/normal and we have a specialized sub-intent
                  if mode == "normal" and sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
@@ -278,16 +279,16 @@ class LLMProcessor:
             if personality:
                 # 🎭 Personalities are now honored in ALL modes
                 from app.llm.router import get_system_prompt_for_personality
-                system_prompt = get_system_prompt_for_personality(personality, user_settings)
+                system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id)
                 
                 # If in Business or Deep Search, append mode-specific constraints to the personality
                 if mode != "normal":
                     from app.llm.router import get_system_prompt_for_mode
-                    mode_prompt = get_system_prompt_for_mode(mode, user_settings)
+                    mode_prompt = get_system_prompt_for_mode(mode, user_settings, user_id)
                     system_prompt = f"{system_prompt}\n\n**MODE CONSTRAINT ({mode.upper()}):**\n{mode_prompt}"
             else:
                 from app.llm.router import get_system_prompt_for_mode
-                system_prompt = get_system_prompt_for_mode(mode, user_settings)
+                system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id)
             
             messages = [{"role": "system", "content": system_prompt}]
             

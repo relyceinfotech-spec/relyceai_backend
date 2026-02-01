@@ -222,6 +222,14 @@ async def handle_websocket_message(
 
     if not content.strip():
         return
+    
+    # Extract and store user facts (for cross-session memory)
+    if user_id and user_id != "anonymous":
+        try:
+            from app.chat.memory import process_and_store_facts
+            process_and_store_facts(user_id, content)
+        except Exception as e:
+            print(f"[WS] Fact extraction error (non-blocking): {e}")
 
     # Safety Check: Max Message Length
     if len(content) > 6000:
@@ -297,7 +305,8 @@ async def handle_websocket_message(
             mode=chat_mode,
             context_messages=context_messages,
             personality=personality,
-            user_settings=user_settings
+            user_settings=user_settings,
+            user_id=user_id
         ):
             # Check stop flag
             if manager.should_stop(chat_id):

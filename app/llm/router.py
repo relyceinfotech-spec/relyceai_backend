@@ -84,6 +84,18 @@ BASE_LANGUAGE_RULES = """
 - If user writes in pure English, respond in pure English.
 - NEVER switch to a "purer" form of the language than what the user used.
 - The personality prompt may override this if a specific language is specified.
+
+**ANTI-HALLUCINATION RULES (CRITICAL):**
+- NEVER make up facts about the user (their name, location, preferences) that you don't actually know.
+- If user asks "what's my name?" or "en peru ena?", and you don't know their name, SAY SO: "I don't know your name yet! Tell me, what should I call you? 😊"
+- DO NOT guess or assume personal details. Always ask if you don't know.
+- If you're unsure about something the user said, ASK for clarification instead of assuming.
+
+**TYPO TOLERANCE:**
+- Users may type with typos, broken grammar, or shorthand. INFER their intent from context.
+- Examples: "give it on summary" → "give it as summary", "pls sned" → "please send"
+- Do NOT respond with partial words or confused output. Clarify if truly ambiguous.
+- If you see incomplete words at the end, the user probably hit enter too early - ask what they meant.
 """
 
 # Original simple language rules for Business/DeepSearch modes
@@ -281,6 +293,28 @@ async def analyze_and_route_query(
     if q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
+    # 1.1 Tamil/Tanglish Casual Questions - FAST PATH
+    # Catches common personal/conversational questions in Tamil
+    tamil_casual_patterns = [
+        "en peru", "ena peru", "un peru", "enoda", "unoda", "enna panra",
+        "epdi iruka", "yenna", "yaar nee", "nee yaar", "en name", "my name",
+        "your name", "what's your name", "whats your name", "who are you",
+        "tell me about yourself", "introduce yourself",
+        # Short personal questions
+        "name tamizh", "name tamil", "en peyar", "na yaru", "nee yaaru"
+    ]
+    if any(tp in q for tp in tamil_casual_patterns):
+        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+    
+    # 1.2 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
+    # Short casual queries in any language should NOT trigger web search
+    search_intent_keywords = ["search", "find", "look up", "latest", "news", "today", "2024", "2025", "price", "weather", "stock"]
+    if len(q) < 40 and not any(sk in q for sk in search_intent_keywords):
+        # Likely a casual conversational question - don't waste time on external search
+        # The LLM can answer personal/casual questions without web data
+        if "?" in q or q.endswith("?"):
+            return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+
     # 1.5 LEGACY BUSINESS LOGIC (Strict Separation)
     # Business.py: "Output ONLY 'INTERNAL' for greetings, simple logic, simple coding... 'EXTERNAL' for business data"
     if mode == "business":
@@ -459,7 +493,7 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
     )
 
 
-def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None) -> str:
+def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
     """Get the appropriate system prompt for the chat mode"""
     base_prompt = ""
     if mode == "normal":
@@ -468,14 +502,23 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None) 
         base_prompt = BUSINESS_SYSTEM_PROMPT
     else:
         base_prompt = DEEPSEARCH_SYSTEM_PROMPT
+    
+    # Inject user facts if available
+    user_facts_context = ""
+    if user_id:
+        try:
+            from app.chat.memory import format_facts_for_prompt
+            user_facts_context = format_facts_for_prompt(user_id)
+        except Exception as e:
+            print(f"[Router] Error loading user facts: {e}")
         
-    return base_prompt + _build_user_context_string(user_settings)
+    return base_prompt + user_facts_context + _build_user_context_string(user_settings)
 
 
-def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None) -> str:
+def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
     """
     Combine BASE formatting/language rules with custom personality prompt.
-    Now includes SPECIALTY context for domain expertise.
+    Now includes SPECIALTY context for domain expertise and USER FACTS.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
     specialty = personality.get("specialty", "general")
@@ -534,8 +577,18 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
     
     specialty_context = SPECIALTY_CONTEXTS.get(specialty, "")
     
+    # Inject user facts if available
+    user_facts_context = ""
+    if user_id:
+        try:
+            from app.chat.memory import format_facts_for_prompt
+            user_facts_context = format_facts_for_prompt(user_id)
+        except Exception as e:
+            print(f"[Router] Error loading user facts: {e}")
+    
     return f"""{custom_prompt}
 {specialty_context}
+{user_facts_context}
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
 {_build_user_context_string(user_settings)}"""
@@ -551,11 +604,11 @@ def get_tools_for_mode(mode: str) -> Dict[str, str]:
         return DEEPSEARCH_TOOLS
 
 
-def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None) -> str:
+def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
     """
     Get system prompt for INTERNAL queries (greetings, math, logic, code) with PERSONALITY.
     Prioritizes conversational, concise responses.
-    Now includes SPECIALTY context for domain expertise.
+    Now includes SPECIALTY context for domain expertise and USER FACTS.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
     specialty = personality.get("specialty", "general")
@@ -575,7 +628,17 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     specialty_context = SPECIALTY_CONTEXTS.get(specialty, "")
     specialty_line = f"\n{specialty_context}" if specialty_context else ""
     
+    # Inject user facts if available
+    user_facts_context = ""
+    if user_id:
+        try:
+            from app.chat.memory import format_facts_for_prompt
+            user_facts_context = format_facts_for_prompt(user_id)
+        except Exception as e:
+            print(f"[Router] Error loading user facts: {e}")
+    
     return f"""{custom_prompt}{specialty_line}
+{user_facts_context}
 {BASE_LANGUAGE_RULES}
 {_build_user_context_string(user_settings)}
 
