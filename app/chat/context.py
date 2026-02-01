@@ -121,7 +121,11 @@ def get_context_for_llm(user_id: str, chat_id: str) -> List[Dict]:
     
     # 2. Add Recent Messages (Short-term memory)
     raw_messages = get_context(user_id, chat_id)
-    context_msgs.extend([{"role": msg["role"], "content": msg["content"]} for msg in raw_messages])
+    for msg in raw_messages:
+        role = msg["role"]
+        if role == "bot":
+            role = "assistant"
+        context_msgs.append({"role": role, "content": msg["content"]})
     
     return context_msgs
 
