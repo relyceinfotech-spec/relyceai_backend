@@ -198,16 +198,17 @@ class LLMProcessor:
         """
         import time
         start_time = time.time()
-        print(f"[LATENCY] Start processing: {0:.4f}s")
+        print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
         
         # Combined Analysis (Intent + Tools)
+        t_analysis_start = time.time()
         # Pass context_messages for sticky routing (history awareness)
         # Pass personality for Content Mode overrides (Pure LLM / Web Search)
         analysis = await analyze_and_route_query(user_query, mode, context_messages, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
         selected_tools = analysis.get("tools", [])
         
-        print(f"[LATENCY] Analysis Complete ({intent}): {time.time() - start_time:.4f}s")
+        print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
         if intent == "INTERNAL" or not selected_tools:
             # Stream internal response
@@ -232,7 +233,9 @@ class LLMProcessor:
             print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
             
             # 🚀 IMMEDIATELY yield a signal token to hide the loader on frontend
+            t_first_yield = time.time()
             yield " " 
+            print(f"[LATENCY] First whitespace token yielded: {time.time() - start_time:.4f}s")
 
             # Construct messages with Context (Option 2 Support)
             messages = [{"role": "system", "content": system_prompt}]
@@ -246,11 +249,14 @@ class LLMProcessor:
             
             messages.append({"role": "user", "content": user_query})
 
+            print(f"[LATENCY] Internal: Calling OpenAI Stream (Model: {self.model})... (Time: {time.time() - start_time:.4f}s)")
+            t_stream_start = time.time()
             stream = await get_openai_client().chat.completions.create(
                 model=self.model,
                 messages=messages,
                 stream=True
             )
+            print(f"[LATENCY] Internal: OpenAI Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:
@@ -302,8 +308,10 @@ class LLMProcessor:
             
             print(f"[LATENCY] Ready to Stream Synthesis: {time.time() - start_time:.4f}s")
             
-            # 🚀 Signal frontend to show message bubble
-            yield " "
+            print(f"[LATENCY] Ready to Stream Synthesis: {time.time() - start_time:.4f}s")
+            
+            # Removed premature signal token to keep Search Loader active until first real token
+            # yield " "
 
             stream = await get_openai_client().chat.completions.create(
                 model=self.model,

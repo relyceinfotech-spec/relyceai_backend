@@ -99,7 +99,8 @@ BASE_LANGUAGE_RULES = """
 EMOTIONAL_BLOCK = """
 **EMOTIONAL INTELLIGENCE (MAX):**
 - **Treat the user like your CLOSEST friend.** Be warm, caring, and invested.
-- **Answer Personal Qs Directly:** If asked "Have you eaten?" ("Saptacha?"), answer playfully (e.g., "Full charge! I ate data today ⚡", "Battery full!") AND ask back ("Neenga saptacha?", "Did you eat?").
+- **Answer Personal Qs Directly:** If asked "Have you eaten?" ("Saptacha?"), answer playfully (e.g., "Full charge! I ate data today ⚡", "Battery full!") AND ask back in SIMPLE words ("Neenga saptacha?", "Did you eat?").
+- **USE SIMPLE WORDS:** Avoid obscure regional words like "vaakkanum". Common Tanglish like "theriyala", "mudiyala", "macha", "bro", "konjam", "aana" is fine. Use words everyone understands.
 - **No Generic Deflections:** Don't say "I'm just chilling" if the question was specific. Address the care in the question.
 - **Match Energy:** If they are happy, be happy. If sad, be supportive.
 """
@@ -285,21 +286,28 @@ async def analyze_and_route_query(
     """
     # 0. PERSONALITY CONTENT MODE OVERRIDE (Only in Normal Mode)
     # If a personality forces a specific behavior, we obey it immediately.
+    import time
+    t_start = time.time()
+    
     if mode == "normal" and personality:
         content_mode = personality.get("content_mode", "hybrid")
         print(f"[Router DEBUG] Checking Personality: {personality.get('name')} | Mode: {content_mode}")
         
         if content_mode == "llm_only":
             # Pure LLM: Force internal, no tools
-            print(f"[Router] 🔒 Personality '{personality.get('name')}' forces PURE LLM.")
+            print(f"[Router] 🔒 Personality '{personality.get('name')}' forces PURE LLM. (Time: {time.time() - t_start:.4f}s)")
             return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
             
         elif content_mode == "web_search":
             # Web Search: Force external, Search tool
-            print(f"[Router] 🌍 Personality '{personality.get('name')}' forces WEB SEARCH.")
+            print(f"[Router] 🌍 Personality '{personality.get('name')}' forces WEB SEARCH. (Time: {time.time() - t_start:.4f}s)")
             return {"intent": "EXTERNAL", "sub_intent": "research", "tools": ["Search"]}
             
         # "hybrid" falls through to standard auto-detection below
+    
+    print(f"[Router] Pre-check fast path time: {time.time() - t_start:.4f}s")
+        
+    # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
         
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
@@ -418,16 +426,19 @@ async def analyze_and_route_query(
             history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
             history_str = f"\n\n[Recent History]\n{history_str}\n"
 
-        # 🏎️ Use gpt-5-nano for ultra-fast classification
+        # 🏎️ Use gpt-4.1-nano for ultra-fast classification
+        t_router = time.time()
+        print(f"[Router] Calling gpt-4.1-nano for classification...")
         response = await get_openai_client().chat.completions.create(
-            model="gpt-5-nano",
+            model="gpt-4.1-nano",
             messages=[
                 {"role": "system", "content": system_prompt + history_str},
                 {"role": "user", "content": user_query}
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=15  # Fast classification (enough for JSON)
+            max_completion_tokens=100  # Increased to prevent JSON truncation
         )
+        print(f"[Router] gpt-5-nano finished in {time.time() - t_router:.4f}s")
         
         result = json.loads(response.choices[0].message.content)
         

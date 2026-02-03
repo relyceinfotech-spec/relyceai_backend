@@ -281,6 +281,15 @@ async def handle_websocket_message(
                 )
                 break
             
+            # Intercept [INFO] messages (like search status)
+            if token.strip().startswith("[INFO]"):
+                clean_info = token.replace("[INFO]", "").strip()
+                await manager.broadcast_to_chat(
+                    chat_id,
+                    json.dumps({"type": "info", "content": clean_info})
+                )
+                continue # Do not append to full_response or stream as token
+            
             full_response += token
             await manager.stream_to_chat(chat_id, token)
         

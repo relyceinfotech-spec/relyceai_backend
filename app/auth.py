@@ -112,6 +112,34 @@ def get_user_by_uid(uid: str) -> Optional[dict]:
         print(f"[Auth] Get user error: {e}")
         return None
 
+from fastapi import Header, HTTPException, status
+
+def get_current_user(authorization: str = Header(None)):
+    """FastAPI Dependency for token extraction and verification"""
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization Header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+         raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authentication Scheme",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+        
+    is_valid, user = verify_token(token)
+    if not is_valid or not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or Expired Token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
 # Auto-initialize on import
 try:
     initialize_firebase()

@@ -3,32 +3,12 @@ Users Router
 Handles user initialization and management.
 """
 from fastapi import APIRouter, HTTPException, Depends, Header
-from app.auth import verify_token, get_firestore_db
-from datetime import datetime
-from firebase_admin import firestore
+from app.auth import verify_token, get_firestore_db, get_current_user
+from datetime import datetime, timezone
 import threading
-
-# Lock to prevent race conditions within the same instance (though transaction handles DB)
-_id_lock = threading.Lock()
-from firebase_admin import firestore
-import threading
-
-# Lock to prevent race conditions within the same instance (though transaction handles DB)
-_id_lock = threading.Lock()
 
 router = APIRouter()
-
-async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    
-    token = authorization.split(" ")[1]
-    is_valid, user_info = verify_token(token)
-    
-    if not is_valid or not user_info:
-        raise HTTPException(status_code=401, detail="Invalid token")
-        
-    return user_info
+_id_lock = threading.Lock()
 
 def check_membership_expiry(user_ref, user_data, uid):
     """
@@ -51,17 +31,22 @@ def check_membership_expiry(user_ref, user_data, uid):
 
     # 2. Expiry Logic
     try:
-        # data is stored as ISO format string
+        # Parse stored date. If no timezone info, assume UTC to be safe (or raise warning).
+        # We replace 'Z' with +00:00 to handle standard ISO string
         expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
-        # Ensure timezone awareness compatibility (assuming stored as simple ISO or UTC)
-        now = datetime.now() # Server local time. Ideally should be UTC. 
-        # Note: If expiry_date is offset-aware and now is naive, this might crash.
-        # Let's assume naive for now or handle mixed.
-        # Better:
-        # if expiry_date.tzinfo is None: expiry_date = expiry_date.replace(tzinfo=None)
         
+        # If naive (no timezone), force it to UTC
+        if expiry_date.tzinfo is None:
+             expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+        
+        # Get current time in UTC
+        now = datetime.now(timezone.utc) 
+        
+        # Debug Log (Helpful to see why users are expiring)
+        # print(f"[Users] Expiry Check {uid}: Now={now} vs Expiry={expiry_date}")
+
         if now > expiry_date:
-            print(f"[Users] Expiry: Downgrading user {uid} from {current_plan} to free")
+            print(f"[Users] Expiry: Downgrading user {uid} from {current_plan} to free. (Expired at {expiry_date})")
             
             # 3. Downgrade & Log
             updates = {
@@ -69,7 +54,7 @@ def check_membership_expiry(user_ref, user_data, uid):
                 "membership.planName": "Free",
                 "membership.status": "expired",
                 "membership.isExpired": True, 
-                "membership.updatedAt": datetime.now()
+                "membership.updatedAt": datetime.now(timezone.utc)
             }
             user_ref.update(updates)
             
@@ -82,7 +67,7 @@ def check_membership_expiry(user_ref, user_data, uid):
                 "reason": "expiry",
                 "by": "system",
                 "target": uid,
-                "timestamp": datetime.now()
+                "timestamp": datetime.now(timezone.utc)
             })
             
     except Exception as e:
@@ -91,31 +76,41 @@ def check_membership_expiry(user_ref, user_data, uid):
 def generate_unique_id(db):
     """
     Generates a unique ID like RA001, RA002 using a Firestore counter.
-    Uses a transaction to ensure atomicity.
+    Uses simple get/set with lock instead of transaction (which can fail on named DBs).
     """
     counter_ref = db.collection('counters').document('userIds')
     
-    @firestore.transactional
-    def increment_counter(transaction, counter_ref):
-        snapshot = transaction.get(counter_ref)
-        if snapshot.exists:
-            current_id = snapshot.get("currentId")
-            if not current_id: current_id = 0
-            new_id = current_id + 1
-        else:
-            new_id = 1
+    with _id_lock:  # Thread safety within this instance
+        try:
+            # Get current counter
+            counter_doc = counter_ref.get()
             
-        transaction.set(counter_ref, {"currentId": new_id, "lastUpdated": datetime.now()}, merge=True)
-        return new_id
-
-    try:
-        transaction = db.transaction()
-        new_id_num = increment_counter(transaction, counter_ref)
-        return f"RA{new_id_num:03d}"
-    except Exception as e:
-        print(f"[Users] ID Generation failed: {e}")
-        # Fallback: Timestamp based
-        return f"RA{int(datetime.now().timestamp())}"
+            if counter_doc.exists:
+                current_id = counter_doc.to_dict().get("currentId", 0)
+                if not isinstance(current_id, int):
+                    current_id = int(current_id) if current_id else 0
+                new_id = current_id + 1
+            else:
+                new_id = 1
+            
+            # Update counter
+            counter_ref.set({
+                "currentId": new_id,
+                "lastUpdated": datetime.now(timezone.utc)
+            }, merge=True)
+            
+            result_id = f"RA{new_id:03d}"
+            print(f"[Users] Generated ID: {result_id}")
+            return result_id
+            
+        except Exception as e:
+            print(f"[Users] ID Generation error: {e}")
+            # Fallback: Just use a timestamp-based random ID to prevent blocking user creation
+            # The previous "scan all users" fallback was too dangerous/slow.
+            import random
+            fallback_id = f"RA{int(datetime.now().timestamp())}{random.randint(10,99)}"
+            print(f"[Users] Using fallback timestamp ID: {fallback_id}")
+            return fallback_id
 
 
 @router.post("/init")
@@ -135,31 +130,43 @@ async def init_user(user_info: dict = Depends(get_current_user)):
         
         if doc.exists:
             user_data = doc.to_dict()
-            # If role is missing, set it to 'user'
             updates = {}
-            if "role" not in user_data:
-                print(f"[Users] Init: Setting default role for existing user {uid}")
+            
+            # FIX: Check if role is missing OR falsy (empty string, null)
+            # This prevents roles from staying blank
+            current_role = user_data.get("role")
+            if not current_role or current_role not in ["user", "admin", "superadmin"]:
+                print(f"[Users] Init: Setting default role for user {uid} (was: {current_role})")
                 updates["role"] = "user"
 
-            # Check for uniqueUserId
-            if "uniqueUserId" not in user_data:
+            # FIX: Check if uniqueUserId is missing OR falsy (empty string, null)
+            current_unique_id = user_data.get("uniqueUserId")
+            if not current_unique_id:
                 new_unique_id = generate_unique_id(db)
-                print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid}")
+                print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (was: {current_unique_id})")
                 updates["uniqueUserId"] = new_unique_id
 
-            # Check for membership and set default ONLY if key is missing
-            # Fix: Never overwrite existing membership (even if incomplete/falsy) - that's a data corruption risk
-            if "membership" not in user_data:
-                print(f"[Users] Init: Setting default FREE membership for {uid}")
+            # FIX: Check if membership is missing OR malformed (no plan field)
+            # This ensures paid users don't lose their plan, but free users get proper structure
+            membership = user_data.get("membership")
+            if not membership or not isinstance(membership, dict):
+                print(f"[Users] Init: Setting default FREE membership for {uid} (was: {membership})")
                 updates["membership"] = {
                     "plan": "free",
                     "planName": "Free",
                     "status": "active",
                     "billingCycle": "monthly",
-                    "paymentStatus": "free", # Explicitly mark as free
-                    "startDate": datetime.now().isoformat(),
-                    "updatedAt": datetime.now() # Use datetime object, Firestore serializer handles it or we use server_timestamp if imported
+                    "paymentStatus": "free",
+                    "startDate": datetime.now(timezone.utc).isoformat(),
+                    "updatedAt": datetime.now(timezone.utc)
                 }
+            elif not membership.get("plan"):
+                # Membership exists but plan is missing/empty - fix it
+                print(f"[Users] Init: Fixing missing plan in membership for {uid}")
+                updates["membership.plan"] = "free"
+                updates["membership.planName"] = "Free"
+                updates["membership.status"] = "active"
+                updates["membership.paymentStatus"] = "free"
 
             if updates:
                 user_ref.update(updates)
@@ -186,15 +193,15 @@ async def init_user(user_info: dict = Depends(get_current_user)):
                 "uniqueUserId": new_unique_id,
                 "email": email,
                 "role": "user",
-                "createdAt": datetime.now(),
-                "lastLoginAt": datetime.now(),
+                "createdAt": datetime.now(timezone.utc),
+                "lastLoginAt": datetime.now(timezone.utc),
                 "membership": {
                     "plan": "free",
                     "planName": "Free",
                     "status": "active",
                     "billingCycle": "monthly",
                     "paymentStatus": "free",
-                    "startDate": datetime.now().isoformat()
+                    "startDate": datetime.now(timezone.utc).isoformat()
                 }
             }
             user_ref.set(new_user_data, merge=True)

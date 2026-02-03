@@ -66,14 +66,14 @@ async def verify_payment(
             amount_paid = 0
 
         # 2. Payment Verified - Calculate Expiry
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         import firebase_admin
         from firebase_admin import firestore
         
         db = firestore.client()
         
-        # Calculate expiry date
-        now = datetime.now()
+        # Calculate expiry date in UTC
+        now = datetime.now(timezone.utc)
         if billing_cycle == 'yearly':
             expiry_date = now + timedelta(days=365)
         else:
@@ -152,10 +152,6 @@ async def verify_payment(
         
     except razorpay.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Signature verification failed")
-    except Exception as e:
-        print(f"[Razorpay] Verification error: {e}")
-        raise HTTPException(status_code=500, detail="Payment verification failed")
-
     except Exception as e:
         print(f"[Razorpay] Verification error: {e}")
         raise HTTPException(status_code=500, detail="Payment verification failed")
@@ -401,11 +397,11 @@ async def handle_payment_captured(db, payload):
         # But to be safe against double-counting, we should check `membership.paymentHistory`.
 
         # Calculate expiry
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         import firebase_admin
         from firebase_admin import firestore
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         if billing_cycle == 'yearly':
             expiry_date = now + timedelta(days=365)
         else:
@@ -531,17 +527,17 @@ async def handle_subscription_activated(db, payload):
         # Update user
         user_ref = db.collection('users').document(user_id)
         
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         start_ts = entity.get('start_at') or entity.get('created_at')
         
         if start_ts:
-            start_date = datetime.fromtimestamp(start_ts).isoformat()
+            start_date = datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat()
         else:
-            start_date = datetime.now().isoformat()
+            start_date = datetime.now(timezone.utc).isoformat()
             
         billing_cycle = notes.get('billingCycle', 'monthly')
         
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         if billing_cycle == 'yearly':
             expiry_date = now + timedelta(days=365)
         else:
@@ -569,7 +565,7 @@ async def handle_subscription_activated(db, payload):
                     "billingCycle": billing_cycle
                 },
                 "timestamp": firestore.SERVER_TIMESTAMP,
-                "time": datetime.now().timestamp()
+                "time": datetime.now(timezone.utc).timestamp()
             })
         except Exception as audit_err:
              print(f"[Webhook] Audit Log Error: {audit_err}")
@@ -609,18 +605,21 @@ async def handle_subscription_charged(db, payload):
         current_data = user_doc.to_dict().get('membership', {})
         current_expiry = current_data.get('expiryDate')
         
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         
         if current_expiry:
             try:
-                old_end = datetime.fromisoformat(current_expiry)
+                # Handle existing timestamps that might have Z or be naive
+                old_end = datetime.fromisoformat(current_expiry.replace('Z', '+00:00'))
+                if old_end.tzinfo is None:
+                    old_end = old_end.replace(tzinfo=timezone.utc)
             except:
-                old_end = datetime.now()
+                old_end = datetime.now(timezone.utc)
         else:
-            old_end = datetime.now()
+            old_end = datetime.now(timezone.utc)
             
         # Ensure we don't extend from a long-expired date
-        base_date = max(old_end, datetime.now())
+        base_date = max(old_end, datetime.now(timezone.utc))
         
         billing_cycle = current_data.get('billingCycle', 'monthly')
         
@@ -647,7 +646,7 @@ async def handle_subscription_charged(db, payload):
                     "newExpiry": new_end.isoformat()
                 },
                 "timestamp": firestore.SERVER_TIMESTAMP,
-                "time": datetime.now().timestamp()
+                "time": datetime.now(timezone.utc).timestamp()
             })
         except Exception as audit_err:
              print(f"[Webhook] Audit Log Error: {audit_err}")
@@ -679,7 +678,7 @@ async def handle_subscription_cancelled(db, payload):
                         "subscriptionId": sub_id
                     },
                     "timestamp": firestore.SERVER_TIMESTAMP,
-                    "time": datetime.now().timestamp()
+                    "time": datetime.now(timezone.utc).timestamp()
                 })
             except Exception as audit_err:
                 print(f"[Webhook] Audit Log Error: {audit_err}")

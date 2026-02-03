@@ -131,7 +131,8 @@ def sync_payment(payment_id):
     print("Updating Firestore...")
     
     # Calculate expiry
-    now = datetime.now()
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
     if billing_cycle == 'yearly':
         expiry_date = now + timedelta(days=365)
     else:
