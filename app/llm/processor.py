@@ -17,7 +17,6 @@ from app.llm.router import (
     get_system_prompt_for_personality,
     get_internal_system_prompt_for_personality,
     INTERNAL_SYSTEM_PROMPT,
-    INTERNAL_SYSTEM_PROMPT,
     get_openai_client
 )
 
@@ -282,16 +281,11 @@ class LLMProcessor:
             context_str = json.dumps(aggregated_context, indent=2)
             
             # Determine system prompt
-            if personality:
-                # 🎭 Personalities are now honored in ALL modes
+            if personality and mode == "normal":
+                # 🎭 Personalities are now honored ONLY in Normal/Generic mode
+                # This prevents "Hello macha" leaking into Business Mode
                 from app.llm.router import get_system_prompt_for_personality
                 system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id)
-                
-                # If in Business or Deep Search, append mode-specific constraints to the personality
-                if mode != "normal":
-                    from app.llm.router import get_system_prompt_for_mode
-                    mode_prompt = get_system_prompt_for_mode(mode, user_settings, user_id)
-                    system_prompt = f"{system_prompt}\n\n**MODE CONSTRAINT ({mode.upper()}):**\n{mode_prompt}"
             else:
                 from app.llm.router import get_system_prompt_for_mode
                 system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id)
