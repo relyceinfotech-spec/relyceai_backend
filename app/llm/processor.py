@@ -80,8 +80,14 @@ class LLMProcessor:
             from app.llm.router import _build_user_context_string
             system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
             
+        # Check for Coding Buddy override
+        model_to_use = self.model
+        if personality and personality.get("id") == "coding_buddy":
+            model_to_use = "gpt-5-nano"
+            print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
+
         response = await get_openai_client().chat.completions.create(
-            model=self.model,
+            model=model_to_use,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
@@ -140,8 +146,14 @@ class LLMProcessor:
             "content": f"Search Data:\n{context_str}\n\nUser Query: {user_query}"
         })
         
+        # Check for Coding Buddy override
+        model_to_use = self.model
+        if personality and personality.get("id") == "coding_buddy":
+            model_to_use = "gpt-5-nano"
+            print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
+
         response = await get_openai_client().chat.completions.create(
-            model=self.model,
+            model=model_to_use,
             messages=messages
         )
         
@@ -250,8 +262,15 @@ class LLMProcessor:
 
             print(f"[LATENCY] Internal: Calling OpenAI Stream (Model: {self.model})... (Time: {time.time() - start_time:.4f}s)")
             t_stream_start = time.time()
+            
+            # Check for Coding Buddy override
+            model_to_use = self.model
+            if personality and personality.get("id") == "coding_buddy":
+                model_to_use = "gpt-5-nano"
+                print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
+            
             stream = await get_openai_client().chat.completions.create(
-                model=self.model,
+                model=model_to_use,
                 messages=messages,
                 stream=True
             )
@@ -307,8 +326,14 @@ class LLMProcessor:
             # Removed premature signal token to keep Search Loader active until first real token
             # yield " "
 
+            # Check for Coding Buddy override
+            model_to_use = self.model
+            if personality and personality.get("id") == "coding_buddy":
+                model_to_use = "gpt-5-nano"
+                print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
+
             stream = await get_openai_client().chat.completions.create(
-                model=self.model,
+                model=model_to_use,
                 messages=messages,
                 stream=True
             )
