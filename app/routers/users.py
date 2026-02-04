@@ -43,7 +43,7 @@ def check_membership_expiry(user_ref, user_data, uid):
         now = datetime.now(timezone.utc) 
         
         # Debug Log (Helpful to see why users are expiring)
-        # print(f"[Users] Expiry Check {uid}: Now={now} vs Expiry={expiry_date}")
+        print(f"[Users] Expiry Check {uid}: Now={now} vs Expiry={expiry_date}")
 
         if now > expiry_date:
             print(f"[Users] Expiry: Downgrading user {uid} from {current_plan} to free. (Expired at {expiry_date})")
@@ -162,11 +162,28 @@ async def init_user(user_info: dict = Depends(get_current_user)):
                 }
             elif not membership.get("plan"):
                 # Membership exists but plan is missing/empty - fix it
-                print(f"[Users] Init: Fixing missing plan in membership for {uid}")
-                updates["membership.plan"] = "free"
-                updates["membership.planName"] = "Free"
-                updates["membership.status"] = "active"
-                updates["membership.paymentStatus"] = "free"
+                # check if there is a valid expiry date in the future
+                has_future_expiry = False
+                expiry_str = membership.get("expiryDate")
+                if expiry_str:
+                    try:
+                         exp = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                         if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
+                         if exp > datetime.now(timezone.utc):
+                             has_future_expiry = True
+                    except: pass
+                
+                if has_future_expiry:
+                    print(f"[Users] Init: Recovering MISSING PLAN as PRO for {uid} (Found valid future expiry)")
+                    updates["membership.plan"] = "pro"
+                    updates["membership.planName"] = "Pro"
+                    updates["membership.status"] = "active"
+                else:
+                    print(f"[Users] Init: Fixing missing plan in membership for {uid} (Defaulting to Free)")
+                    updates["membership.plan"] = "free"
+                    updates["membership.planName"] = "Free"
+                    updates["membership.status"] = "active"
+                    updates["membership.paymentStatus"] = "free"
 
             if updates:
                 user_ref.update(updates)

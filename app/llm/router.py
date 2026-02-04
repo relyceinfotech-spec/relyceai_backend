@@ -434,11 +434,11 @@ async def analyze_and_route_query(
             history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
             history_str = f"\n\n[Recent History]\n{history_str}\n"
 
-        # 🏎️ Use gpt-4.1-nano for ultra-fast classification
+        # 🏎️ Use gpt-5-mini for ultra-fast classification
         t_router = time.time()
-        print(f"[Router] Calling gpt-4.1-nano for classification...")
+        print(f"[Router] Calling gpt-5-mini for classification...")
         response = await get_openai_client().chat.completions.create(
-            model="gpt-4.1-nano",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt + history_str},
                 {"role": "user", "content": user_query}

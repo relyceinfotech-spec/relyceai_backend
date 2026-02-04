@@ -11,7 +11,7 @@ load_dotenv()
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
 
 # Firebase Configuration
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")

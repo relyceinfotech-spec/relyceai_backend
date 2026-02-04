@@ -3,12 +3,14 @@ import json
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
+import time
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-MODEL = os.getenv("LLM_MODEL", "gpt-4o")
+MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
 
 TOOLS = {
     "Search": "https://google.serper.dev/search",
@@ -37,14 +39,19 @@ You are a proprietary AI model developed by **Relyce AI**. You are NOT affiliate
 - Final section: Sources (Format: Source: [Link])
 """
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+  api_key=OPENAI_API_KEY,
+)
 
 def get_headers():
     return {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
 
 def analyze_query_intent(user_query):
     system_prompt = "Output ONLY 'INTERNAL' for greetings, simple logic, simple coding, or small talk. Output 'EXTERNAL' for data queries."
-    response = client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}])
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}],
+    )
     return response.choices[0].message.content.strip()
 
 def llm_internal_solve(user_query):
@@ -55,13 +62,19 @@ def llm_internal_solve(user_query):
         "If you provide any code, terminal commands, or technical snippets, ALWAYS wrap them in markdown code blocks with the appropriate language identifier (e.g., ```bash, ```python, etc.).\n"
         "Do NOT include a title. Do NOT include sources. Just the answer."
     )
-    response = client.chat.completions.create(model=MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}])
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}],
+    )
     return response.choices[0].message.content
 
 def select_multiple_tools(user_query):
     tools_list = ", ".join(TOOLS.keys())
     system_prompt = f"Select relevant tools from [{tools_list}] for: '{user_query}'. Return comma-separated list."
-    response = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": system_prompt}])
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": system_prompt}],
+    )
     selected_str = response.choices[0].message.content.strip()
     selected_tools = [t.strip() for t in selected_str.split(',') if t.strip() in TOOLS]
     if not selected_tools: return ["Search"]
@@ -79,7 +92,7 @@ def llm_synthesize_answer(user_query, search_data):
         messages=[
             {"role": "system", "content": RELYCE_SYSTEM_PROMPT},
             {"role": "user", "content": f"Search Data:\n{context_str}\n\nUser Query: {user_query}"}
-        ]
+        ],
     )
     return response.choices[0].message.content
 
@@ -89,10 +102,17 @@ def run_normal():
         if query.strip() == "0258": break
         if not query.strip(): continue
         
+        start_ts = time.time()
+        print(f"\n[Timing] Request sent at: {time.strftime('%H:%M:%S', time.localtime(start_ts))}")
+
         if analyze_query_intent(query) == "INTERNAL":
             print("\n" + "-"*60)
             print(llm_internal_solve(query))
             print("-" * 60)
+            
+            end_ts = time.time()
+            print(f"[Timing] Response received at: {time.strftime('%H:%M:%S', time.localtime(end_ts))}")
+            print(f"[Timing] Total Duration: {end_ts - start_ts:.2f}s")
             continue 
 
         print(f"[{MODEL}] Mode: External Data Required")
@@ -107,6 +127,10 @@ def run_normal():
         print("-" * 60)
         print(llm_synthesize_answer(query, aggregated_context))
         print("-" * 60)
+        
+        end_ts = time.time()
+        print(f"[Timing] Response received at: {time.strftime('%H:%M:%S', time.localtime(end_ts))}")
+        print(f"[Timing] Total Duration: {end_ts - start_ts:.2f}s")
 
 if __name__ == "__main__":
     run_normal()

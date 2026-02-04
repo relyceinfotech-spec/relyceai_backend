@@ -17,7 +17,8 @@ from app.llm.router import (
     get_system_prompt_for_personality,
     get_internal_system_prompt_for_personality,
     INTERNAL_SYSTEM_PROMPT,
-    get_openai_client
+    INTERNAL_SYSTEM_PROMPT,
+    get_openai_client,
 )
 
 class LLMProcessor:
@@ -86,13 +87,23 @@ class LLMProcessor:
             model_to_use = "gpt-5-nano"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        response = await get_openai_client().chat.completions.create(
-            model=model_to_use,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ]
-        )
+        if mode == "normal":
+            # Use OpenAI for Normal Mode
+            response = await get_openai_client().chat.completions.create(
+                model="gpt-5-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ]
+            )
+        else:
+            response = await get_openai_client().chat.completions.create(
+                model=model_to_use,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ]
+            )
         return response.choices[0].message.content
     
     async def process_external_query(
@@ -149,13 +160,20 @@ class LLMProcessor:
         # Check for Coding Buddy override
         model_to_use = self.model
         if personality and personality.get("id") == "coding_buddy":
-            model_to_use = "gpt-5-nano"
+            model_to_use = "gpt-5-mini"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        response = await get_openai_client().chat.completions.create(
-            model=model_to_use,
-            messages=messages
-        )
+        if mode == "normal":
+             # Use OpenAI for Normal Mode
+            response = await get_openai_client().chat.completions.create(
+                model="gpt-5-mini",
+                messages=messages
+            )
+        else:
+            response = await get_openai_client().chat.completions.create(
+                model=model_to_use,
+                messages=messages
+            )
         
         return response.choices[0].message.content, selected_tools
     
@@ -269,11 +287,18 @@ class LLMProcessor:
                 model_to_use = "gpt-5-nano"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
             
-            stream = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                stream=True
-            )
+            if mode == "normal":
+                 stream = await get_openai_client().chat.completions.create(
+                    model="gpt-5-mini",
+                    messages=messages,
+                    stream=True
+                )
+            else:
+                stream = await get_openai_client().chat.completions.create(
+                    model=model_to_use,
+                    messages=messages,
+                    stream=True
+                )
             print(f"[LATENCY] Internal: OpenAI Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
             
             async for chunk in stream:
@@ -329,14 +354,21 @@ class LLMProcessor:
             # Check for Coding Buddy override
             model_to_use = self.model
             if personality and personality.get("id") == "coding_buddy":
-                model_to_use = "gpt-5-nano"
+                model_to_use = "gpt-5-mini"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-            stream = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                stream=True
-            )
+            if mode == "normal":
+                stream = await get_openai_client().chat.completions.create(
+                    model="gpt-5-mini",
+                    messages=messages,
+                    stream=True
+                )
+            else:
+                stream = await get_openai_client().chat.completions.create(
+                    model=model_to_use,
+                    messages=messages,
+                    stream=True
+                )
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:

@@ -10,7 +10,7 @@ load_dotenv()
 # CONFIGURATION
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-MODEL = os.getenv("LLM_MODEL", "gpt-5-nano")
+MODEL = os.getenv("LLM_MODEL", "gpt-5-mini")
 
 # FULL TOOL SUITE
 TOOLS = {
