@@ -1,7 +1,7 @@
 """
 Relyce AI - LLM Processor
 Handles message processing with streaming support
-Uses logic from existing Normal.py, Business.py, Deepsearch.py
+Includes legacy prompts and routing logic consolidated into app/llm
 """
 import json
 from typing import AsyncGenerator, List, Dict, Any, Optional
@@ -17,18 +17,29 @@ from app.llm.router import (
     get_system_prompt_for_personality,
     get_internal_system_prompt_for_personality,
     INTERNAL_SYSTEM_PROMPT,
-    INTERNAL_SYSTEM_PROMPT,
     get_openai_client,
 )
 
 class LLMProcessor:
     """
     Main LLM processor class that handles all chat modes.
-    Imports and uses logic from existing Normal.py, Business.py, Deepsearch.py
+    Consolidated logic from legacy mode scripts
     """
     
     def __init__(self):
         self.model = LLM_MODEL
+    
+    def _sanitize_output_text(self, text: str) -> str:
+        """
+        Normalize punctuation to avoid em-dashes/double-hyphen in outputs.
+        """
+        if not text:
+            return text
+        # Replace em dash and en dash with a simple hyphen
+        sanitized = text.replace("—", " - ").replace("–", " - ")
+        # Reduce double-hyphen to single hyphen spacing
+        sanitized = sanitized.replace("--", " - ")
+        return sanitized
     
     async def summarize_context(self, messages: List[Dict], existing_summary: str = "") -> str:
         """
@@ -61,7 +72,7 @@ class LLMProcessor:
         
         try:
             response = await get_openai_client().chat.completions.create(
-                model="gpt-3.5-turbo", # Use cheaper model for summary
+                model="gpt-5-nano",
                 messages=[{"role": "user", "content": prompt_content}],
                 max_tokens=400
             )
@@ -87,24 +98,14 @@ class LLMProcessor:
             model_to_use = "gpt-5-nano"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        if mode == "normal":
-            # Use OpenAI for Normal Mode
-            response = await get_openai_client().chat.completions.create(
-                model="gpt-5-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_query}
-                ]
-            )
-        else:
-            response = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_query}
-                ]
-            )
-        return response.choices[0].message.content
+        response = await get_openai_client().chat.completions.create(
+            model=model_to_use,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query}
+            ]
+        )
+        return self._sanitize_output_text(response.choices[0].message.content)
     
     async def process_external_query(
         self, 
@@ -160,22 +161,15 @@ class LLMProcessor:
         # Check for Coding Buddy override
         model_to_use = self.model
         if personality and personality.get("id") == "coding_buddy":
-            model_to_use = "gpt-5-mini"
+            model_to_use = "gpt-5-nano"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        if mode == "normal":
-             # Use OpenAI for Normal Mode
-            response = await get_openai_client().chat.completions.create(
-                model="gpt-5-mini",
-                messages=messages
-            )
-        else:
-            response = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=messages
-            )
+        response = await get_openai_client().chat.completions.create(
+            model=model_to_use,
+            messages=messages
+        )
         
-        return response.choices[0].message.content, selected_tools
+        return self._sanitize_output_text(response.choices[0].message.content), selected_tools
     
     async def process_message(
         self, 
@@ -197,7 +191,7 @@ class LLMProcessor:
             response_text = await self.process_internal_query(user_query, personality, user_settings, mode=mode)
             return {
                 "success": True,
-                "response": response_text,
+                "response": self._sanitize_output_text(response_text),
                 "mode_used": "internal",
                 "tools_activated": []
             }
@@ -207,7 +201,7 @@ class LLMProcessor:
             )
             return {
                 "success": True,
-                "response": response_text,
+                "response": self._sanitize_output_text(response_text),
                 "mode_used": mode,
                 "tools_activated": tools
             }
@@ -228,7 +222,7 @@ class LLMProcessor:
         import time
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
-        
+
         # Combined Analysis (Intent + Tools)
         t_analysis_start = time.time()
         # Pass context_messages for sticky routing (history awareness)
@@ -260,11 +254,6 @@ class LLMProcessor:
                  system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
 
             print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
-            
-            # 🚀 IMMEDIATELY yield a signal token to hide the loader on frontend
-            t_first_yield = time.time()
-            yield " " 
-            print(f"[LATENCY] First whitespace token yielded: {time.time() - start_time:.4f}s")
 
             # Construct messages with Context (Option 2 Support)
             messages = [{"role": "system", "content": system_prompt}]
@@ -287,23 +276,16 @@ class LLMProcessor:
                 model_to_use = "gpt-5-nano"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
             
-            if mode == "normal":
-                 stream = await get_openai_client().chat.completions.create(
-                    model="gpt-5-mini",
-                    messages=messages,
-                    stream=True
-                )
-            else:
-                stream = await get_openai_client().chat.completions.create(
-                    model=model_to_use,
-                    messages=messages,
-                    stream=True
-                )
+            stream = await get_openai_client().chat.completions.create(
+                model=model_to_use,
+                messages=messages,
+                stream=True
+            )
             print(f"[LATENCY] Internal: OpenAI Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                    yield self._sanitize_output_text(chunk.choices[0].delta.content)
         else:
             # External Mode with Tools
             tools_dict = get_tools_for_mode(mode)
@@ -354,25 +336,18 @@ class LLMProcessor:
             # Check for Coding Buddy override
             model_to_use = self.model
             if personality and personality.get("id") == "coding_buddy":
-                model_to_use = "gpt-5-mini"
+                model_to_use = "gpt-5-nano"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-            if mode == "normal":
-                stream = await get_openai_client().chat.completions.create(
-                    model="gpt-5-mini",
-                    messages=messages,
-                    stream=True
-                )
-            else:
-                stream = await get_openai_client().chat.completions.create(
-                    model=model_to_use,
-                    messages=messages,
-                    stream=True
-                )
+            stream = await get_openai_client().chat.completions.create(
+                model=model_to_use,
+                messages=messages,
+                stream=True
+            )
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                    yield self._sanitize_output_text(chunk.choices[0].delta.content)
 
 # Global processor instance
 llm_processor = LLMProcessor()

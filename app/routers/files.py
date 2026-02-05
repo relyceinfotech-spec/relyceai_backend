@@ -2,13 +2,13 @@
 Files Router
 Handles file uploads and secure usage tracking.
 """
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from typing import Optional
 import shutil
 import os
 import time
 from datetime import datetime
-from app.auth import get_firestore_db
+from app.auth import get_firestore_db, get_current_user
 from firebase_admin import firestore
 
 router = APIRouter()
@@ -19,20 +19,19 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    user_id: str = Form(...)
+    user_info: dict = Depends(get_current_user)
 ):
     """
     Upload a file and increment user usage securely.
     """
     try:
-        # 1. Validation (Basic)
-        if not user_id:
-            raise HTTPException(status_code=400, detail="user_id is required")
+        user_id = user_info["uid"]
         
         # 2. Save File Locally (for RAG processing)
         # Generate safe filename
         timestamp = int(time.time())
-        safe_filename = f"{user_id}_{timestamp}_{file.filename}"
+        original_name = os.path.basename(file.filename)
+        safe_filename = f"{user_id}_{timestamp}_{original_name}"
         file_path = os.path.join(UPLOAD_DIR, safe_filename)
         
         with open(file_path, "wb") as buffer:
@@ -78,3 +77,37 @@ async def upload_file(
     except Exception as e:
         print(f"[Files] Upload error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@router.delete("/delete/{user_id}/{filename}")
+async def delete_file(
+    user_id: str,
+    filename: str,
+    user_info: dict = Depends(get_current_user)
+):
+    """
+    Delete an uploaded file for the authenticated user.
+    Path user_id is ignored; token UID is enforced.
+    """
+    try:
+        uid = user_info["uid"]
+        safe_name = os.path.basename(filename)
+
+        if safe_name != filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        if not safe_name.startswith(f"{uid}_"):
+            raise HTTPException(status_code=403, detail="Cannot delete file")
+
+        file_path = os.path.join(UPLOAD_DIR, safe_name)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        os.remove(file_path)
+
+        return {"success": True, "message": "File deleted"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"[Files] Delete error: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed")

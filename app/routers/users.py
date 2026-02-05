@@ -25,15 +25,19 @@ def check_membership_expiry(user_ref, user_data, uid):
     if current_plan == "free":
         return
 
-    expiry_date_str = membership.get("expiryDate") # Using expiryDate as per frontend schema
-    if not expiry_date_str:
+    expiry_value = membership.get("expiryDate") # Using expiryDate as per frontend schema
+    if not expiry_value:
         return # Skip if no expiry date (e.g. lifetime/unknown)
 
     # 2. Expiry Logic
     try:
-        # Parse stored date. If no timezone info, assume UTC to be safe (or raise warning).
-        # We replace 'Z' with +00:00 to handle standard ISO string
-        expiry_date = datetime.fromisoformat(expiry_date_str.replace('Z', '+00:00'))
+        # Parse stored date. Accept ISO strings and Firestore Timestamps.
+        if hasattr(expiry_value, "to_datetime"):
+            expiry_date = expiry_value.to_datetime()
+        elif isinstance(expiry_value, datetime):
+            expiry_date = expiry_value
+        else:
+            expiry_date = datetime.fromisoformat(str(expiry_value).replace('Z', '+00:00'))
         
         # If naive (no timezone), force it to UTC
         if expiry_date.tzinfo is None:
@@ -72,6 +76,41 @@ def check_membership_expiry(user_ref, user_data, uid):
             
     except Exception as e:
         print(f"[Users] Expiry check failed for {uid}: {e}")
+
+
+def normalize_role(role_value: str) -> str:
+    """Normalize role strings without downgrading."""
+    if not role_value:
+        return ""
+    role = str(role_value).strip().lower()
+    if role == "super_admin":
+        return "superadmin"
+    return role
+
+
+def infer_plan_from_membership(membership: dict) -> str:
+    """Infer plan safely from membership data without guessing."""
+    if not membership:
+        return ""
+    if membership.get("plan"):
+        return str(membership.get("plan")).lower()
+    plan_name = membership.get("planName")
+    if plan_name:
+        return str(plan_name).strip().lower()
+    payment_history = membership.get("paymentHistory")
+    if isinstance(payment_history, dict) and payment_history:
+        try:
+            # Pick most recent payment by date field if present
+            def get_date(item):
+                data = item[1] or {}
+                return data.get("date") or ""
+            latest = max(payment_history.items(), key=get_date)
+            plan = latest[1].get("plan")
+            if plan:
+                return str(plan).lower()
+        except Exception:
+            pass
+    return ""
 
 def generate_unique_id(db):
     """
@@ -132,58 +171,13 @@ async def init_user(user_info: dict = Depends(get_current_user)):
             user_data = doc.to_dict()
             updates = {}
             
-            # FIX: Check if role is missing OR falsy (empty string, null)
-            # This prevents roles from staying blank
-            current_role = user_data.get("role")
-            if not current_role or current_role not in ["user", "admin", "superadmin"]:
-                print(f"[Users] Init: Setting default role for user {uid} (was: {current_role})")
-                updates["role"] = "user"
+            # HARDENING: For existing users, do NOT modify role or membership via /users/init.
+            # This prevents unintended downgrades. Only assign uniqueUserId if the field is missing.
 
-            # FIX: Check if uniqueUserId is missing OR falsy (empty string, null)
-            current_unique_id = user_data.get("uniqueUserId")
-            if not current_unique_id:
+            if "uniqueUserId" not in user_data:
                 new_unique_id = generate_unique_id(db)
-                print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (was: {current_unique_id})")
+                print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (field missing)")
                 updates["uniqueUserId"] = new_unique_id
-
-            # FIX: Check if membership is missing OR malformed (no plan field)
-            # This ensures paid users don't lose their plan, but free users get proper structure
-            membership = user_data.get("membership")
-            if not membership or not isinstance(membership, dict):
-                print(f"[Users] Init: Setting default FREE membership for {uid} (was: {membership})")
-                updates["membership"] = {
-                    "plan": "free",
-                    "planName": "Free",
-                    "status": "active",
-                    "billingCycle": "monthly",
-                    "paymentStatus": "free",
-                    "startDate": datetime.now(timezone.utc).isoformat(),
-                    "updatedAt": datetime.now(timezone.utc)
-                }
-            elif not membership.get("plan"):
-                # Membership exists but plan is missing/empty - fix it
-                # check if there is a valid expiry date in the future
-                has_future_expiry = False
-                expiry_str = membership.get("expiryDate")
-                if expiry_str:
-                    try:
-                         exp = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
-                         if exp.tzinfo is None: exp = exp.replace(tzinfo=timezone.utc)
-                         if exp > datetime.now(timezone.utc):
-                             has_future_expiry = True
-                    except: pass
-                
-                if has_future_expiry:
-                    print(f"[Users] Init: Recovering MISSING PLAN as PRO for {uid} (Found valid future expiry)")
-                    updates["membership.plan"] = "pro"
-                    updates["membership.planName"] = "Pro"
-                    updates["membership.status"] = "active"
-                else:
-                    print(f"[Users] Init: Fixing missing plan in membership for {uid} (Defaulting to Free)")
-                    updates["membership.plan"] = "free"
-                    updates["membership.planName"] = "Free"
-                    updates["membership.status"] = "active"
-                    updates["membership.paymentStatus"] = "free"
 
             if updates:
                 user_ref.update(updates)
@@ -193,7 +187,7 @@ async def init_user(user_info: dict = Depends(get_current_user)):
                 user_data.update(updates)
                 
             # --- EXPIRY CHECK ---
-            check_membership_expiry(user_ref, user_data, uid)
+            # Disabled in /users/init to avoid accidental downgrades.
 
             if updates:
                 return {"success": True, "status": "updated", "updates": list(updates.keys())}

@@ -2,13 +2,12 @@
 Admin Router
 Handles administrative actions like role management and audit logging.
 """
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, Body
 from pydantic import BaseModel
 from typing import Optional
 import time
-from app.auth import verify_token, get_firestore_db
-from app.auth import verify_token, get_firestore_db
-from datetime import datetime
+from app.auth import verify_token, get_firestore_db, get_current_user
+from datetime import datetime, timedelta
 # Import reusable expiry logic
 from app.routers.users import check_membership_expiry
 
@@ -17,6 +16,24 @@ router = APIRouter()
 class ChangeRoleRequest(BaseModel):
     target_uid: str
     new_role: str
+
+
+class UpdateMembershipRequest(BaseModel):
+    target_uid: str
+    plan: str
+    billing_cycle: str = "monthly"
+    payment: Optional[dict] = None
+
+
+def require_admin(user_info: dict = Depends(get_current_user)):
+    db = get_firestore_db()
+    doc = db.collection("users").document(user_info["uid"]).get()
+    if not doc.exists:
+        raise HTTPException(status_code=403, detail="Admin profile not found")
+    role = doc.to_dict().get("role", "user")
+    if role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return user_info
 
 async def get_current_user_uid(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -80,6 +97,116 @@ async def change_role(request: ChangeRoleRequest, requester_uid: str = Depends(g
     except Exception as e:
         print(f"[Admin] Role change error: {e}")
         raise HTTPException(status_code=500, detail="Failed to update role")
+
+
+@router.post("/membership/update")
+async def update_membership(request: UpdateMembershipRequest, user_info: dict = Depends(require_admin)):
+    """
+    Admin-only membership update through backend.
+    """
+    db = get_firestore_db()
+    target_ref = db.collection("users").document(request.target_uid)
+    target_doc = target_ref.get()
+    if not target_doc.exists:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    now = datetime.now()
+    # Calculate expiry
+    if request.billing_cycle == "yearly":
+        expiry_date = now.replace(year=now.year + 1)
+    else:
+        expiry_date = now + timedelta(days=30)
+
+    updates = {
+        "membership.plan": request.plan,
+        "membership.planName": request.plan.capitalize(),
+        "membership.status": "active" if request.plan != "free" else "active",
+        "membership.billingCycle": request.billing_cycle,
+        "membership.paymentStatus": "paid" if request.plan != "free" else "free",
+        "membership.startDate": now.isoformat(),
+        "membership.expiryDate": None if request.plan == "free" else expiry_date.isoformat(),
+        "membership.updatedAt": now,
+    }
+
+    if request.payment and request.plan != "free":
+        payment_id = request.payment.get("transactionId") or request.payment.get("paymentId")
+        if payment_id:
+            updates[f"membership.paymentHistory.{payment_id}"] = {
+                "transactionId": payment_id,
+                "orderId": request.payment.get("orderId"),
+                "amount": request.payment.get("amount"),
+                "currency": request.payment.get("currency") or "INR",
+                "method": request.payment.get("method") or "manual",
+                "plan": request.plan,
+                "billingCycle": request.billing_cycle,
+                "date": now.isoformat(),
+                "verified": True,
+                "source": "admin"
+            }
+
+    target_ref.update(updates)
+
+    db.collection("auditLogs").add({
+        "action": "MEMBERSHIP_CHANGED",
+        "by": user_info["uid"],
+        "target": request.target_uid,
+        "details": {
+            "plan": request.plan,
+            "billingCycle": request.billing_cycle
+        },
+        "timestamp": now,
+        "time": now.timestamp()
+    })
+
+    return {"success": True, "message": "Membership updated"}
+
+
+@router.delete("/users/{target_uid}")
+async def delete_user(target_uid: str, user_info: dict = Depends(require_admin)):
+    """
+    Admin-only user deletion through backend.
+    """
+    db = get_firestore_db()
+    target_ref = db.collection("users").document(target_uid)
+    target_doc = target_ref.get()
+    if not target_doc.exists:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    # Delete chat sessions and messages
+    sessions = db.collection("users").document(target_uid).collection("chatSessions").stream()
+    for session in sessions:
+        msgs = session.reference.collection("messages").stream()
+        for msg in msgs:
+            msg.reference.delete()
+        session.reference.delete()
+
+    # Delete files metadata
+    files = db.collection("users").document(target_uid).collection("files").stream()
+    for f in files:
+        f.reference.delete()
+
+    # Delete folders
+    folders = db.collection("users").document(target_uid).collection("folders").stream()
+    for f in folders:
+        f.reference.delete()
+
+    # Delete shared chats
+    shared = db.collection("sharedChats").where("userId", "==", target_uid).stream()
+    for s in shared:
+        s.reference.delete()
+
+    target_ref.delete()
+
+    now = datetime.now()
+    db.collection("auditLogs").add({
+        "action": "USER_DELETED",
+        "by": user_info["uid"],
+        "target": target_uid,
+        "timestamp": now,
+        "time": now.timestamp()
+    })
+
+    return {"success": True, "message": "User deleted"}
 
 @router.post("/jobs/expire-memberships")
 async def run_expiry_job(requester_uid: str = Depends(get_current_user_uid)):

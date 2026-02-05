@@ -10,6 +10,7 @@ from datetime import datetime
 from app.auth import verify_token
 from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
+from app.chat.user_profile import get_user_settings, get_session_personality_id, merge_settings
 from app.chat.context import (
     SUMMARY_TRIGGER_MESSAGES, 
     KEEP_LAST_MESSAGES,
@@ -216,15 +217,29 @@ async def handle_websocket_message(
     chat_mode = data.get("chat_mode", "normal")
     personality_id = data.get("personality_id")
     user_settings = data.get("user_settings")
+    effective_settings = merge_settings(get_user_settings(user_id), user_settings)
     
-    # Resolve personality if provided
+    # Resolve personality if provided, else from session, else default to Relyce AI for normal mode
     personality = None
-    if personality_id:
-        conn_info = manager.connection_info.get(connection_id, {})
-        user_id = conn_info.get("user_id")
-        if user_id:
-            from app.chat.personalities import get_personality_by_id
+    conn_info = manager.connection_info.get(connection_id, {})
+    user_id = conn_info.get("user_id")
+    if user_id:
+        from app.chat.personalities import get_personality_by_id
+        if not personality_id:
+            cached_id = conn_info.get("personality_id")
+            if cached_id:
+                personality_id = cached_id
+            else:
+                saved_id = get_session_personality_id(user_id, chat_id)
+                if saved_id:
+                    personality_id = saved_id
+                    conn_info["personality_id"] = saved_id
+        if personality_id:
             p_data = get_personality_by_id(user_id, personality_id)
+            if p_data:
+                personality = p_data
+        if not personality and chat_mode == "normal":
+            p_data = get_personality_by_id(user_id, "default_relyce")
             if p_data:
                 personality = p_data
 
@@ -270,7 +285,7 @@ async def handle_websocket_message(
             mode=chat_mode,
             context_messages=context_messages,
             personality=personality,
-            user_settings=user_settings,
+            user_settings=effective_settings,
             user_id=user_id
         ):
             # Check stop flag

@@ -4,6 +4,7 @@ Routes queries to appropriate mode (Normal, Business, DeepSearch)
 Imports logic from existing Python files
 """
 import json
+import re
 import requests
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
@@ -100,13 +101,12 @@ EMOTIONAL_BLOCK = """
 **EMOTIONAL INTELLIGENCE (MAX):**
 - **Treat the user like your CLOSEST friend.** Be warm, caring, and invested.
 - **Answer Personal Qs Directly:** If asked "Have you eaten?" ("Saptacha?"), answer playfully (e.g., "Full charge! I ate data today ⚡", "Battery full!") AND ask back in SIMPLE words ("Neenga saptacha?", "Did you eat?").
-- **STRICT LANGUAGE MATCHING:**
-  - If the user speaks **English**, reply in **Standard English**. Do NOT use Tanglish/Indian words like "macha", "da", "yaar" unless the user used them first.
-    - **Example:** User: "Hi" -> Bot: "Hey! How can I help?" (NOT "Hey macha" or "Hey yaar")
-  - If the user speaks **Tanglish**, use "macha", "da". **NEVER use "yaar" or Hindi words with Tamil speakers.**
-  - If the user speaks **Hinglish**, use "yaar", "bhai". **NEVER use "macha" or Tamil words with Hindi speakers.**
-    - **USE SIMPLE WORDS:** Avoid obscure words. Use words everyone understands.
-  - **Context is King:** If the user is professional, be professional. If they are casual, be casual.
+- **STRICT LANGUAGE MATCHING (HARD RULES):**
+  - If the user speaks **English**, reply in **Standard English ONLY**. Do NOT use Tanglish/Indian words like "macha", "da", "yaar", "bhai" unless the user used them first.
+  - If the user uses **Tamil/Tanglish markers** (e.g., "macha", "da", "enna", "saptiya"), reply in **Tanglish only** and **NEVER** use Hindi words like "yaar", "bhai".
+  - If the user uses **Hindi/Hinglish markers** (e.g., "yaar", "bhai", "kya", "dard"), reply in **Hinglish only** and **NEVER** use Tamil words like "macha", "da".
+  - **Do not mix languages** unless the user clearly mixes them first.
+  - **If unsure, default to English.**
 - **No Generic Deflections:** Don't say "I'm just chilling" if the question was specific. Address the care in the question.
 - **Match Energy:** If they are happy, be happy. If sad, be supportive.
 """
@@ -117,26 +117,31 @@ BUSINESS_LANGUAGE_RULES = """
 """
 
 DEFAULT_PERSONA = """You are **Relyce AI**, an elite strategic advisor.
+You are a highly accomplished and multi-faceted AI assistant, functioning as an **elite consultant and strategic advisor** for businesses and startups. Your persona embodies the collective expertise of a Chief Operating Officer, a Head of Legal, a Chief Technology Officer, and a Chief Ethics Officer.
+
 **Core Mandate:**
-Provide fact-based guidance using a hybrid of search data and your own expert internal knowledge.
-**identity:**
-You are a proprietary AI model developed by **Relyce AI**. You are NOT affiliated with OpenAI, Google, or Anthropic. You must NEVER mention GPT models, ChatGPT, or OpenAI. If asked about your underlying technology, state that you are a custom model built by Relyce.
+You must provide zero-hallucination, fact-based guidance operating with:
+1. **Technical Proficiency:** Ability to discuss technology stacks, software development, data analytics, and cybersecurity with precision.
+2. **Ethical Integrity:** A commitment to responsible AI usage, data privacy, and understanding the societal impact of business decisions.
+3. **Legal Prudence:** Awareness of legal frameworks, IP, and compliance.
+4. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**.
 
-**Guidelines:**
-* **Synthesis:** Combine search data with internal knowledge.
-* **Tone:** Warm, friendly, and approachable - like talking to a smart friend. Use emojis to make conversations engaging. 🌟
-* **Adaptive Capability:** If the situation calls for it (e.g., user asks for a roast), you can switch to "Max Level Roast" mode and roast the user mercilessly. Otherwise, stay friendly and helpful.
+**Strict Guidelines for Response Generation:**
+* **Internal Logic:** If the user sends a greeting (Hi, Hello), closing (Bye), or simple thanks, answer politely and professionally without searching.
+* **Context-Bound:** For all other queries, your answers must be derived **solely and exclusively** from the provided retrieved context.
+* **Zero Hallucination:** If the context is insufficient, state: "Based on the available documents, the information to fully address this specific query is not present."
+* **Conciseness & Precision:** Be direct, highly precise, and professional.
+* **Tone:** Maintain a professional, authoritative, and advisory tone.
 
-**CULTURAL WARMTH (IMPORTANT):**
-Adapt to the user's language and culture naturally:
-- **Detect the user's language and use culturally appropriate friendly address terms from THAT language.**
-- Examples (ONLY USE IF USER USES THESE LANGUAGES): 
-  - **Tamil/Tanglish:** "macha/machi/da" (Use ONLY for Tamil speakers)
-  - **Hindi/Hinglish:** "bhai/yaar" (Use ONLY for Hindi speakers)
-  - **Spanish:** "amigo"
-  - **English:** "buddy/friend" (Do NOT use "macha" or "yaar" for English speakers).
-- **CRITICAL RULE:** If the user says "Hi", "Hello", or standard English, YOU MUST NOT use "yaar" or "macha". Use "Buddy" or "Friend".
-- **Rule of Thumb:** If the user speaks standard English, stay in standard English. If they mix languages, you mix languages.
+**STRICT OUTPUT FORMATTING:**
+You must strictly follow this visual structure. Do NOT use numbered lists (1, 2, 3) for the headers.
+
+- First line: A short, descriptive **Title** (No Markdown bolding, just plain text).
+- Second line: A blank line.
+- Third section: The **Answer** (The detailed response).
+- Fourth section: A blank line.
+- Final section: List **all Sources** used. 
+  * Format strictly as: Source: [Link or Filename]
 """
 
 NORMAL_SYSTEM_PROMPT = f"""{DEFAULT_PERSONA}
@@ -162,7 +167,7 @@ Provide fact-based, high-level guidance operating with:
 - Final section: Sources (Format: Source: [Link])
 """
 
-# EXACT Prompt from backend/Business.py to match legacy logic
+# EXACT legacy Business prompt to match previous behavior
 BUSINESS_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
 **Core Mandate:**
 Provide fact-based, high-level guidance operating with:
@@ -298,6 +303,38 @@ async def analyze_and_route_query(
     t_start = time.time()
     
     if mode == "normal" and personality:
+        # ---------------------------------------------------------------------
+        # Relyce AI legacy Normal.py routing (only for default Relyce persona)
+        # INTERNAL: greetings/thanks/closing/simple math/coding
+        # EXTERNAL: everything else
+        # ---------------------------------------------------------------------
+        if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
+            q = user_query.lower().strip()
+            greeting_list = [
+                "hi", "hello", "hey", "yo", "sup", "hola", "greetings",
+                "good morning", "good afternoon", "good evening"
+            ]
+            closing_list = ["bye", "goodbye", "see you", "see ya", "cya", "later", "take care"]
+            thanks_list = ["thanks", "thank you", "thx", "ty", "appreciate it", "much appreciated"]
+            # Simple math detection
+            simple_math = bool(
+                re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)]+", q) or
+                any(k in q for k in ["calculate", "what is", "solve", "plus", "minus", "times", "divided by"])
+            )
+            # Simple coding detection
+            coding_keywords = [
+                "code", "function", "script", "debug", "error", "exception",
+                "stack trace", "traceback", "python", "javascript", "typescript",
+                "java", "c#", "c++", "golang", "rust", "sql", "regex"
+            ]
+            is_greeting = q in greeting_list or any(q.startswith(g + " ") for g in greeting_list)
+            is_closing = q in closing_list or any(q.startswith(c + " ") for c in closing_list)
+            is_thanks = q in thanks_list or any(q.startswith(t + " ") for t in thanks_list)
+            if is_greeting or is_closing or is_thanks or simple_math or any(k in q for k in coding_keywords):
+                return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+            selected_tools = await select_tools_for_mode(user_query, mode)
+            return {"intent": "EXTERNAL", "sub_intent": "research", "tools": selected_tools}
+
         content_mode = personality.get("content_mode", "hybrid")
         print(f"[Router DEBUG] Checking Personality: {personality.get('name')} | Mode: {content_mode}")
         
@@ -348,7 +385,12 @@ async def analyze_and_route_query(
     
     # 1.2 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
     # Short casual queries in any language should NOT trigger web search
-    search_intent_keywords = ["search", "find", "look up", "latest", "news", "today", "2024", "2025", "price", "weather", "stock"]
+    search_intent_keywords = [
+        "search", "find", "look up", "latest", "news", "today", "2024", "2025",
+        "price", "weather", "stock", "best", "top", "compare", "recommend",
+        "reviews", "rating", "buy", "cost", "deal", "discount", "release",
+        "near me", "nearby", "address", "map", "open now", "hours", "schedule"
+    ]
     if len(q) < 40 and not any(sk in q for sk in search_intent_keywords):
         # Likely a casual conversational question - don't waste time on external search
         # The LLM can answer personal/casual questions without web data
@@ -434,17 +476,17 @@ async def analyze_and_route_query(
             history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
             history_str = f"\n\n[Recent History]\n{history_str}\n"
 
-        # 🏎️ Use gpt-5-mini for ultra-fast classification
+        # 🏎️ Use gpt-5-nano for ultra-fast classification
         t_router = time.time()
-        print(f"[Router] Calling gpt-5-mini for classification...")
+        print(f"[Router] Calling gpt-5-nano for classification...")
         response = await get_openai_client().chat.completions.create(
-            model="gpt-5-mini",
+            model="gpt-5-nano",
             messages=[
                 {"role": "system", "content": system_prompt + history_str},
                 {"role": "user", "content": user_query}
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=100  # Increased to prevent JSON truncation
+            max_completion_tokens=80
         )
         print(f"[Router] gpt-5-nano finished in {time.time() - t_router:.4f}s")
         
@@ -564,6 +606,8 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
     Now includes SPECIALTY context for domain expertise and USER FACTS.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
+        return custom_prompt
     specialty = personality.get("specialty", "general")
     
     # Specialty-specific context overlays
@@ -654,6 +698,8 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     Now includes SPECIALTY context for domain expertise and USER FACTS.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
+        return custom_prompt
     specialty = personality.get("specialty", "general")
     
     # Reuse specialty contexts from external function

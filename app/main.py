@@ -16,9 +16,10 @@ from app.models import (
     ChatRequest, ChatResponse, SearchRequest,
     HealthResponse, WebSocketMessage, Personality
 )
-from app.auth import verify_token, initialize_firebase
+from app.auth import verify_token, initialize_firebase, get_current_user
 from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
+from app.chat.user_profile import get_user_settings, get_session_personality_id, merge_settings
 from app.chat.history import save_message_to_firebase, load_chat_history, increment_message_count
 from app.websocket import manager, handle_websocket_message
 
@@ -88,13 +89,15 @@ from app.chat.personalities import (
 )
 
 @app.get("/personalities/{user_id}")
-async def get_personalities(user_id: str):
+async def get_personalities(user_id: str, user_info: dict = Depends(get_current_user)):
     """Get all available personalities for a user"""
-    return {"success": True, "personalities": get_all_personalities(user_id)}
+    uid = user_info["uid"]
+    return {"success": True, "personalities": get_all_personalities(uid)}
 
 @app.post("/personalities")
-async def create_personality(request: Personality, user_id: str = Query(...)):
+async def create_personality(request: Personality, user_info: dict = Depends(get_current_user)):
     """Create a new custom personality"""
+    user_id = user_info["uid"]
     result = create_custom_personality(
         user_id, 
         request.name, 
@@ -109,10 +112,11 @@ async def create_personality(request: Personality, user_id: str = Query(...)):
 
 
 @app.put("/personalities/{personality_id}")
-async def update_personality(personality_id: str, request: Personality, user_id: str = Query(...)):
+async def update_personality(personality_id: str, request: Personality, user_info: dict = Depends(get_current_user)):
     """Update a custom personality"""
     from app.chat.personalities import update_custom_personality
     
+    user_id = user_info["uid"]
     success = update_custom_personality(
         user_id,
         personality_id,
@@ -129,10 +133,11 @@ async def update_personality(personality_id: str, request: Personality, user_id:
 
 
 @app.delete("/personalities/{personality_id}")
-async def delete_personality(personality_id: str, user_id: str = Query(...)):
+async def delete_personality(personality_id: str, user_info: dict = Depends(get_current_user)):
     """Delete a custom personality"""
     from app.chat.personalities import delete_custom_personality
     
+    user_id = user_info["uid"]
     success = delete_custom_personality(user_id, personality_id)
     
     if success:
@@ -141,25 +146,35 @@ async def delete_personality(personality_id: str, user_id: str = Query(...)):
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)):
     """
     Non-streaming chat endpoint.
     Processes message and returns complete response.
     """
     try:
+        user_id = user_info["uid"]
+        request.user_id = user_id
+
         # Get context if session exists
         context_messages = []
-        if request.user_id and request.session_id:
-            context_messages = get_context_for_llm(request.user_id, request.session_id)
+        if request.session_id:
+            context_messages = get_context_for_llm(user_id, request.session_id)
         
         # Resolve personality
         personality = request.personality
-        if not personality and request.personality_id and request.user_id:
-            p_data = get_personality_by_id(request.user_id, request.personality_id)
+        personality_id = request.personality_id
+        if not personality and not personality_id and request.session_id:
+            saved_id = get_session_personality_id(user_id, request.session_id)
+            if saved_id:
+                personality_id = saved_id
+        if not personality and personality_id:
+            p_data = get_personality_by_id(user_id, personality_id)
             if p_data:
-                # Convert dict to expected format if needed by processor, 
-                # but processor takes dict. Models.py defines Personality as object.
-                # However processor.py type hint says Optional[Dict].
+                personality = p_data
+        # Default to Relyce AI for normal mode if none provided
+        if not personality and request.chat_mode == "normal":
+            p_data = get_personality_by_id(user_id, "default_relyce")
+            if p_data:
                 personality = p_data
         
         # Convert Personality object to dict if it is an object
@@ -169,18 +184,19 @@ async def chat(request: ChatRequest):
             personality = personality.model_dump()
 
         # Process message
+        effective_settings = merge_settings(get_user_settings(user_id), request.user_settings)
         result = await llm_processor.process_message(
             user_query=request.message,
             mode=request.chat_mode,
             context_messages=context_messages,
             personality=personality,
-            user_settings=request.user_settings
+            user_settings=effective_settings
         )
         
         # Update context
-        if request.user_id and request.session_id:
+        if request.session_id:
             update_context_with_exchange(
-                request.user_id, 
+                user_id, 
                 request.session_id,
                 request.message,
                 result["response"]
@@ -188,15 +204,15 @@ async def chat(request: ChatRequest):
             
             # Save to Firebase
             save_message_to_firebase(
-                request.user_id, request.session_id, "user", request.message
+                user_id, request.session_id, "user", request.message
             )
             msg_id = save_message_to_firebase(
-                request.user_id, request.session_id, "assistant", result["response"]
+                user_id, request.session_id, "assistant", result["response"]
             )
             result["message_id"] = msg_id
             
             # Increment Usage
-            increment_message_count(request.user_id)
+            increment_message_count(user_id)
         
         return ChatResponse(**result)
         
@@ -206,7 +222,7 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_current_user)):
     """
     Streaming chat endpoint using Server-Sent Events (SSE).
     Returns tokens as they're generated.
@@ -217,15 +233,28 @@ async def chat_stream(request: ChatRequest):
             # This helps in environments like Vercel/Nginx/Render that buffer responses
             yield ": " + (" " * 1024) + "\n\n"
 
+            user_id = user_info["uid"]
+            request.user_id = user_id
+
             # Get context if session exists
             context_messages = []
-            if request.user_id and request.session_id:
-                context_messages = get_context_for_llm(request.user_id, request.session_id)
+            if request.session_id:
+                context_messages = get_context_for_llm(user_id, request.session_id)
             
             # Resolve personality
             personality = request.personality
-            if not personality and request.personality_id and request.user_id:
-                p_data = get_personality_by_id(request.user_id, request.personality_id)
+            personality_id = request.personality_id
+            if not personality and not personality_id and request.session_id:
+                saved_id = get_session_personality_id(user_id, request.session_id)
+                if saved_id:
+                    personality_id = saved_id
+            if not personality and personality_id:
+                p_data = get_personality_by_id(user_id, personality_id)
+                if p_data:
+                    personality = p_data
+            # Default to Relyce AI for normal mode if none provided
+            if not personality and request.chat_mode == "normal":
+                p_data = get_personality_by_id(user_id, "default_relyce")
                 if p_data:
                     personality = p_data
             
@@ -237,13 +266,14 @@ async def chat_stream(request: ChatRequest):
 
             full_response = ""
             
+            effective_settings = merge_settings(get_user_settings(user_id), request.user_settings)
             async for token in llm_processor.process_message_stream(
                 request.message,
                 mode=request.chat_mode,
                 context_messages=context_messages,
                 personality=personality,
-                user_settings=request.user_settings,
-                user_id=request.user_id # Pass User ID for facts
+                user_settings=effective_settings,
+                user_id=user_id # Pass User ID for facts
             ):
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
@@ -252,22 +282,22 @@ async def chat_stream(request: ChatRequest):
             yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
             
             # Update context and save to Firebase
-            if request.user_id and request.session_id:
+            if request.session_id:
                 update_context_with_exchange(
-                    request.user_id,
+                    user_id,
                     request.session_id,
                     request.message,
                     full_response
                 )
                 save_message_to_firebase(
-                    request.user_id, request.session_id, "user", request.message
+                    user_id, request.session_id, "user", request.message
                 )
                 save_message_to_firebase(
-                    request.user_id, request.session_id, "assistant", full_response
+                    user_id, request.session_id, "assistant", full_response
                 )
                 
                 # Increment Usage
-                increment_message_count(request.user_id)
+                increment_message_count(user_id)
                 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
@@ -310,10 +340,11 @@ async def web_search(request: SearchRequest):
 
 
 @app.get("/history/{user_id}/{session_id}")
-async def get_history(user_id: str, session_id: str, limit: int = 50):
+async def get_history(user_id: str, session_id: str, limit: int = 50, user_info: dict = Depends(get_current_user)):
     """Get chat history for a session"""
     try:
-        messages = load_chat_history(user_id, session_id, limit)
+        uid = user_info["uid"]
+        messages = load_chat_history(uid, session_id, limit)
         return {"success": True, "messages": messages}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -355,15 +386,26 @@ async def websocket_endpoint(
     - Error: {"type": "error", "content": "..."}
     - Info: {"type": "info", "content": "processing"|"stopped"}
     """
-    # Verify token if provided
-    user_id = "anonymous"
-    if token:
-        is_valid, user_info = verify_token(token)
-        if is_valid and user_info:
-            user_id = user_info.get("uid", "anonymous")
-        else:
-            # For development, allow connection without valid token
-            print("[WS] ! Invalid token, using anonymous mode")
+    # Require valid token
+    if not token:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized"}))
+        await websocket.close(code=1008)
+        return
+
+    is_valid, user_info = verify_token(token)
+    if not is_valid or not user_info:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"type": "error", "content": "Invalid token"}))
+        await websocket.close(code=1008)
+        return
+
+    user_id = user_info.get("uid")
+    if not user_id:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"type": "error", "content": "Invalid user"}))
+        await websocket.close(code=1008)
+        return
     
     # Use provided chat_id or generate one
     if not chat_id:

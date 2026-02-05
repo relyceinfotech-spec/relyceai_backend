@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Body, Request
 from app.config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
+from app.auth import get_current_user, get_firestore_db
 import razorpay
 import hmac
 import hashlib
@@ -14,18 +15,23 @@ async def create_order(
     amount: int = Body(..., description="Amount in currency subunits (e.g. 100 paise = 1 INR)"),
     currency: str = Body("INR"),
     receipt: str = Body(None),
-    notes: dict = Body(None)
+    notes: dict = Body(None),
+    user_info: dict = Depends(get_current_user)
 ):
     """
     Create a new Razorpay order.
     Amount should be in subunits (e.g., paise for INR).
     """
     try:
+        user_id = user_info["uid"]
+        safe_notes = notes.copy() if isinstance(notes, dict) else {}
+        safe_notes["user_id"] = user_id
+
         data = {
             "amount": amount,
             "currency": currency,
             "receipt": receipt,
-            "notes": notes,
+            "notes": safe_notes,
             "payment_capture": 1 # Auto capture
         }
         order = client.order.create(data=data)
@@ -41,12 +47,13 @@ async def verify_payment(
     razorpay_signature: str = Body(...),
     plan_id: str = Body(...),
     billing_cycle: str = Body("monthly"),
-    user_id: str = Body(...)
+    user_info: dict = Depends(get_current_user)
 ):
     """
     Verify Razorpay payment signature and update user membership securely.
     """
     try:
+        user_id = user_info["uid"]
         # 1. Verify signature
         params_dict = {
             'razorpay_order_id': razorpay_order_id,
@@ -64,6 +71,17 @@ async def verify_payment(
         except Exception as fetch_error:
             print(f"[Payment] Warning: Could not fetch payment details: {fetch_error}")
             amount_paid = 0
+            payment_details = {}
+
+        # 1.6 Validate payment notes user_id matches token
+        notes = (payment_details or {}).get('notes', {}) or {}
+        notes_user_id = notes.get('user_id') or notes.get('userId')
+        if not notes_user_id:
+            print(f"[Payment] Missing user_id in payment notes for {razorpay_payment_id}")
+            raise HTTPException(status_code=400, detail="Payment metadata missing user_id")
+        if notes_user_id != user_id:
+            print(f"[Payment] User mismatch: token={user_id} notes={notes_user_id}")
+            raise HTTPException(status_code=403, detail="Payment user mismatch")
 
         # 2. Payment Verified - Calculate Expiry
         from datetime import datetime, timedelta, timezone
@@ -91,15 +109,13 @@ async def verify_payment(
             "membership.billingCycle": billing_cycle,
             "membership.paymentStatus": "paid",
             "membership.updatedAt": firestore.SERVER_TIMESTAMP,
-            "membership.paymentHistory": {
-                razorpay_payment_id: {
-                    "transactionId": razorpay_payment_id,
-                    "orderId": razorpay_order_id,
-                    "amount": amount_paid,
-                    "plan": plan_id,
-                    "date": now.isoformat(),
-                    "verified": True
-                }
+            f"membership.paymentHistory.{razorpay_payment_id}": {
+                "transactionId": razorpay_payment_id,
+                "orderId": razorpay_order_id,
+                "amount": amount_paid,
+                "plan": plan_id,
+                "date": now.isoformat(),
+                "verified": True
             }
         }
         
@@ -160,8 +176,19 @@ async def verify_payment(
 # Admin Payment Reconciliation Endpoints
 # ==========================================
 
+async def require_admin(user_info: dict = Depends(get_current_user)):
+    db = get_firestore_db()
+    doc = db.collection("users").document(user_info["uid"]).get()
+    if not doc.exists:
+        raise HTTPException(status_code=403, detail="Admin profile not found")
+    role = doc.to_dict().get("role", "user")
+    if role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return user_info
+
+
 @router.get("/admin/check-payment/{payment_id}")
-async def check_payment_status(payment_id: str):
+async def check_payment_status(payment_id: str, user_info: dict = Depends(require_admin)):
     """
     Fetch payment details directly from Razorpay to verify status.
     Intended for Admin Dashboard reconciliation.
@@ -226,7 +253,7 @@ async def check_payment_status(payment_id: str):
         raise HTTPException(status_code=404, detail=f"Payment not found or error fetching: {str(e)}")
 
 @router.post("/admin/sync-payment/{payment_id}")
-async def sync_payment_manual(payment_id: str, user_id: str = Body(..., embed=True), plan_id: str = Body(..., embed=True)):
+async def sync_payment_manual(payment_id: str, user_id: str = Body(..., embed=True), plan_id: str = Body(..., embed=True), user_info: dict = Depends(require_admin)):
     """
     Manually sync a payment to activate a user's plan.
     This behaves like the webhook but is triggered manually by admin.
@@ -362,6 +389,16 @@ async def handle_razorpay_webhook(request: Request):
         print(f"[Razorpay Webhook] Error processing event: {e}")
         # Return 200 to prevent Razorpay from retrying indefinitely on logic errors
         return {"status": "error", "message": str(e)}
+
+
+@router.post("/webhook")
+async def razorpay_webhook(request: Request):
+    """
+    Razorpay Webhook endpoint.
+    """
+    if not RAZORPAY_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    return await handle_razorpay_webhook(request)
 
 async def handle_payment_captured(db, payload):
     """
@@ -517,6 +554,7 @@ async def handle_subscription_activated(db, payload):
         
         notes = entity.get('notes', {})
         user_id = notes.get('userId') or notes.get('user_id')
+        plan_id = notes.get('plan_id') or notes.get('plan') or notes.get('planId')
         
         if not user_id:
             print(f"[Webhook] No user_id found in notes for subscription {sub_id}")
@@ -552,6 +590,9 @@ async def handle_subscription_activated(db, payload):
             "membership.billingCycle": billing_cycle,
             "membership.updatedAt": firestore.SERVER_TIMESTAMP
         }
+        if plan_id:
+            update_data["membership.plan"] = plan_id
+            update_data["membership.planName"] = str(plan_id).capitalize()
 
         # AUDIT LOG: Subscription Activated
         try:
@@ -583,6 +624,7 @@ async def handle_subscription_charged(db, payload):
         # Try notes first
         notes = entity.get('notes', {})
         user_id = notes.get('userId') or notes.get('user_id')
+        plan_id = notes.get('plan_id') or notes.get('plan') or notes.get('planId')
         
         user_ref = None
         user_doc = None
@@ -628,11 +670,15 @@ async def handle_subscription_charged(db, payload):
         else:
             new_end = base_date + timedelta(days=30)
             
-        user_ref.update({
+        update_data = {
             "membership.expiryDate": new_end.isoformat(),
             "membership.lastBillingAt": firestore.SERVER_TIMESTAMP,
             "membership.status": "active"
-        })
+        }
+        if plan_id:
+            update_data["membership.plan"] = plan_id
+            update_data["membership.planName"] = str(plan_id).capitalize()
+        user_ref.update(update_data)
         
         # AUDIT LOG: Subscription Charged (Renewal)
         try:
