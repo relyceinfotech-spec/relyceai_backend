@@ -1,6 +1,6 @@
 # Relyce AI Backend
 
-Production-grade ChatGPT-style backend with multi-device support.
+Production-grade  backend with multi-device support.
 
 ## Features
 

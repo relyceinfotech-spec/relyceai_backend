@@ -20,6 +20,18 @@ from app.llm.router import (
     get_openai_client,
 )
 
+TEMPERATURE_MAP = {
+    "general": 0.65,
+    "coding": 0.2,
+    "business": 0.4,
+    "ecommerce": 0.55,
+    "creative": 0.9,
+    "music": 0.95,
+    "legal": 0.15,
+    "health": 0.3,
+    "education": 0.5,
+}
+
 class LLMProcessor:
     """
     Main LLM processor class that handles all chat modes.
@@ -28,6 +40,36 @@ class LLMProcessor:
     
     def __init__(self):
         self.model = LLM_MODEL
+
+    def _get_sampling(self, personality: Optional[Dict]) -> Dict[str, Any]:
+        """
+        Backend-side authority: clamp and cap temperature and add specialty-based sampling hints.
+        """
+        if not personality:
+            return {}
+
+        specialty = personality.get("specialty") or "general"
+        raw_temp = personality.get("temperature")
+
+        if not isinstance(raw_temp, (int, float)):
+            raw_temp = TEMPERATURE_MAP.get(specialty, TEMPERATURE_MAP["general"])
+
+        # Clamp defensively
+        temp = max(0, min(1, raw_temp))
+
+        # Hard caps for safety-critical domains
+        if specialty in {"coding", "legal"}:
+            temp = min(temp, 0.3)
+
+        sampling: Dict[str, Any] = {"temperature": temp}
+
+        # Specialty-specific knobs
+        if specialty == "coding":
+            sampling.update({"top_p": 0.9, "frequency_penalty": 0, "presence_penalty": 0})
+        elif specialty == "creative":
+            sampling.update({"top_p": 1, "presence_penalty": 0.6})
+
+        return sampling
     
     def _sanitize_output_text(self, text: str) -> str:
         """
@@ -98,13 +140,17 @@ class LLMProcessor:
             model_to_use = "gpt-5-nano"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        response = await get_openai_client().chat.completions.create(
-            model=model_to_use,
-            messages=[
+        create_kwargs = {
+            "model": model_to_use,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query}
             ]
-        )
+        }
+        temperature = self._get_temperature(personality)
+        if temperature is not None:
+            create_kwargs["temperature"] = temperature
+        response = await get_openai_client().chat.completions.create(**create_kwargs)
         return self._sanitize_output_text(response.choices[0].message.content)
     
     async def process_external_query(
@@ -164,10 +210,12 @@ class LLMProcessor:
             model_to_use = "gpt-5-nano"
             print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-        response = await get_openai_client().chat.completions.create(
-            model=model_to_use,
-            messages=messages
-        )
+        create_kwargs = {
+            "model": model_to_use,
+            "messages": messages
+        }
+        create_kwargs.update(self._get_sampling(personality))
+        response = await get_openai_client().chat.completions.create(**create_kwargs)
         
         return self._sanitize_output_text(response.choices[0].message.content), selected_tools
     
@@ -276,11 +324,13 @@ class LLMProcessor:
                 model_to_use = "gpt-5-nano"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
             
-            stream = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                stream=True
-            )
+            create_kwargs = {
+                "model": model_to_use,
+                "messages": messages,
+                "stream": True
+            }
+            create_kwargs.update(self._get_sampling(personality))
+            stream = await get_openai_client().chat.completions.create(**create_kwargs)
             print(f"[LATENCY] Internal: OpenAI Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
             
             async for chunk in stream:
@@ -339,11 +389,13 @@ class LLMProcessor:
                 model_to_use = "gpt-5-nano"
                 print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
 
-            stream = await get_openai_client().chat.completions.create(
-                model=model_to_use,
-                messages=messages,
-                stream=True
-            )
+            create_kwargs = {
+                "model": model_to_use,
+                "messages": messages,
+                "stream": True
+            }
+            create_kwargs.update(self._get_sampling(personality))
+            stream = await get_openai_client().chat.completions.create(**create_kwargs)
             
             async for chunk in stream:
                 if chunk.choices[0].delta.content:

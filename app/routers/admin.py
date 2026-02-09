@@ -7,9 +7,9 @@ from pydantic import BaseModel
 from typing import Optional
 import time
 from app.auth import verify_token, get_firestore_db, get_current_user
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # Import reusable expiry logic
-from app.routers.users import check_membership_expiry
+from app.routers.users import check_membership_expiry, generate_unique_id
 
 router = APIRouter()
 
@@ -110,7 +110,7 @@ async def update_membership(request: UpdateMembershipRequest, user_info: dict = 
     if not target_doc.exists:
         raise HTTPException(status_code=404, detail="Target user not found")
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     # Calculate expiry
     if request.billing_cycle == "yearly":
         expiry_date = now.replace(year=now.year + 1)
@@ -229,7 +229,7 @@ async def run_expiry_job(requester_uid: str = Depends(get_current_user_uid)):
     # we query 'active' and potentially filter by date in code if index fails, 
     # BUT standard is to use the index query.
     
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     
     try:
         # Use simple query on status first if index isn't ready, but let's try strict.
@@ -257,3 +257,70 @@ async def run_expiry_job(requester_uid: str = Depends(get_current_user_uid)):
     except Exception as e:
         print(f"[Job] Failed to run expiry job: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/jobs/backfill-unique-ids")
+async def run_unique_id_backfill(requester_uid: str = Depends(get_current_user_uid)):
+    """
+    CRON/ADMIN JOB: Backfill missing or malformed uniqueUserId for all users.
+    Attempts to recover legacy IDs when possible; otherwise generates new RA IDs.
+    """
+    print(f"[Job] Unique ID backfill triggered by {requester_uid}")
+
+    db = get_firestore_db()
+    requester = db.collection("users").document(requester_uid).get()
+    if not requester.exists or requester.to_dict().get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Only SuperAdmin can trigger jobs")
+
+    users = db.collection("users").stream()
+    updated = 0
+    recovered = 0
+    converted = 0
+    skipped = 0
+
+    legacy_fields = ["legacyUniqueUserId", "publicId", "unique_id", "legacyId"]
+
+    for doc in users:
+        data = doc.to_dict() or {}
+        current = data.get("uniqueUserId")
+
+        # Normalize if numeric ID slipped in
+        if current and str(current).isdigit():
+            new_id = f"RA{int(current):03d}"
+            doc.reference.update({"uniqueUserId": new_id})
+            converted += 1
+            updated += 1
+            continue
+
+        # Skip if valid
+        if isinstance(current, str) and current.startswith("RA"):
+            skipped += 1
+            continue
+
+        # Try to recover from legacy fields
+        legacy_value = None
+        for key in legacy_fields:
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("RA") and val[2:].isdigit():
+                legacy_value = val
+                break
+
+        if legacy_value:
+            doc.reference.update({"uniqueUserId": legacy_value})
+            recovered += 1
+            updated += 1
+            continue
+
+        # Generate new ID
+        new_id = generate_unique_id(db)
+        doc.reference.update({"uniqueUserId": new_id})
+        updated += 1
+
+    return {
+        "success": True,
+        "updated": updated,
+        "recovered": recovered,
+        "converted": converted,
+        "skipped": skipped,
+        "message": "Unique ID backfill completed"
+    }

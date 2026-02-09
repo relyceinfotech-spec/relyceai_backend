@@ -174,7 +174,7 @@ async def init_user(user_info: dict = Depends(get_current_user)):
             # HARDENING: For existing users, do NOT modify role or membership via /users/init.
             # This prevents unintended downgrades. Only assign uniqueUserId if the field is missing.
 
-            if "uniqueUserId" not in user_data:
+            if not user_data.get("uniqueUserId"):
                 new_unique_id = generate_unique_id(db)
                 print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (field missing)")
                 updates["uniqueUserId"] = new_unique_id
@@ -190,9 +190,18 @@ async def init_user(user_info: dict = Depends(get_current_user)):
             # Disabled in /users/init to avoid accidental downgrades.
 
             if updates:
-                return {"success": True, "status": "updated", "updates": list(updates.keys())}
+                return {
+                    "success": True,
+                    "status": "updated",
+                    "updates": list(updates.keys()),
+                    "uniqueUserId": updates.get("uniqueUserId") or user_data.get("uniqueUserId")
+                }
             else:
-                 return {"success": True, "status": "already_has_role_and_membership"}
+                 return {
+                     "success": True,
+                     "status": "already_has_role_and_membership",
+                     "uniqueUserId": user_data.get("uniqueUserId")
+                 }
         else:
             # If user doc doesn't exist, create it with default role, membership AND ID
             print(f"[Users] Init: Creating new user doc for {uid}")
@@ -216,7 +225,7 @@ async def init_user(user_info: dict = Depends(get_current_user)):
                 }
             }
             user_ref.set(new_user_data, merge=True)
-            return {"success": True, "status": "created"}
+            return {"success": True, "status": "created", "uniqueUserId": new_unique_id}
             
     except Exception as e:
         print(f"[Users] Init error for {uid}: {e}")

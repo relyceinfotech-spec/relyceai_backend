@@ -6,6 +6,24 @@ from typing import List, Dict, Optional, Any
 import uuid
 from app.auth import get_firestore_db
 from app.llm.router import DEFAULT_PERSONA
+from app.chat.user_profile import get_user_settings
+
+VALID_CONTENT_MODES = {"hybrid", "web_search", "llm_only"}
+
+
+def _get_relyce_behavior_mode(user_id: str) -> Optional[str]:
+    if not user_id or user_id == "anonymous":
+        return None
+    settings = get_user_settings(user_id)
+    if not isinstance(settings, dict):
+        return None
+    personalization = settings.get("personalization", settings)
+    if not isinstance(personalization, dict):
+        return None
+    mode = personalization.get("behaviorMode")
+    if mode in VALID_CONTENT_MODES:
+        return mode
+    return None
 
 # System Locked Personalities (Cannot be edited/deleted)
 SYSTEM_PERSONALITIES = [
@@ -96,6 +114,14 @@ def get_all_personalities(user_id: str) -> List[Dict]:
     """
     # Start with System Locked ones
     personalities = [p.copy() for p in SYSTEM_PERSONALITIES]
+
+    # Apply per-user behavior mode override for Relyce AI if configured
+    behavior_mode = _get_relyce_behavior_mode(user_id)
+    if behavior_mode:
+        for p in personalities:
+            if p.get("id") == "default_relyce":
+                p["content_mode"] = behavior_mode
+                break
     
     # Track IDs we have loaded to avoid duplicates (shadowing)
     loaded_ids = {p['id'] for p in personalities}
@@ -179,7 +205,12 @@ def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
     # Check System
     for p in SYSTEM_PERSONALITIES:
         if p['id'] == personality_id:
-            return p
+            result = p.copy()
+            if personality_id == "default_relyce":
+                behavior_mode = _get_relyce_behavior_mode(user_id)
+                if behavior_mode:
+                    result["content_mode"] = behavior_mode
+            return result
             
     # Check DB (User Custom or Shadowed Template)
     try:

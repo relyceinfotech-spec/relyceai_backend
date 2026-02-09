@@ -147,7 +147,6 @@ def get_user_sessions(user_id: str, limit: int = 50) -> List[Dict]:
     except Exception as e:
         print(f"[History] Error getting sessions: {e}")
         return []
-        return sessions
         
     except Exception as e:
         print(f"[History] Error getting sessions: {e}")

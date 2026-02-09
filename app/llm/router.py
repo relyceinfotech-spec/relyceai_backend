@@ -309,6 +309,11 @@ async def analyze_and_route_query(
         # EXTERNAL: everything else
         # ---------------------------------------------------------------------
         if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
+            content_mode = personality.get("content_mode", "hybrid")
+            if content_mode == "llm_only":
+                return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+            if content_mode == "web_search":
+                return {"intent": "EXTERNAL", "sub_intent": "research", "tools": ["Search"]}
             q = user_query.lower().strip()
             greeting_list = [
                 "hi", "hello", "hey", "yo", "sup", "hola", "greetings",
