@@ -154,8 +154,8 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     # UI/creative requests should stay creative (no coding clamp)
     if sub_intent in CREATIVE_INTENTS:
         temp = _resolve_temperature(personality, "creative")
-        if temp < 0.6:
-            temp = 0.6
+        if temp < 0.7:
+            temp = 0.7
         return ("openrouter", GEMINI_MODEL, temp, False)
     
     # Analysis/Research with thinking gate
@@ -204,6 +204,8 @@ class LLMProcessor:
             temp = min(temp, 0.3)
         elif is_logic_coding_intent or (specialty == "coding" and not is_creative_intent):
             temp = min(temp, 0.3)
+        elif is_creative_intent and temp < 0.7:
+            temp = 0.7
 
         sampling: Dict[str, Any] = {"temperature": temp}
 
