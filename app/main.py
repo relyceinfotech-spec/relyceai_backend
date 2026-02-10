@@ -40,6 +40,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! Firebase init failed: {e}")
     
+    # Load intent embeddings into memory (for fast routing)
+    try:
+        import asyncio
+        from app.llm.embeddings import load_intent_embeddings
+        
+        # 🛡️ SAFETY TIMEOUT: Prevent production "looping" or hangs
+        # If loading takes > 5s, we skip it and let the server start.
+        try:
+            await asyncio.wait_for(load_intent_embeddings(), timeout=5.0)
+            print("[Startup] - Intent embeddings loaded into RAM")
+        except asyncio.TimeoutError:
+             print("[Startup] ⚠️ Embedding load TIMED OUT (skipping to ensure startup)")
+             
+    except Exception as e:
+        print(f"[Startup] ! Embedding load failed: {e}")
+    
     print(f"[Startup] - Server ready on {HOST}:{PORT}")
     print("=" * 60)
     
@@ -81,6 +97,37 @@ async def health_check():
         timestamp=datetime.now()
     )
 
+
+# ============================================
+# AUTH RATE LIMITING ENDPOINTS
+# ============================================
+from fastapi import Request
+from pydantic import BaseModel, EmailStr
+from app.rate_limiter import check_rate_limit, record_failed_attempt, clear_attempts
+
+class RateLimitRequest(BaseModel):
+    email: str
+
+@app.post("/auth/check-limit")
+async def check_login_limit(request: RateLimitRequest, req: Request):
+    """Check if login attempt is allowed for this email+IP"""
+    ip = req.client.host if req.client else "unknown"
+    result = check_rate_limit(request.email, ip)
+    return result
+
+@app.post("/auth/record-failure")
+async def record_login_failure(request: RateLimitRequest, req: Request):
+    """Record a failed login attempt"""
+    ip = req.client.host if req.client else "unknown"
+    result = record_failed_attempt(request.email, ip)
+    return result
+
+@app.post("/auth/clear-attempts")
+async def clear_login_attempts(request: RateLimitRequest, req: Request):
+    """Clear login attempts on successful login"""
+    ip = req.client.host if req.client else "unknown"
+    success = clear_attempts(request.email, ip)
+    return {"success": success}
 
 from app.chat.personalities import (
     get_all_personalities, 
@@ -275,6 +322,10 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
                 user_settings=effective_settings,
                 user_id=user_id # Pass User ID for facts
             ):
+                if token.strip().startswith("[INFO]"):
+                    clean_info = token.replace("[INFO]", "").strip()
+                    yield f"data: {json.dumps({'type': 'info', 'content': clean_info})}\n\n"
+                    continue
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
             
@@ -386,24 +437,31 @@ async def websocket_endpoint(
     - Error: {"type": "error", "content": "..."}
     - Info: {"type": "info", "content": "processing"|"stopped"}
     """
+
+    # Accept connection immediately to handle errors gracefully
+    await websocket.accept()
+
     # Require valid token
     if not token:
-        await websocket.accept()
-        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized"}))
+        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Missing token"}))
         await websocket.close(code=1008)
         return
 
-    is_valid, user_info = verify_token(token)
+    # Verify token safely
+    try:
+        is_valid, user_info = verify_token(token)
+    except Exception as e:
+        print(f"[WS] Auth Error: {e}")
+        is_valid, user_info = False, None
+
     if not is_valid or not user_info:
-        await websocket.accept()
-        await websocket.send_text(json.dumps({"type": "error", "content": "Invalid token"}))
+        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Invalid token"}))
         await websocket.close(code=1008)
         return
 
     user_id = user_info.get("uid")
     if not user_id:
-        await websocket.accept()
-        await websocket.send_text(json.dumps({"type": "error", "content": "Invalid user"}))
+        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Invalid user"}))
         await websocket.close(code=1008)
         return
     

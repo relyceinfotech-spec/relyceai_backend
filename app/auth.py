@@ -75,7 +75,11 @@ def verify_token(id_token: str) -> Tuple[bool, Optional[dict]]:
     Returns: (is_valid, user_info)
     """
     if not _firebase_initialized:
-        initialize_firebase()
+        try:
+            initialize_firebase()
+        except Exception as e:
+            print(f"[Auth] Firebase init failed during token verify: {e}")
+            return False, None
     
     try:
         decoded_token = auth.verify_id_token(id_token)

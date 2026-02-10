@@ -4,7 +4,7 @@ Multi-device safe WebSocket implementation
 """
 import json
 import asyncio
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, Tuple
 from fastapi import WebSocket, WebSocketDisconnect
 from datetime import datetime
 from app.auth import verify_token
@@ -27,17 +27,17 @@ class ConnectionManager:
     
     Key Design (from architecture):
     - One user → Multiple devices → Multiple WebSocket connections → SAME chat_id
-    - Connections are organized by chat_id, NOT by user_id
-    - This allows multiple devices to connect to the same chat and receive synced responses
+    - Connections are organized by (user_id, chat_id) to prevent cross-user leakage
+    - This allows multiple devices for the same user to connect to the same chat and receive synced responses
     """
     
     def __init__(self):
-        # Structure: {chat_id: {connection_id: WebSocket}}
-        self.active_connections: Dict[str, Dict[str, WebSocket]] = {}
+        # Structure: {(user_id, chat_id): {connection_id: WebSocket}}
+        self.active_connections: Dict[Tuple[str, str], Dict[str, WebSocket]] = {}
         # Track user info per connection: {connection_id: {"user_id": str, "chat_id": str}}
         self.connection_info: Dict[str, Dict] = {}
-        # Stop flags for generation: {chat_id: bool}
-        self.stop_flags: Dict[str, bool] = {}
+        # Stop flags for generation: {(user_id, chat_id): bool}
+        self.stop_flags: Dict[Tuple[str, str], bool] = {}
         # Connection counter for unique IDs
         self._counter = 0
     
@@ -45,6 +45,10 @@ class ConnectionManager:
         """Generate unique connection ID"""
         self._counter += 1
         return f"conn_{self._counter}_{datetime.now().timestamp()}"
+
+    def _chat_key(self, user_id: str, chat_id: str) -> Tuple[str, str]:
+        """Scope connections by user to prevent cross-user leakage."""
+        return (user_id, chat_id)
     
     async def connect(
         self, 
@@ -53,31 +57,31 @@ class ConnectionManager:
         user_id: str
     ) -> str:
         """
-        Accept WebSocket connection.
+        Register WebSocket connection.
         Multiple connections allowed per chat_id (multi-device support).
         
         Returns: connection_id
         """
-        await websocket.accept()
-        
         connection_id = self._generate_connection_id()
+        chat_key = self._chat_key(user_id, chat_id)
         
         # Initialize chat_id bucket if not exists
-        if chat_id not in self.active_connections:
-            self.active_connections[chat_id] = {}
+        if chat_key not in self.active_connections:
+            self.active_connections[chat_key] = {}
         
         # Add connection to chat_id bucket
-        self.active_connections[chat_id][connection_id] = websocket
+        self.active_connections[chat_key][connection_id] = websocket
         
         # Track connection info
         self.connection_info[connection_id] = {
             "user_id": user_id,
             "chat_id": chat_id,
+            "chat_key": chat_key,
             "connected_at": datetime.now().isoformat()
         }
         
-        print(f"[WS] ✅ Connected: {connection_id} to chat {chat_id}")
-        print(f"[WS] Active connections for chat {chat_id}: {len(self.active_connections[chat_id])}")
+        print(f"[WS] ✅ Connected: {connection_id} to chat {chat_id} (user={user_id})")
+        print(f"[WS] Active connections for chat {chat_id} (user={user_id}): {len(self.active_connections[chat_key])}")
         
         return connection_id
     
@@ -91,18 +95,19 @@ class ConnectionManager:
         
         info = self.connection_info[connection_id]
         chat_id = info["chat_id"]
+        chat_key = info.get("chat_key") or self._chat_key(info["user_id"], chat_id)
         
         # Remove from active connections
-        if chat_id in self.active_connections:
-            if connection_id in self.active_connections[chat_id]:
-                del self.active_connections[chat_id][connection_id]
+        if chat_key in self.active_connections:
+            if connection_id in self.active_connections[chat_key]:
+                del self.active_connections[chat_key][connection_id]
             
             # Clean up empty chat_id bucket
-            if not self.active_connections[chat_id]:
-                del self.active_connections[chat_id]
+            if not self.active_connections[chat_key]:
+                del self.active_connections[chat_key]
                 # Also clean up stop flag
-                if chat_id in self.stop_flags:
-                    del self.stop_flags[chat_id]
+                if chat_key in self.stop_flags:
+                    del self.stop_flags[chat_key]
         
         # Remove connection info
         del self.connection_info[connection_id]
@@ -117,8 +122,8 @@ class ConnectionManager:
             print(f"[WS] Error sending message: {e}")
     
     async def broadcast_to_chat(
-        self, 
-        chat_id: str, 
+        self,
+        chat_key: Tuple[str, str],
         message: str,
         exclude_connection: Optional[str] = None
     ) -> None:
@@ -126,12 +131,12 @@ class ConnectionManager:
         Broadcast message to ALL connections in a chat_id.
         This enables multi-device sync - all devices see the same response.
         """
-        if chat_id not in self.active_connections:
+        if chat_key not in self.active_connections:
             return
         
         disconnected = []
         
-        for conn_id, websocket in self.active_connections[chat_id].items():
+        for conn_id, websocket in self.active_connections[chat_key].items():
             if conn_id == exclude_connection:
                 continue
             try:
@@ -144,8 +149,8 @@ class ConnectionManager:
             self.disconnect(conn_id)
     
     async def stream_to_chat(
-        self, 
-        chat_id: str, 
+        self,
+        chat_key: Tuple[str, str],
         token: str
     ) -> None:
         """
@@ -153,24 +158,30 @@ class ConnectionManager:
         Used for real-time streaming responses.
         """
         message = json.dumps({"type": "token", "content": token})
-        await self.broadcast_to_chat(chat_id, message)
+        await self.broadcast_to_chat(chat_key, message)
     
-    def set_stop_flag(self, chat_id: str, value: bool = True) -> None:
+    def set_stop_flag(self, chat_key: Tuple[str, str], value: bool = True) -> None:
         """Set stop generation flag for a chat"""
-        self.stop_flags[chat_id] = value
+        self.stop_flags[chat_key] = value
     
-    def should_stop(self, chat_id: str) -> bool:
+    def should_stop(self, chat_key: Tuple[str, str]) -> bool:
         """Check if generation should stop for a chat"""
-        return self.stop_flags.get(chat_id, False)
+        return self.stop_flags.get(chat_key, False)
     
-    def clear_stop_flag(self, chat_id: str) -> None:
+    def clear_stop_flag(self, chat_key: Tuple[str, str]) -> None:
         """Clear stop flag for a chat"""
-        if chat_id in self.stop_flags:
-            del self.stop_flags[chat_id]
+        if chat_key in self.stop_flags:
+            del self.stop_flags[chat_key]
     
-    def get_connection_count(self, chat_id: str) -> int:
+    def get_connection_count(self, chat_id: str, user_id: Optional[str] = None) -> int:
         """Get number of active connections for a chat"""
-        return len(self.active_connections.get(chat_id, {}))
+        if isinstance(chat_id, tuple):
+            chat_key = chat_id
+        elif user_id:
+            chat_key = self._chat_key(user_id, chat_id)
+        else:
+            return 0
+        return len(self.active_connections.get(chat_key, {}))
 
 
 # Global connection manager instance
@@ -192,12 +203,13 @@ async def handle_websocket_message(
     info = manager.connection_info.get(connection_id, {})
     user_id = info.get("user_id", "anonymous")
     chat_id = info.get("chat_id", "default")
+    chat_key = info.get("chat_key") or (user_id, chat_id)
     
     if msg_type == "stop":
         # Stop generation
-        manager.set_stop_flag(chat_id)
+        manager.set_stop_flag(chat_key)
         await manager.broadcast_to_chat(
-            chat_id, 
+            chat_key,
             json.dumps({"type": "info", "content": "Generation stopped"})
         )
         return
@@ -247,11 +259,11 @@ async def handle_websocket_message(
         return
     
     # Clear any previous stop flag
-    manager.clear_stop_flag(chat_id)
+        manager.clear_stop_flag(chat_key)
     
     # Notify all devices - processing started (IMMEDIATE FEEDBACK)
     await manager.broadcast_to_chat(
-        chat_id,
+        chat_key,
         json.dumps({"type": "info", "content": "processing"})
     )
     
@@ -259,9 +271,8 @@ async def handle_websocket_message(
     if user_id and user_id != "anonymous":
         try:
             from app.chat.memory import process_and_store_facts
-            from starlette.concurrency import run_in_threadpool
             # Fire and forget fact extraction
-            asyncio.create_task(run_in_threadpool(process_and_store_facts, user_id, content))
+            asyncio.create_task(asyncio.to_thread(process_and_store_facts, user_id, content))
         except Exception as e:
             print(f"[WS] Fact extraction error (non-blocking): {e}")
 
@@ -289,9 +300,9 @@ async def handle_websocket_message(
             user_id=user_id
         ):
             # Check stop flag
-            if manager.should_stop(chat_id):
+            if manager.should_stop(chat_key):
                 await manager.broadcast_to_chat(
-                    chat_id,
+                    chat_key,
                     json.dumps({"type": "info", "content": "stopped"})
                 )
                 break
@@ -300,17 +311,17 @@ async def handle_websocket_message(
             if token.strip().startswith("[INFO]"):
                 clean_info = token.replace("[INFO]", "").strip()
                 await manager.broadcast_to_chat(
-                    chat_id,
+                    chat_key,
                     json.dumps({"type": "info", "content": clean_info})
                 )
                 continue # Do not append to full_response or stream as token
             
             full_response += token
-            await manager.stream_to_chat(chat_id, token)
+            await manager.stream_to_chat(chat_key, token)
         
         # Send completion signal
         await manager.broadcast_to_chat(
-            chat_id,
+            chat_key,
             json.dumps({"type": "done", "content": ""})
         )
         
@@ -356,6 +367,6 @@ async def handle_websocket_message(
         error_msg = f"Error processing message: {str(e)}"
         print(f"[WS] {error_msg}")
         await manager.broadcast_to_chat(
-            chat_id,
+            chat_key,
             json.dumps({"type": "error", "content": error_msg})
         )

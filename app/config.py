@@ -45,7 +45,13 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8080))
 
 # CORS Origins (add your frontend URLs)
-CORS_ORIGINS = [
+def _csv_env_list(name: str, default: list) -> list:
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+_DEFAULT_CORS_ORIGINS = [
     "https://relyceai.com",
     "https://www.relyceai.com",
     "http://localhost:5173",      # Vite dev server
@@ -54,8 +60,13 @@ CORS_ORIGINS = [
     "http://127.0.0.1:3000",      # Alternative dev port (IP)
 ]
 
-# Regex pattern for Vercel preview deployments
-CORS_ORIGIN_REGEX = r"https://.*\.vercel\.app"
+CORS_ORIGINS = _csv_env_list("CORS_ORIGINS", _DEFAULT_CORS_ORIGINS)
+
+# Regex pattern for preview deployments and subdomains
+CORS_ORIGIN_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"^https://(.*\.)?relyceai\.com$|^https://.*\.vercel\.app$"
+)
 
 # Serper Tool Endpoints
 SERPER_TOOLS = {
