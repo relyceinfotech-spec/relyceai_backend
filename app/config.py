@@ -13,6 +13,19 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5-nano")
 
+# OpenRouter Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GEMINI_MODEL = "google/gemini-2.5-flash-lite:nitro"
+CODING_MODEL = os.getenv("CODING_MODEL", "z-ai/glm-4.7-flash")
+ERNIE_THINKING_MODEL = "baidu/ernie-4.5-21b-a3b-thinking"
+
+# Embedding Configuration (via OpenRouter)
+EMBEDDING_MODEL = "openai/text-embedding-3-small"
+TIEBREAKER_MODEL = "openai/gpt-4o-mini"
+EMBEDDING_THRESHOLD_HIGH = 0.75
+EMBEDDING_THRESHOLD_MEDIUM = 0.60
+EMBEDDING_TIMEOUT_MS = 300
+
 # Firebase Configuration
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
 FIREBASE_PRIVATE_KEY_ID = os.getenv("FIREBASE_PRIVATE_KEY_ID")

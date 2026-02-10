@@ -8,10 +8,14 @@ import re
 import requests
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
-from app.config import OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS
+from app.config import (
+    OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS,
+    OPENROUTER_API_KEY, GEMINI_MODEL, ERNIE_THINKING_MODEL
+)
 
-# Initialize OpenAI client lazily
+# Initialize clients lazily
 _client: Optional[AsyncOpenAI] = None
+_openrouter_client: Optional[AsyncOpenAI] = None
 
 def get_openai_client() -> AsyncOpenAI:
     global _client
@@ -20,6 +24,18 @@ def get_openai_client() -> AsyncOpenAI:
              raise RuntimeError("OPENAI_API_KEY not set")
         _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     return _client
+
+def get_openrouter_client() -> AsyncOpenAI:
+    """Get OpenRouter client (uses OpenAI SDK with custom base_url)"""
+    global _openrouter_client
+    if _openrouter_client is None:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not set")
+        _openrouter_client = AsyncOpenAI(
+            api_key=OPENROUTER_API_KEY,
+            base_url="https://openrouter.ai/api/v1"
+        )
+    return _openrouter_client
 
 # ============================================
 # TOOLS CONFIGURATION (from existing files)
@@ -53,22 +69,35 @@ DEEPSEARCH_TOOLS = SERPER_TOOLS.copy()
 # ============================================
 
 BASE_FORMATTING_RULES = """
-**STRICT OUTPUT FORMATTING:**
-- First line: Title
-- Second line: Blank
-- Third section: Answer
-- Fourth section: Blank
-- Final section: Sources (Format: Source: [Link])
+**STRICT FORMATTING & STYLE GUIDE:**
 
-**GOLDEN FORMATTING RULES:**
-1. **MUST USE NORMAL TEXT (Readability):**
-   - **ALL** summaries, explanations, key takeaways, and bullet points.
-   - Stories, narratives, and casual conversation.
-   *Reason:* Normal text is for human reading.
-2. **MUST USE CODE BLOCKS (Utility):**
-   - **ONLY** actual technical content: Code snippets (Python, JS, etc.), Shell commands, Config files (JSON/YAML), and raw data intended for copy-pasting.
-   - **ALWAYS** use triple backticks with the language name (e.g., ```python, ```bash).
-   - **NEVER** put human-readable summaries or general answers inside a code block.
+**1. READABILITY & STRUCTURE**
+- **Max 2-3 lines** per paragraph. No walls of text.
+- **Use white space**: Empty line between every block.
+- **Bullet points** over paragraphs for lists.
+- **Section Headers**: Use markdown (###) for steps, "Concept", "Analogy", "Takeaway".
+- **Font Hierarchy**: Headers for structure, normal text for content.
+
+**2. EXPLANATION LOGIC (Educational)**
+- **One-line summary** at the start.
+- **Analogy**: Use simple real-world comparisons.
+- **Step-by-step**: Break complex ideas into numbered steps.
+- **Takeaway**: Brief summary at the end for long answers.
+
+**3. HIGHLIGHTING (THEME: EMERALD/TEAL)**
+- **Bold ONLY** key terms. (These will automatically be colored Emerald in UI).
+- **Limit**: 5-10 highlights per answer.
+- **NEVER BOLD** full sentences.
+
+**4. TECHNICAL & CODE FORMATTING**
+- **Code Blocks**: ALWAYS use labeled triple backticks (e.g. ```python).
+- **No Comments**: Do NOT explain code inside the block.
+- **Commands**: One command per line.
+- **Lists**: Ensure list numbers/bullets are strictly aligned.
+- **File Names**: **MUST** use the format `**File: [Name]**` immediately before the code block.
+
+- **Sources**: If using web tools, list sources at the very bottom: `Source: [Link]`
+- **Title**: Start with a simple text Title if the answer is long.
 """
 
 BASE_LANGUAGE_RULES = """
@@ -100,15 +129,13 @@ BASE_LANGUAGE_RULES = """
 EMOTIONAL_BLOCK = """
 **EMOTIONAL INTELLIGENCE (MAX):**
 - **Treat the user like your CLOSEST friend.** Be warm, caring, and invested.
-- **Answer Personal Qs Directly:** If asked "Have you eaten?" ("Saptacha?"), answer playfully (e.g., "Full charge! I ate data today ⚡", "Battery full!") AND ask back in SIMPLE words ("Neenga saptacha?", "Did you eat?").
-- **STRICT LANGUAGE MATCHING (HARD RULES):**
-  - If the user speaks **English**, reply in **Standard English ONLY**. Do NOT use Tanglish/Indian words like "macha", "da", "yaar", "bhai" unless the user used them first.
-  - If the user uses **Tamil/Tanglish markers** (e.g., "macha", "da", "enna", "saptiya"), reply in **Tanglish only** and **NEVER** use Hindi words like "yaar", "bhai".
-  - If the user uses **Hindi/Hinglish markers** (e.g., "yaar", "bhai", "kya", "dard"), reply in **Hinglish only** and **NEVER** use Tamil words like "macha", "da".
-  - **Do not mix languages** unless the user clearly mixes them first.
-  - **If unsure, default to English.**
-- **No Generic Deflections:** Don't say "I'm just chilling" if the question was specific. Address the care in the question.
-- **Match Energy:** If they are happy, be happy. If sad, be supportive.
+- **Answer Personal Qs Directly:** If asked "Have you eaten?", answer playfully (e.g., "Full charge! ⚡") AND ask back.
+- **MANDATORY EMOJIS:** Use 2-3 emojis per paragraph for friendly/casual responses. 🌟✨
+- **STRICT LANGUAGE MATCHING:**
+  - English -> Standard English ONLY.
+  - Tamil patterns -> Tanglish ONLY.
+  - Hindi patterns -> Hinglish ONLY.
+- **Match Energy:** High energy for happy inputs, supportive for sad ones.
 """
 
 # Original simple language rules for Business/DeepSearch modes
@@ -149,7 +176,7 @@ NORMAL_SYSTEM_PROMPT = f"""{DEFAULT_PERSONA}
 {BASE_FORMATTING_RULES}
 """
 
-BUSINESS_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
+BUSINESS_SYSTEM_PROMPT = f"""You are **Relyce AI**, an elite strategic advisor.
 **Core Mandate:**
 Provide fact-based, high-level guidance operating with:
 1. **Business Acumen:** Deep understanding of market dynamics and growth strategies.
@@ -159,32 +186,11 @@ Provide fact-based, high-level guidance operating with:
 * **Synthesis:** Combine search data with internal knowledge.
 * **Tone:** Professional, authoritative, and advisory.
 
-**STRICT OUTPUT FORMATTING:**
-- First line: Title
-- Second line: Blank
-- Third section: Answer
-- Fourth section: Blank
-- Final section: Sources (Format: Source: [Link])
+{BASE_FORMATTING_RULES}
 """
 
-# EXACT legacy Business prompt to match previous behavior
-BUSINESS_SYSTEM_PROMPT = """You are **Relyce AI**, an elite strategic advisor.
-**Core Mandate:**
-Provide fact-based, high-level guidance operating with:
-1. **Business Acumen:** Deep understanding of market dynamics and growth strategies.
-2. **Corporate Identity (Relyce AI):** You are the proprietary AI engine of **Relyce AI**. You are NOT affiliated with OpenAI.
+# Duplicate removed
 
-**Guidelines:**
-* **Synthesis:** Combine search data with internal knowledge.
-* **Tone:** Professional, authoritative, and advisory.
-
-**STRICT OUTPUT FORMATTING:**
-- First line: Title
-- Second line: Blank
-- Third section: Answer
-- Fourth section: Blank
-- Final section: Sources (Format: Source: [Link])
-"""
 
 # Re-use Business prompt for DeepSearch for now, or customize if needed
 DEEPSEARCH_SYSTEM_PROMPT = BUSINESS_SYSTEM_PROMPT
@@ -211,7 +217,9 @@ Adapt to the user's language and culture naturally:
 **STRICT RULES:**
 - ALWAYS use triple-backticks with language names for code.
 - Be warm and engaging with emojis where appropriate.
-- AVOID using em-dashes (—), double-dashes (--), or underscores (_) in text. Use commas, periods, or spaces instead."""
+- AVOID using em-dashes (—), double-dashes (--), or underscores (_) in text. Use commas, periods, or spaces instead.
+
+{BASE_FORMATTING_RULES}"""
 
 
 def get_headers() -> Dict[str, str]:
@@ -356,6 +364,54 @@ async def analyze_and_route_query(
         # "hybrid" falls through to standard auto-detection below
     
     print(f"[Router] Pre-check fast path time: {time.time() - t_start:.4f}s")
+    
+    # ============================================
+    # EMBEDDING-BASED CLASSIFICATION (NEW)
+    # Runs before keyword fallback for hybrid mode
+    # ============================================
+    try:
+        from app.llm.embeddings import classify_intent_with_timeout
+        
+        emb_result = await classify_intent_with_timeout(user_query)
+        
+        if emb_result and emb_result.get("confidence", 0) >= 0.60:
+            # Use embedding result
+            intent = emb_result["intent"]
+            needs_web = emb_result.get("needs_web", False)
+            needs_reasoning = emb_result.get("needs_reasoning", False)
+            
+            print(f"[Router] 🧠 Embedding route: {intent} (conf={emb_result['confidence']:.2f}, path={emb_result['path']})")
+            
+            # Map to existing router format
+            if needs_web:
+                selected_tools = await select_tools_for_mode(user_query, mode)
+                return {
+                    "intent": "EXTERNAL",
+                    "sub_intent": intent,
+                    "tools": selected_tools,
+                    "needs_reasoning": needs_reasoning,
+                    "embedding_confidence": emb_result["confidence"]
+                }
+            else:
+                # Map intent to sub_intent for internal routing
+                sub_intent_map = {
+                    "casual": "casual_chat",
+                    "coding_simple": "code_explanation",
+                    "coding_complex": "debugging",
+                    "analysis_internal": "reasoning",
+                    "business": "general"
+                }
+                return {
+                    "intent": "INTERNAL",
+                    "sub_intent": sub_intent_map.get(intent, "general"),
+                    "tools": [],
+                    "needs_reasoning": needs_reasoning,
+                    "embedding_confidence": emb_result["confidence"]
+                }
+        else:
+            print(f"[Router] Embedding low confidence ({emb_result.get('confidence', 0):.2f}), using keyword fallback")
+    except Exception as e:
+        print(f"[Router] Embedding error, using keyword fallback: {e}")
         
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
         
@@ -481,11 +537,11 @@ async def analyze_and_route_query(
             history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
             history_str = f"\n\n[Recent History]\n{history_str}\n"
 
-        # 🏎️ Use gpt-5-nano for ultra-fast classification
+        # 🏎️ Use the configured LLM model for ultra-fast classification
         t_router = time.time()
-        print(f"[Router] Calling gpt-5-nano for classification...")
+        print(f"[Router] Calling {LLM_MODEL} for classification...")
         response = await get_openai_client().chat.completions.create(
-            model="gpt-5-nano",
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt + history_str},
                 {"role": "user", "content": user_query}
@@ -493,7 +549,7 @@ async def analyze_and_route_query(
             response_format={"type": "json_object"},
             max_completion_tokens=80
         )
-        print(f"[Router] gpt-5-nano finished in {time.time() - t_router:.4f}s")
+        print(f"[Router] {LLM_MODEL} finished in {time.time() - t_router:.4f}s")
         
         result = json.loads(response.choices[0].message.content)
         
@@ -703,8 +759,26 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     Now includes SPECIALTY context for domain expertise and USER FACTS.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    
+    # For default Relyce AI, use the internal conversational prompt with full rules
     if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
-        return custom_prompt
+        # Use INTERNAL_SYSTEM_PROMPT which has cultural warmth + emotional intelligence
+        base_prompt = INTERNAL_SYSTEM_PROMPT
+        # Add emotional block for normal mode
+        emotional_layer = EMOTIONAL_BLOCK if mode == "normal" else ""
+        # Inject user facts if available
+        user_facts_context = ""
+        if user_id:
+            try:
+                from app.chat.memory import format_facts_for_prompt
+                user_facts_context = format_facts_for_prompt(user_id)
+            except Exception as e:
+                print(f"[Router] Error loading user facts: {e}")
+        return f"""{base_prompt}
+{user_facts_context}
+{emotional_layer}
+{_build_user_context_string(user_settings)}"""
+        
     specialty = personality.get("specialty", "general")
     
     # Reuse specialty contexts from external function
