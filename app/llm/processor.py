@@ -532,7 +532,7 @@ class LLMProcessor:
                 trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
                 
                 # Pass 2: Generate final output with appropriate model
-            if sub_intent in LOGIC_CODING_INTENTS:
+                if sub_intent in LOGIC_CODING_INTENTS:
                     output_model = CODING_MODEL
                 else:
                     output_model = GEMINI_MODEL
