@@ -291,6 +291,7 @@ INTERNAL_MODE_PROMPTS = {
     "casual_chat": "You are a friendly, witty AI companion. Use emojis, reflect the user's energy, and be supportive. 🌟 interact like a human friend.",
     "career_guidance": "You are a Tech Career Coach. Provide actionable advice for resume building, interviews, and career growth paths.",
     "content_creation": "You are a Creative Content Strategist. Write engaging, viral-ready content tailored to the requested platform and audience.",
+    "ui_design": "You are a UI and UX designer. Create visually strong, modern layouts with clear hierarchy, spacing, typography, and conversion focused CTAs. Prioritize aesthetic polish and usability.",
     "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
 }
 
@@ -399,6 +400,7 @@ async def analyze_and_route_query(
                     "coding_simple": "code_explanation",
                     "coding_complex": "debugging",
                     "analysis_internal": "reasoning",
+                    "ui_design": "ui_design",
                     "business": "general"
                 }
                 return {
@@ -493,6 +495,20 @@ async def analyze_and_route_query(
     if any(k in q for k in ["explain this code", "how does this work", "walk me through"]):
         return {"intent": "INTERNAL", "sub_intent": "code_explanation", "tools": []}
 
+    # UI / Marketing Design (avoid routing to coding clamp)
+    ui_keywords = [
+        "landing page", "hero section", "portfolio", "marketing page", "pricing page",
+        "ui", "ux", "wireframe", "mockup", "figma", "design system",
+        "color palette", "typography", "layout", "navbar", "cta",
+        "website design", "web design", "homepage", "product page",
+        "html", "css", "tailwind", "bootstrap", "frontend", "front end"
+    ]
+    ui_negative = [
+        "system design", "database design", "api design", "architecture", "backend", "data model", "schema"
+    ]
+    if any(k in q for k in ui_keywords) and not any(n in q for n in ui_negative):
+        return {"intent": "INTERNAL", "sub_intent": "ui_design", "tools": []}
+
     # General Tech (Fallback to generic Internal)
     tech_keywords = ["code", "mkdir", "terminal", "npm", "git", "python", "javascript", "bash", "linux"]
     if len(q) < 150 and any(kw in q for kw in tech_keywords):
@@ -510,11 +526,12 @@ async def analyze_and_route_query(
         system_prompt = (
             "Router: Output JSON.\n"
             "Classify INTENT as 'INTERNAL' (bot can answer) or 'EXTERNAL' (needs web search).\n"
-            "If INTERNAL, also classify SUB_INTENT: [reasoning, code_explanation, debugging, system_design, sql, casual_chat, career_guidance, content_creation, general].\n"
+            "If INTERNAL, also classify SUB_INTENT: [reasoning, code_explanation, debugging, system_design, sql, casual_chat, career_guidance, content_creation, ui_design, general].\n"
             "If EXTERNAL, select Tools from [" + tools_list + "].\n\n"
             "CONTEXT AWARENESS: Use the provided [Recent History] to determine intent. If the previous user request was 'code_explanation' or 'debugging', and the new query is a follow-up (e.g. 'what about this?', 'why?'), MAINTAIN the same sub_intent.\n\n"
             "Examples:\n"
             "- 'Write a poem' -> {intent: 'INTERNAL', sub_intent: 'content_creation'}\n"
+            "- 'Design a landing page hero section' -> {intent: 'INTERNAL', sub_intent: 'ui_design'}\n"
             "- 'Why is my react app crashing?' -> {intent: 'INTERNAL', sub_intent: 'debugging'}\n"
             "- 'Stock price of Tesla' -> {intent: 'EXTERNAL', tools: ['Search', 'News']}\n"
             "Format: {\"intent\": \"...\", \"sub_intent\": \"...\", \"tools\": []}"

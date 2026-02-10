@@ -60,6 +60,14 @@ INTENT_EXAMPLES: Dict[str, List[str]] = {
         "which is better and why",
         "evaluate these options"
     ],
+    "ui_design": [
+        "design a landing page for my startup",
+        "create a portfolio website UI",
+        "make a hero section with a call to action",
+        "build a modern pricing page layout",
+        "design a dashboard UI in HTML and CSS",
+        "generate a marketing website homepage"
+    ],
     "business": [
         "business strategy advice",
         "startup growth plan",
@@ -94,6 +102,7 @@ KEYWORD_RULES: Dict[str, List[str]] = {
     "coding_simple": ["explain", "what does", "example", "how to", "basic", "simple"],
     "coding_complex": ["debug", "fix", "error", "failing", "optimize", "refactor", "design", "architecture"],
     "analysis_internal": ["why", "compare", "analyze", "pros", "cons", "better", "evaluate", "which"],
+    "ui_design": ["landing page", "hero section", "portfolio", "ui", "ux", "design system", "wireframe", "mockup", "pricing page", "marketing page", "website design", "navbar", "cta", "color palette"],
     "business": ["business", "startup", "strategy", "revenue", "pricing", "market", "growth"],
     "web_factual": ["latest", "today", "current", "now", "recent", "news", "price", "weather"],
     "web_analysis": ["trend", "predict", "impact", "changes", "situation", "happening"]
@@ -107,6 +116,7 @@ INTENT_ROUTES: Dict[str, Dict] = {
     "coding_simple": {"needs_web": False, "needs_reasoning": False, "model": "qwen"},
     "coding_complex": {"needs_web": False, "needs_reasoning": True, "model": "qwen"},
     "analysis_internal": {"needs_web": False, "needs_reasoning": True, "model": "gemini"},
+    "ui_design": {"needs_web": False, "needs_reasoning": False, "model": "gemini"},
     "business": {"needs_web": False, "needs_reasoning": False, "model": "openai"},
     "web_factual": {"needs_web": True, "needs_reasoning": False, "model": "gemini"},
     "web_analysis": {"needs_web": True, "needs_reasoning": True, "model": "gemini"}

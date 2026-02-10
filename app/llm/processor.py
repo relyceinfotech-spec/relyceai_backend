@@ -33,6 +33,20 @@ TEMPERATURE_MAP = {
     "education": 0.5,
 }
 
+LOGIC_CODING_INTENTS = {
+    "debugging",
+    "system_design",
+    "coding_complex",
+    "coding_simple",
+    "code_explanation",
+    "sql",
+}
+
+CREATIVE_INTENTS = {
+    "content_creation",
+    "ui_design",
+}
+
 # ============================================
 # PRODUCTION HARDENING: Trace ID & Gating
 # ============================================
@@ -75,7 +89,7 @@ def should_use_thinking_model(query: str, sub_intent: str) -> bool:
     query_lower = query.lower()
     
     # Simple intents NEVER need thinking (hard rule)
-    simple_intents = ["casual_chat", "general", "code_explanation", "sql"]
+    simple_intents = ["casual_chat", "general", "code_explanation", "sql", "content_creation", "ui_design"]
     if sub_intent in simple_intents:
         return False
     
@@ -100,6 +114,21 @@ def should_use_thinking_model(query: str, sub_intent: str) -> bool:
     # Default: medium length queries without keywords → skip
     return False
 
+def _resolve_temperature(personality: Optional[Dict], fallback_specialty: str = "general") -> float:
+    """
+    Resolve a temperature using an explicit personality temperature when provided,
+    otherwise fall back to a specialty-based default.
+    """
+    raw_temp = None
+    if personality and isinstance(personality.get("temperature"), (int, float)):
+        raw_temp = personality.get("temperature")
+
+    if raw_temp is None:
+        raw_temp = TEMPERATURE_MAP.get(fallback_specialty, TEMPERATURE_MAP["general"])
+
+    return max(0, min(1, raw_temp))
+
+
 def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict] = None, query: str = "") -> Tuple[str, str, float, bool]:
     """
     Determine which client/model to use based on mode, sub_intent, and personality.
@@ -119,16 +148,15 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     needs_thinking = should_use_thinking_model(query, sub_intent)
 
     # Always use thinking pass for any coding-related intent
-    coding_intents = {
-        "debugging",
-        "system_design",
-        "coding_complex",
-        "coding_simple",
-        "code_explanation",
-        "sql"
-    }
-    if sub_intent in coding_intents:
+    if sub_intent in LOGIC_CODING_INTENTS:
         return ("openrouter", ERNIE_THINKING_MODEL, 0.2, True)
+
+    # UI/creative requests should stay creative (no coding clamp)
+    if sub_intent in CREATIVE_INTENTS:
+        temp = _resolve_temperature(personality, "creative")
+        if temp < 0.6:
+            temp = 0.6
+        return ("openrouter", GEMINI_MODEL, temp, False)
     
     # Analysis/Research with thinking gate
     if sub_intent in ["analysis", "research", "reasoning"]:
@@ -139,7 +167,8 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
             return ("openrouter", GEMINI_MODEL, 0.4, False)
     
     # Default: General/Personality uses Gemini Flash Lite
-    temp = TEMPERATURE_MAP.get(personality.get("specialty", "general") if personality else "general", 0.65)
+    fallback_specialty = personality.get("specialty", "general") if personality else "general"
+    temp = _resolve_temperature(personality, fallback_specialty)
     return ("openrouter", GEMINI_MODEL, temp, False)
 
 class LLMProcessor:
@@ -151,7 +180,7 @@ class LLMProcessor:
     def __init__(self):
         self.model = LLM_MODEL
 
-    def _get_sampling(self, personality: Optional[Dict]) -> Dict[str, Any]:
+    def _get_sampling(self, personality: Optional[Dict], sub_intent: Optional[str] = None) -> Dict[str, Any]:
         """
         Backend-side authority: clamp and cap temperature and add specialty-based sampling hints.
         """
@@ -167,16 +196,21 @@ class LLMProcessor:
         # Clamp defensively
         temp = max(0, min(1, raw_temp))
 
+        is_creative_intent = sub_intent in CREATIVE_INTENTS if sub_intent else False
+        is_logic_coding_intent = sub_intent in LOGIC_CODING_INTENTS if sub_intent else False
+
         # Hard caps for safety-critical domains
-        if specialty in {"coding", "legal"}:
+        if specialty == "legal":
+            temp = min(temp, 0.3)
+        elif is_logic_coding_intent or (specialty == "coding" and not is_creative_intent):
             temp = min(temp, 0.3)
 
         sampling: Dict[str, Any] = {"temperature": temp}
 
         # Specialty-specific knobs
-        if specialty == "coding":
+        if is_logic_coding_intent or specialty == "coding":
             sampling.update({"top_p": 0.9, "frequency_penalty": 0, "presence_penalty": 0})
-        elif specialty == "creative":
+        elif is_creative_intent or specialty == "creative":
             sampling.update({"top_p": 1, "presence_penalty": 0.6})
 
         return sampling
@@ -253,7 +287,7 @@ class LLMProcessor:
             
         # Check for Coding Buddy override
         model_to_use = self.model
-        if sub_intent in {"debugging", "system_design", "code_explanation", "sql", "coding_complex", "coding_simple"}:
+        if sub_intent in LOGIC_CODING_INTENTS:
             model_to_use = CODING_MODEL
         if personality and personality.get("id") == "coding_buddy":
             model_to_use = CODING_MODEL
@@ -279,7 +313,8 @@ class LLMProcessor:
         mode: str = "normal",
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
-        user_settings: Optional[Dict] = None
+        user_settings: Optional[Dict] = None,
+        sub_intent: str = "general"
     ) -> tuple[str, List[str]]:
         """
         Handle external queries that need web search.
@@ -335,7 +370,7 @@ class LLMProcessor:
             "model": model_to_use,
             "messages": messages
         }
-        create_kwargs.update(self._get_sampling(personality))
+        create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
         response = await client.chat.completions.create(**create_kwargs)
         
         return self._sanitize_output_text(response.choices[0].message.content), selected_tools
@@ -405,6 +440,7 @@ class LLMProcessor:
         analysis = await analyze_and_route_query(user_query, mode, context_messages, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
         selected_tools = analysis.get("tools", [])
+        sub_intent = analysis.get("sub_intent", "general")
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
@@ -413,7 +449,6 @@ class LLMProcessor:
             if personality:
                  # 🎭 Advanced Routing: Dynamic Persona Switching (ONLY for Generic/Normal + Relyce AI)
                  # If sub_intent is detected (debugging, sql, etc.), use that specific prompt overlay
-                 sub_intent = analysis.get("sub_intent", "general")
                  from app.llm.router import INTERNAL_MODE_PROMPTS
                  
                  base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
@@ -446,8 +481,6 @@ class LLMProcessor:
             t_stream_start = time.time()
             
             # 🔀 Multi-Model Routing with Trace
-            sub_intent = analysis.get("sub_intent", "general")
-            
             # Initialize trace for this request
             trace = RequestTrace()
             trace.intent = intent
@@ -497,7 +530,7 @@ class LLMProcessor:
                 trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
                 
                 # Pass 2: Generate final output with appropriate model
-                if sub_intent in ["debugging", "system_design", "code_explanation", "sql", "coding_complex", "coding_simple"]:
+            if sub_intent in LOGIC_CODING_INTENTS:
                     output_model = CODING_MODEL
                 else:
                     output_model = GEMINI_MODEL
@@ -632,7 +665,7 @@ class LLMProcessor:
                     "messages": messages,
                     "stream": True
                 }
-                create_kwargs.update(self._get_sampling(personality))
+                create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
                 stream = await client.chat.completions.create(**create_kwargs)
                 
                 async for chunk in stream:
@@ -704,7 +737,7 @@ class LLMProcessor:
                     "messages": messages,
                     "stream": True
                 }
-                create_kwargs.update(self._get_sampling(personality))
+                create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
                 stream = await get_openrouter_client().chat.completions.create(**create_kwargs)
                 
                 async for chunk in stream:
