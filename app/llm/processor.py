@@ -117,18 +117,18 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     
     # Check if thinking is warranted (confidence gating)
     needs_thinking = should_use_thinking_model(query, sub_intent)
-    
-    # Complex coding with thinking gate
-    if sub_intent in ["debugging", "system_design"] or sub_intent == "coding_complex":
-        if needs_thinking:
-            return ("openrouter", ERNIE_THINKING_MODEL, 0.2, True)
-        else:
-            # Skip thinking, go direct to coding model
-            return ("openrouter", CODING_MODEL, 0.2, False)
-    
-    # Simple coding uses the coding model directly
-    if sub_intent in ["code_explanation", "sql", "coding_simple"]:
-        return ("openrouter", CODING_MODEL, 0.2, False)
+
+    # Always use thinking pass for any coding-related intent
+    coding_intents = {
+        "debugging",
+        "system_design",
+        "coding_complex",
+        "coding_simple",
+        "code_explanation",
+        "sql"
+    }
+    if sub_intent in coding_intents:
+        return ("openrouter", ERNIE_THINKING_MODEL, 0.2, True)
     
     # Analysis/Research with thinking gate
     if sub_intent in ["analysis", "research", "reasoning"]:
