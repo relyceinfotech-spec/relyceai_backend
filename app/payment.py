@@ -1,41 +1,114 @@
 from fastapi import APIRouter, HTTPException, Depends, Body, Request
 from app.config import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
 from app.auth import get_current_user, get_firestore_db
+from firebase_admin import firestore
 import razorpay
-import hmac
-import hashlib
 
 router = APIRouter()
 
 # Initialize Razorpay client
 client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
+DEFAULT_PRICING = {
+    "starter": {"monthly": 199, "yearly": 1999},
+    "plus": {"monthly": 999, "yearly": 9999},
+    "pro": {"monthly": 1999, "yearly": 19999},
+    "business": {"monthly": 2499, "yearly": 24999}
+}
+
+VALID_BILLING_CYCLES = {"monthly", "yearly"}
+
+def _normalize_plan_id(plan_id: str) -> str:
+    return str(plan_id).strip().lower() if plan_id else ""
+
+def _load_pricing(db):
+    try:
+        doc = db.collection("config").document("pricing").get()
+        if doc.exists:
+            plans = doc.to_dict().get("plans")
+            if isinstance(plans, dict) and plans:
+                return plans
+    except Exception as e:
+        print(f"[Payment] Pricing load failed: {e}")
+    return DEFAULT_PRICING
+
+def _get_plan_amount(pricing: dict, plan_id: str, billing_cycle: str):
+    plan = pricing.get(plan_id)
+    if not isinstance(plan, dict):
+        return None
+    if billing_cycle == "yearly":
+        return plan.get("yearly") or plan.get("yearlyPrice")
+    return plan.get("monthly") or plan.get("monthlyPrice")
+
+def _infer_plan_from_amount(pricing: dict, amount: float):
+    for plan_id, plan in pricing.items():
+        if not isinstance(plan, dict):
+            continue
+        if plan.get("monthly") == amount or plan.get("yearly") == amount:
+            return plan_id
+        if plan.get("monthlyPrice") == amount or plan.get("yearlyPrice") == amount:
+            return plan_id
+    return None
+
+def _get_order_meta(db, order_id: str):
+    try:
+        doc = db.collection("paymentOrders").document(order_id).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as e:
+        print(f"[Payment] Order meta lookup failed: {e}")
+        return None
+
 @router.post("/create-order")
 async def create_order(
-    amount: int = Body(..., description="Amount in currency subunits (e.g. 100 paise = 1 INR)"),
+    plan_id: str = Body(...),
+    billing_cycle: str = Body("monthly"),
     currency: str = Body("INR"),
     receipt: str = Body(None),
-    notes: dict = Body(None),
     user_info: dict = Depends(get_current_user)
 ):
     """
     Create a new Razorpay order.
-    Amount should be in subunits (e.g., paise for INR).
     """
     try:
         user_id = user_info["uid"]
-        safe_notes = notes.copy() if isinstance(notes, dict) else {}
-        safe_notes["user_id"] = user_id
+        plan_id = _normalize_plan_id(plan_id)
+        billing_cycle = (billing_cycle or "monthly").lower()
+        if billing_cycle not in VALID_BILLING_CYCLES:
+            raise HTTPException(status_code=400, detail="Invalid billing cycle")
+
+        db = get_firestore_db()
+        pricing = _load_pricing(db)
+        amount_rupees = _get_plan_amount(pricing, plan_id, billing_cycle)
+        if not amount_rupees:
+            raise HTTPException(status_code=400, detail="Invalid plan")
+
+        amount_subunits = int(amount_rupees * 100)
+        safe_notes = {
+            "user_id": user_id,
+            "plan_id": plan_id,
+            "billing_cycle": billing_cycle
+        }
 
         data = {
-            "amount": amount,
+            "amount": amount_subunits,
             "currency": currency,
             "receipt": receipt,
             "notes": safe_notes,
             "payment_capture": 1 # Auto capture
         }
         order = client.order.create(data=data)
-        return {"success": True, "order": order, "key_id": RAZORPAY_KEY_ID}
+        try:
+            db.collection("paymentOrders").document(order.get("id")).set({
+                "userId": user_id,
+                "planId": plan_id,
+                "billingCycle": billing_cycle,
+                "amount": amount_rupees,
+                "currency": currency,
+                "createdAt": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+        except Exception as meta_err:
+            print(f"[Payment] Warning: Failed to store order meta: {meta_err}")
+        return {"success": True, "order": order, "key_id": RAZORPAY_KEY_ID, "amount": amount_rupees}
     except Exception as e:
         print(f"[Razorpay] Order creation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -45,8 +118,8 @@ async def verify_payment(
     razorpay_order_id: str = Body(...),
     razorpay_payment_id: str = Body(...),
     razorpay_signature: str = Body(...),
-    plan_id: str = Body(...),
-    billing_cycle: str = Body("monthly"),
+    plan_id: str = Body(None),
+    billing_cycle: str = Body(None),
     user_info: dict = Depends(get_current_user)
 ):
     """
@@ -63,7 +136,7 @@ async def verify_payment(
         
         client.utility.verify_payment_signature(params_dict)
         
-        # 1.5 Fetch payment details to get actual amount (including coupons)
+        # 1.5 Fetch payment + order details for validation
         try:
             payment_details = client.payment.fetch(razorpay_payment_id)
             amount_paid = payment_details.get('amount', 0) / 100 # Convert to Rupees
@@ -73,9 +146,17 @@ async def verify_payment(
             amount_paid = 0
             payment_details = {}
 
+        try:
+            order_details = client.order.fetch(razorpay_order_id)
+        except Exception as fetch_error:
+            print(f"[Payment] Warning: Could not fetch order details: {fetch_error}")
+            order_details = {}
+
+        payment_notes = (payment_details or {}).get('notes', {}) or {}
+        order_notes = (order_details or {}).get('notes', {}) or {}
+
         # 1.6 Validate payment notes user_id matches token
-        notes = (payment_details or {}).get('notes', {}) or {}
-        notes_user_id = notes.get('user_id') or notes.get('userId')
+        notes_user_id = order_notes.get('user_id') or payment_notes.get('user_id') or payment_notes.get('userId')
         if not notes_user_id:
             print(f"[Payment] Missing user_id in payment notes for {razorpay_payment_id}")
             raise HTTPException(status_code=400, detail="Payment metadata missing user_id")
@@ -83,16 +164,54 @@ async def verify_payment(
             print(f"[Payment] User mismatch: token={user_id} notes={notes_user_id}")
             raise HTTPException(status_code=403, detail="Payment user mismatch")
 
+        # 1.7 Resolve plan + billing from server-side metadata
+        db = get_firestore_db()
+        order_meta = _get_order_meta(db, razorpay_order_id) or {}
+
+        resolved_plan_id = _normalize_plan_id(
+            order_notes.get('plan_id')
+            or order_notes.get('plan')
+            or payment_notes.get('plan_id')
+            or payment_notes.get('plan')
+            or order_meta.get('planId')
+        )
+        resolved_billing = (
+            order_notes.get('billing_cycle')
+            or order_notes.get('billingCycle')
+            or payment_notes.get('billing_cycle')
+            or payment_notes.get('billingCycle')
+            or order_meta.get('billingCycle')
+            or "monthly"
+        ).lower()
+
+        if resolved_billing not in VALID_BILLING_CYCLES:
+            raise HTTPException(status_code=400, detail="Invalid billing cycle")
+        if not resolved_plan_id:
+            raise HTTPException(status_code=400, detail="Missing plan metadata")
+
+        pricing = _load_pricing(db)
+        expected_amount = _get_plan_amount(pricing, resolved_plan_id, resolved_billing)
+        if not expected_amount:
+            raise HTTPException(status_code=400, detail="Invalid plan pricing")
+
+        order_amount = (order_details or {}).get('amount', 0) / 100 if order_details else 0
+        if not order_amount and order_meta.get("amount"):
+            order_amount = order_meta.get("amount")
+
+        if not order_amount and not amount_paid:
+            raise HTTPException(status_code=400, detail="Unable to verify payment amount")
+
+        if order_amount and int(order_amount) != int(expected_amount):
+            raise HTTPException(status_code=400, detail="Order amount mismatch")
+        if amount_paid and int(amount_paid) != int(expected_amount):
+            raise HTTPException(status_code=400, detail="Payment amount mismatch")
+
         # 2. Payment Verified - Calculate Expiry
         from datetime import datetime, timedelta, timezone
-        import firebase_admin
-        from firebase_admin import firestore
-        
-        db = firestore.client()
-        
+
         # Calculate expiry date in UTC
         now = datetime.now(timezone.utc)
-        if billing_cycle == 'yearly':
+        if resolved_billing == 'yearly':
             expiry_date = now + timedelta(days=365)
         else:
             expiry_date = now + timedelta(days=30)
@@ -100,20 +219,21 @@ async def verify_payment(
         # 3. Update Firestore (Secure Backend Write)
         user_ref = db.collection('users').document(user_id)
         
+        amount_to_store = amount_paid if amount_paid else expected_amount
         update_data = {
-            "membership.plan": plan_id,
-            "membership.planName": plan_id.capitalize(), # Or fetch from config
+            "membership.plan": resolved_plan_id,
+            "membership.planName": resolved_plan_id.capitalize(), # Or fetch from config
             "membership.status": "active",
             "membership.startDate": now.isoformat(),
             "membership.expiryDate": expiry_date.isoformat(),
-            "membership.billingCycle": billing_cycle,
+            "membership.billingCycle": resolved_billing,
             "membership.paymentStatus": "paid",
             "membership.updatedAt": firestore.SERVER_TIMESTAMP,
             f"membership.paymentHistory.{razorpay_payment_id}": {
                 "transactionId": razorpay_payment_id,
                 "orderId": razorpay_order_id,
-                "amount": amount_paid,
-                "plan": plan_id,
+                "amount": amount_to_store,
+                "plan": resolved_plan_id,
                 "date": now.isoformat(),
                 "verified": True
             }
@@ -128,20 +248,20 @@ async def verify_payment(
             # Construct nested dict for set
             nested_data = {
                 "membership": {
-                    "plan": plan_id,
-                    "planName": plan_id.capitalize(),
+                    "plan": resolved_plan_id,
+                    "planName": resolved_plan_id.capitalize(),
                     "status": "active",
                     "startDate": now.isoformat(),
                     "expiryDate": expiry_date.isoformat(),
-                    "billingCycle": billing_cycle,
+                    "billingCycle": resolved_billing,
                     "paymentStatus": "paid",
                     "updatedAt": firestore.SERVER_TIMESTAMP,
                     "paymentHistory": {
                         razorpay_payment_id: {
                             "transactionId": razorpay_payment_id,
                             "orderId": razorpay_order_id,
-                            "amount": amount_paid,
-                            "plan": plan_id,
+                            "amount": amount_to_store,
+                            "plan": resolved_plan_id,
                             "date": now.isoformat(),
                             "verified": True
                         }
@@ -156,14 +276,15 @@ async def verify_payment(
             "userId": user_id,
             "orderId": razorpay_order_id,
             "paymentId": razorpay_payment_id,
-            "planId": plan_id,
-            "billingCycle": billing_cycle,
-            "amount": amount_paid,
+            "planId": resolved_plan_id,
+            "plan": resolved_plan_id,
+            "billingCycle": resolved_billing,
+            "amount": amount_to_store,
             "timestamp": firestore.SERVER_TIMESTAMP,
             "verified": True
         })
         
-        print(f"[Payment] Verified and updated for user {user_id} - Plan: {plan_id} - Amount: {amount_paid}")
+        print(f"[Payment] Verified and updated for user {user_id} - Plan: {resolved_plan_id} - Amount: {amount_to_store}")
         return {"success": True, "message": "Payment verified and membership updated"}
         
     except razorpay.errors.SignatureVerificationError:
@@ -205,8 +326,7 @@ async def check_payment_status(payment_id: str, user_info: dict = Depends(requir
         # Try to find user by email if we have one
         if email:
             try:
-                from firebase_admin import firestore
-                db = firestore.client()
+                db = get_firestore_db()
                 # Query users collection by email
                 users_ref = db.collection('users')
                 query = users_ref.where('email', '==', email).limit(1)
@@ -219,14 +339,13 @@ async def check_payment_status(payment_id: str, user_info: dict = Depends(requir
                 print(f"[Admin Payment Check] DB Lookup Error: {db_e}")
 
         # Try to infer plan from amount if missing in notes
-        # This is a heuristic based on known pricing
         inferred_plan = None
         amount_in_rupees = payment.get('amount', 0) / 100
-        
-        # Simple heuristic mapping (you might want to move this to config if prices change often)
-        if amount_in_rupees in [199, 1999]: inferred_plan = 'starter'
-        elif amount_in_rupees in [999, 9999]: inferred_plan = 'plus'
-        elif amount_in_rupees in [2499, 24999]: inferred_plan = 'business'
+        try:
+            pricing = _load_pricing(get_firestore_db())
+            inferred_plan = _infer_plan_from_amount(pricing, amount_in_rupees)
+        except Exception as infer_err:
+            print(f"[Admin Payment Check] Plan inference error: {infer_err}")
         
         return {
             "success": True,
@@ -265,6 +384,10 @@ async def sync_payment_manual(payment_id: str, user_id: str = Body(..., embed=Tr
         if payment.get('status') != 'captured':
              raise HTTPException(status_code=400, detail=f"Payment is in '{payment.get('status')}' state, not 'captured'. Cannot sync.")
 
+        plan_id = _normalize_plan_id(plan_id)
+        if not plan_id:
+            raise HTTPException(status_code=400, detail="Invalid plan")
+
         # Prepare payload wrapper to reuse existing logic
         # We construct a synthetic payload that matches what handle_payment_captured expects
         
@@ -298,11 +421,12 @@ async def sync_payment_manual(payment_id: str, user_id: str = Body(..., embed=Tr
             }
         }
         
-        from firebase_admin import firestore
-        db = firestore.client()
+        db = get_firestore_db()
         
         # reuse the logic
-        await handle_payment_captured(db, payload)
+        success = await handle_payment_captured(db, payload)
+        if not success:
+            raise HTTPException(status_code=400, detail="Payment sync failed validation")
         
         return {"success": True, "message": f"Payment {payment_id} synced and plan {plan_id} activated for user {user_id}"}
 
@@ -350,8 +474,7 @@ async def handle_razorpay_webhook(request: Request):
         print(f"[Razorpay Webhook] Received event: {event_type} (ID: {unique_event_id})")
 
         # 4. Idempotency Check
-        from firebase_admin import firestore
-        db = firestore.client()
+        db = get_firestore_db()
         
         webhook_ref = db.collection('processed_webhooks').document(unique_event_id)
         if webhook_ref.get().exists:
@@ -412,12 +535,16 @@ async def handle_payment_captured(db, payload):
         # Extract metadata from notes
         notes = entity.get('notes', {})
         user_id = notes.get('user_id') or notes.get('userId')
-        plan_id = notes.get('plan_id')
-        billing_cycle = notes.get('billing_cycle') or notes.get('billingCycle') or 'monthly'
+        plan_id = _normalize_plan_id(notes.get('plan_id') or notes.get('plan') or notes.get('planId'))
+        billing_cycle = (notes.get('billing_cycle') or notes.get('billingCycle') or 'monthly').lower()
 
         if not user_id or not plan_id:
             print(f"[Webhook] Missing user_id or plan_id in payment notes for {payment_id}")
-            return
+            return False
+
+        if billing_cycle not in VALID_BILLING_CYCLES:
+            print(f"[Webhook] Invalid billing cycle '{billing_cycle}' for {payment_id}")
+            return False
 
         print(f"[Webhook] Processing captured payment {payment_id} for user {user_id}, plan {plan_id}")
 
@@ -453,6 +580,15 @@ async def handle_payment_captured(db, payload):
         # Screenshot showed '9,999' which matches Plan Price. Razorpay sends 999900.
         amount_val = entity.get('amount', 0)
         amount_in_rupees = amount_val / 100 if amount_val > 0 else 0
+
+        pricing = _load_pricing(db)
+        expected_amount = _get_plan_amount(pricing, plan_id, billing_cycle)
+        if not expected_amount:
+            print(f"[Webhook] Invalid plan pricing for {plan_id}")
+            return False
+        if amount_in_rupees and int(amount_in_rupees) != int(expected_amount):
+            print(f"[Webhook] Amount mismatch for {payment_id}: expected {expected_amount}, got {amount_in_rupees}")
+            return False
 
         update_data = {
             "membership.plan": plan_id,
@@ -542,9 +678,11 @@ async def handle_payment_captured(db, payload):
         }, merge=True) # Merge to allow updating existing botched records
 
         print(f"[Webhook] Successfully activated plan {plan_id} for user {user_id}")
+        return True
 
     except Exception as e:
-        print(f"[Webhook] Error in handle_payment_captured: {e}") 
+        print(f"[Webhook] Error in handle_payment_captured: {e}")
+        return False
 
 
 async def handle_subscription_activated(db, payload):

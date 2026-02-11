@@ -2,8 +2,8 @@
 Users Router
 Handles user initialization and management.
 """
-from fastapi import APIRouter, HTTPException, Depends, Header
-from app.auth import verify_token, get_firestore_db, get_current_user
+from fastapi import APIRouter, HTTPException, Depends
+from app.auth import get_firestore_db, get_current_user, get_claim_role
 from datetime import datetime, timezone
 import threading
 
@@ -167,17 +167,37 @@ async def init_user(user_info: dict = Depends(get_current_user)):
     try:
         doc = user_ref.get()
         
+        claim_role = get_claim_role(user_info)
         if doc.exists:
             user_data = doc.to_dict()
             updates = {}
             
-            # HARDENING: For existing users, do NOT modify role or membership via /users/init.
-            # This prevents unintended downgrades. Only assign uniqueUserId if the field is missing.
+            # HARDENING: For existing users, only FILL IN missing defaults.
+            # Never overwrite existing role or membership values.
 
             if not user_data.get("uniqueUserId"):
                 new_unique_id = generate_unique_id(db)
                 print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (field missing)")
                 updates["uniqueUserId"] = new_unique_id
+
+            existing_role = normalize_role(user_data.get("role"))
+            if not existing_role and not claim_role:
+                updates["role"] = "user"
+                print(f"[Users] Init: Assigning default role 'user' to {uid}")
+            elif claim_role and claim_role != existing_role:
+                updates["role"] = claim_role
+                print(f"[Users] Init: Syncing role from claims '{claim_role}' for {uid}")
+
+            if not user_data.get("membership") or not user_data.get("membership", {}).get("plan"):
+                updates["membership"] = {
+                    "plan": "free",
+                    "planName": "Free",
+                    "status": "active",
+                    "billingCycle": "monthly",
+                    "paymentStatus": "free",
+                    "startDate": datetime.now(timezone.utc).isoformat()
+                }
+                print(f"[Users] Init: Assigning default free membership to {uid}")
 
             if updates:
                 user_ref.update(updates)
@@ -212,7 +232,7 @@ async def init_user(user_info: dict = Depends(get_current_user)):
                 "uid": uid,
                 "uniqueUserId": new_unique_id,
                 "email": email,
-                "role": "user",
+                "role": claim_role or "user",
                 "createdAt": datetime.now(timezone.utc),
                 "lastLoginAt": datetime.now(timezone.utc),
                 "membership": {
@@ -230,3 +250,41 @@ async def init_user(user_info: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"[Users] Init error for {uid}: {e}")
         raise HTTPException(status_code=500, detail="Failed to initialize user")
+
+
+@router.post("/membership/downgrade")
+async def downgrade_membership(user_info: dict = Depends(get_current_user)):
+    """
+    Allow authenticated users to downgrade themselves to the Free plan.
+    Paid upgrades must go through the payment flow.
+    """
+    uid = user_info["uid"]
+    db = get_firestore_db()
+    user_ref = db.collection("users").document(uid)
+
+    now = datetime.now(timezone.utc)
+    updates = {
+        "membership.plan": "free",
+        "membership.planName": "Free",
+        "membership.status": "active",
+        "membership.billingCycle": "monthly",
+        "membership.paymentStatus": "free",
+        "membership.expiryDate": None,
+        "membership.isExpired": False,
+        "membership.updatedAt": now
+    }
+
+    try:
+        user_ref.update(updates)
+        db.collection("auditLogs").add({
+            "action": "MEMBERSHIP_CHANGED",
+            "by": uid,
+            "target": uid,
+            "details": {"plan": "free", "billingCycle": "monthly"},
+            "timestamp": now,
+            "time": now.timestamp()
+        })
+        return {"success": True, "message": "Downgraded to Free plan"}
+    except Exception as e:
+        print(f"[Users] Downgrade error for {uid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to downgrade membership")

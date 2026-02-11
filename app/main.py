@@ -21,6 +21,7 @@ from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
 from app.chat.user_profile import get_user_settings, get_session_personality_id, merge_settings
 from app.chat.history import save_message_to_firebase, load_chat_history, increment_message_count
+from app.rate_limit import check_rate_limit as check_chat_rate_limit
 from app.websocket import manager, handle_websocket_message
 
 from app.payment import router as payment_router
@@ -40,22 +41,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! Firebase init failed: {e}")
     
-    # Load intent embeddings into memory (for fast routing)
+    # Load intent embeddings into memory (for fast routing) in the background
     try:
         import asyncio
         from app.llm.embeddings import load_intent_embeddings
-        
-        # 🛡️ SAFETY TIMEOUT: Prevent production "looping" or hangs
-        # If loading takes > 5s, we skip it and let the server start.
-        try:
-            await asyncio.wait_for(load_intent_embeddings(), timeout=5.0)
-            print("[Startup] - Intent embeddings loaded into RAM")
-        except asyncio.TimeoutError:
-             print("[Startup] ⚠️ Embedding load TIMED OUT (skipping to ensure startup)")
-             
+
+        async def _load_embeddings_background():
+            try:
+                loaded = await load_intent_embeddings()
+                if loaded:
+                    print("[Startup] - Intent embeddings loaded into RAM")
+                else:
+                    print("[Startup] - Intent embeddings not found in Firestore")
+            except Exception as e:
+                print(f"[Startup] ! Embedding load failed: {e}")
+
+        asyncio.create_task(_load_embeddings_background())
+
     except Exception as e:
-        print(f"[Startup] ! Embedding load failed: {e}")
-    
+        print(f"[Startup] ! Embedding task init failed: {e}")
+
     print(f"[Startup] - Server ready on {HOST}:{PORT}")
     print("=" * 60)
     
@@ -103,7 +108,7 @@ async def health_check():
 # ============================================
 from fastapi import Request
 from pydantic import BaseModel, EmailStr
-from app.rate_limiter import check_rate_limit, record_failed_attempt, clear_attempts
+from app.rate_limiter import check_rate_limit as check_login_rate_limit, record_failed_attempt, clear_attempts
 
 class RateLimitRequest(BaseModel):
     email: str
@@ -112,7 +117,7 @@ class RateLimitRequest(BaseModel):
 async def check_login_limit(request: RateLimitRequest, req: Request):
     """Check if login attempt is allowed for this email+IP"""
     ip = req.client.host if req.client else "unknown"
-    result = check_rate_limit(request.email, ip)
+    result = check_login_rate_limit(request.email, ip)
     return result
 
 @app.post("/auth/record-failure")
@@ -200,16 +205,16 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
     """
     try:
         user_id = user_info["uid"]
+        if not check_chat_rate_limit(user_id):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded (30 req/min). Try again later.")
         request.user_id = user_id
 
-        # Get context if session exists
-        context_messages = []
-        if request.session_id:
-            context_messages = get_context_for_llm(user_id, request.session_id)
-        
         # Resolve personality
         personality = request.personality
         personality_id = request.personality_id
+        if personality and not personality_id:
+            if hasattr(personality, "id"):
+                personality_id = personality.id
         if not personality and not personality_id and request.session_id:
             saved_id = get_session_personality_id(user_id, request.session_id)
             if saved_id:
@@ -223,12 +228,20 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
             p_data = get_personality_by_id(user_id, "default_relyce")
             if p_data:
                 personality = p_data
+                personality_id = personality_id or p_data.get("id")
         
         # Convert Personality object to dict if it is an object
         if hasattr(personality, "dict"):
             personality = personality.dict()
         elif hasattr(personality, "model_dump"):
             personality = personality.model_dump()
+        if personality and not personality_id:
+            personality_id = personality.get("id")
+
+        # Get context if session exists (personality-aware)
+        context_messages = []
+        if request.session_id:
+            context_messages = get_context_for_llm(user_id, request.session_id, personality_id)
 
         # Process message
         effective_settings = merge_settings(get_user_settings(user_id), request.user_settings)
@@ -237,7 +250,8 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
             mode=request.chat_mode,
             context_messages=context_messages,
             personality=personality,
-            user_settings=effective_settings
+            user_settings=effective_settings,
+            user_id=user_id
         )
         
         # Update context
@@ -246,15 +260,16 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
                 user_id, 
                 request.session_id,
                 request.message,
-                result["response"]
+                result["response"],
+                personality_id
             )
             
             # Save to Firebase
             save_message_to_firebase(
-                user_id, request.session_id, "user", request.message
+                user_id, request.session_id, "user", request.message, personality_id
             )
             msg_id = save_message_to_firebase(
-                user_id, request.session_id, "assistant", result["response"]
+                user_id, request.session_id, "assistant", result["response"], personality_id
             )
             result["message_id"] = msg_id
             
@@ -274,23 +289,24 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
     Streaming chat endpoint using Server-Sent Events (SSE).
     Returns tokens as they're generated.
     """
+    user_id = user_info["uid"]
+    if not check_chat_rate_limit(user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (30 req/min). Try again later.")
+
     async def generate():
         try:
             # 🚀 Force flush buffer immediately with padding (1KB)
             # This helps in environments like Vercel/Nginx/Render that buffer responses
             yield ": " + (" " * 1024) + "\n\n"
 
-            user_id = user_info["uid"]
             request.user_id = user_id
 
-            # Get context if session exists
-            context_messages = []
-            if request.session_id:
-                context_messages = get_context_for_llm(user_id, request.session_id)
-            
             # Resolve personality
             personality = request.personality
             personality_id = request.personality_id
+            if personality and not personality_id:
+                if hasattr(personality, "id"):
+                    personality_id = personality.id
             if not personality and not personality_id and request.session_id:
                 saved_id = get_session_personality_id(user_id, request.session_id)
                 if saved_id:
@@ -304,12 +320,20 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
                 p_data = get_personality_by_id(user_id, "default_relyce")
                 if p_data:
                     personality = p_data
+                    personality_id = personality_id or p_data.get("id")
             
              # Convert Personality object to dict if it is an object
             if hasattr(personality, "dict"):
                 personality = personality.dict()
             elif hasattr(personality, "model_dump"):
                 personality = personality.model_dump()
+            if personality and not personality_id:
+                personality_id = personality.get("id")
+
+            # Get context if session exists (personality-aware)
+            context_messages = []
+            if request.session_id:
+                context_messages = get_context_for_llm(user_id, request.session_id, personality_id)
 
             full_response = ""
             
@@ -338,13 +362,14 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
                     user_id,
                     request.session_id,
                     request.message,
-                    full_response
+                    full_response,
+                    personality_id
                 )
                 save_message_to_firebase(
-                    user_id, request.session_id, "user", request.message
+                    user_id, request.session_id, "user", request.message, personality_id
                 )
                 save_message_to_firebase(
-                    user_id, request.session_id, "assistant", full_response
+                    user_id, request.session_id, "assistant", full_response, personality_id
                 )
                 
                 # Increment Usage

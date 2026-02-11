@@ -11,6 +11,7 @@ from collections import defaultdict
 _context_store: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdict(list))
 _context_timestamps: Dict[str, Dict[str, datetime]] = defaultdict(dict)
 _context_summaries: Dict[str, Dict[str, str]] = defaultdict(lambda: defaultdict(str))
+_context_personalities: Dict[str, Dict[str, str]] = defaultdict(dict)
 
 # Context settings
 MAX_CONTEXT_MESSAGES = 20  # Absolute safety cap (RAM protection)
@@ -26,7 +27,19 @@ def get_raw_message_count(user_id: str, chat_id: str) -> int:
     """Get the raw count of messages in the store (excluding dynamically injected ones)"""
     return len(_context_store[user_id][chat_id])
 
-def get_context(user_id: str, chat_id: str) -> List[Dict]:
+def _ensure_personality_context(user_id: str, chat_id: str, personality_id: Optional[str]) -> None:
+    """
+    If personality changes for a session, clear context to avoid prompt bleed.
+    """
+    if not personality_id or user_id == "anonymous":
+        return
+    last_personality = _context_personalities.get(user_id, {}).get(chat_id)
+    if last_personality and last_personality != personality_id:
+        clear_context(user_id, chat_id)
+    _context_personalities[user_id][chat_id] = personality_id
+
+
+def get_context(user_id: str, chat_id: str, personality_id: Optional[str] = None) -> List[Dict]:
     """
     Get conversation context for a user's chat session.
     Returns ALL current memory messages (processor handles slicing).
@@ -47,7 +60,7 @@ def get_context(user_id: str, chat_id: str) -> List[Dict]:
         try:
             from app.chat.history import load_chat_history
             # Load message limit based on safety cap
-            history = load_chat_history(user_id, chat_id, limit=MAX_CONTEXT_MESSAGES)
+            history = load_chat_history(user_id, chat_id, limit=MAX_CONTEXT_MESSAGES, personality_id=personality_id)
             if history:
                 # Convert to context format (history has 'createdAt', context needs 'timestamp' string usually, but we can adapt)
                 for msg in history:
@@ -102,14 +115,17 @@ def clear_context(user_id: str, chat_id: str) -> None:
             del _context_timestamps[user_id][chat_id]
         if chat_id in _context_summaries.get(user_id, {}):
             del _context_summaries[user_id][chat_id]
+        if chat_id in _context_personalities.get(user_id, {}):
+            del _context_personalities[user_id][chat_id]
 
-def get_context_for_llm(user_id: str, chat_id: str) -> List[Dict]:
+def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str] = None) -> List[Dict]:
     """
     Get context formatted for LLM consumption.
     Injects summary as system message if it exists.
     Returns list of {"role": "user"|"assistant"|"system", "content": str}
     """
     context_msgs = []
+    _ensure_personality_context(user_id, chat_id, personality_id)
     
     # 1. Inject Summary (Long-term memory)
     summary = get_session_summary(user_id, chat_id)
@@ -120,7 +136,7 @@ def get_context_for_llm(user_id: str, chat_id: str) -> List[Dict]:
         })
     
     # 2. Add Recent Messages (Short-term memory)
-    raw_messages = get_context(user_id, chat_id)
+    raw_messages = get_context(user_id, chat_id, personality_id)
     for msg in raw_messages:
         role = msg["role"]
         if role == "bot":
@@ -133,10 +149,12 @@ def update_context_with_exchange(
     user_id: str, 
     chat_id: str, 
     user_message: str, 
-    assistant_response: str
+    assistant_response: str,
+    personality_id: Optional[str] = None
 ) -> None:
     """
     Add a complete exchange (user message + assistant response) to context.
     """
+    _ensure_personality_context(user_id, chat_id, personality_id)
     add_to_context(user_id, chat_id, "user", user_message)
     add_to_context(user_id, chat_id, "assistant", assistant_response)

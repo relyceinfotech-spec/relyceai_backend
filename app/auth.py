@@ -83,10 +83,17 @@ def verify_token(id_token: str) -> Tuple[bool, Optional[dict]]:
     
     try:
         decoded_token = auth.verify_id_token(id_token)
+        role_claim = decoded_token.get("role")
+        admin_claim = decoded_token.get("admin") is True
+        superadmin_claim = decoded_token.get("superadmin") is True
         user_info = {
             "uid": decoded_token.get("uid"),
             "email": decoded_token.get("email"),
             "name": decoded_token.get("name"),
+            "role": role_claim,
+            "admin": admin_claim,
+            "superadmin": superadmin_claim,
+            "claims": decoded_token
         }
         return True, user_info
     except auth.InvalidIdTokenError:
@@ -115,6 +122,30 @@ def get_user_by_uid(uid: str) -> Optional[dict]:
     except Exception as e:
         print(f"[Auth] Get user error: {e}")
         return None
+
+def normalize_role(role_value: Optional[str]) -> str:
+    if not role_value:
+        return ""
+    role = str(role_value).strip().lower()
+    if role == "super_admin":
+        return "superadmin"
+    return role
+
+def get_claim_role(user_info: dict) -> str:
+    role = normalize_role(user_info.get("role"))
+    if role:
+        return role
+    if user_info.get("superadmin"):
+        return "superadmin"
+    if user_info.get("admin"):
+        return "admin"
+    return ""
+
+def is_admin_user(user_info: dict) -> bool:
+    return get_claim_role(user_info) in ["admin", "superadmin"]
+
+def is_superadmin_user(user_info: dict) -> bool:
+    return get_claim_role(user_info) == "superadmin"
 
 from fastapi import Header, HTTPException, status
 

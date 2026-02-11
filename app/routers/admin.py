@@ -2,12 +2,13 @@
 Admin Router
 Handles administrative actions like role management and audit logging.
 """
-from fastapi import APIRouter, HTTPException, Depends, Header, Body
+from fastapi import APIRouter, HTTPException, Depends, Body
 from pydantic import BaseModel
 from typing import Optional
 import time
-from app.auth import verify_token, get_firestore_db, get_current_user
+from app.auth import get_firestore_db, get_current_user, is_admin_user, is_superadmin_user, normalize_role
 from datetime import datetime, timedelta, timezone
+from firebase_admin import auth as firebase_auth
 # Import reusable expiry logic
 from app.routers.users import check_membership_expiry, generate_unique_id
 
@@ -26,49 +27,24 @@ class UpdateMembershipRequest(BaseModel):
 
 
 def require_admin(user_info: dict = Depends(get_current_user)):
-    db = get_firestore_db()
-    doc = db.collection("users").document(user_info["uid"]).get()
-    if not doc.exists:
-        raise HTTPException(status_code=403, detail="Admin profile not found")
-    role = doc.to_dict().get("role", "user")
-    if role not in ["admin", "superadmin"]:
+    if not is_admin_user(user_info):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     return user_info
 
-async def get_current_user_uid(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    
-    token = authorization.split(" ")[1]
-    is_valid, user_info = verify_token(token)
-    
-    if not is_valid or not user_info:
-        raise HTTPException(status_code=401, detail="Invalid token")
-        
-    return user_info["uid"]
+def require_superadmin(user_info: dict = Depends(get_current_user)):
+    if not is_superadmin_user(user_info):
+        raise HTTPException(status_code=403, detail="Insufficient permissions: SuperAdmin only")
+    return user_info
 
 @router.post("/change-role")
-async def change_role(request: ChangeRoleRequest, requester_uid: str = Depends(get_current_user_uid)):
+async def change_role(request: ChangeRoleRequest, user_info: dict = Depends(require_superadmin)):
     """
     Change a user's role.
     Only SuperAdmin can perform this action.
     """
     db = get_firestore_db()
     
-    # 1. Verify Requester is SuperAdmin
-    requester_ref = db.collection("users").document(requester_uid)
-    requester_doc = requester_ref.get()
-    
-    if not requester_doc.exists:
-        raise HTTPException(status_code=403, detail="Requester profile not found")
-        
-    requester_data = requester_doc.to_dict()
-    current_role = requester_data.get("role", "user")
-    
-    if current_role != "superadmin":
-        raise HTTPException(status_code=403, detail="Insufficient permissions: Only SuperAdmin can change roles")
-
-    # 2. Update Target User Role
+    # 1. Update Target User Role
     target_ref = db.collection("users").document(request.target_uid)
     target_doc = target_ref.get()
     
@@ -76,17 +52,37 @@ async def change_role(request: ChangeRoleRequest, requester_uid: str = Depends(g
         raise HTTPException(status_code=404, detail="Target user not found")
         
     try:
-        # Update the role
-        target_ref.update({"role": request.new_role})
+        # Normalize and validate role
+        new_role = normalize_role(request.new_role)
+        if new_role not in ["user", "premium", "admin", "superadmin"]:
+            raise HTTPException(status_code=400, detail="Invalid role")
+
+        # Update Firebase custom claims (preserve existing claims)
+        user_record = firebase_auth.get_user(request.target_uid)
+        claims = user_record.custom_claims or {}
+        claims.update({
+            "role": new_role,
+            "admin": new_role in ["admin", "superadmin"],
+            "superadmin": new_role == "superadmin"
+        })
+        firebase_auth.set_custom_user_claims(request.target_uid, claims)
+        # Force re-auth so new role takes effect immediately
+        firebase_auth.revoke_refresh_tokens(request.target_uid)
+
+        # Mirror role in Firestore for UI display
+        target_ref.update({
+            "role": new_role,
+            "roleChangedAt": datetime.now(timezone.utc)
+        })
         
         # 3. Create Audit Log
         audit_entry = {
             "action": "ROLE_CHANGED",
-            "by": requester_uid,
+            "by": user_info["uid"],
             "target": request.target_uid,
             "previous_role": target_doc.to_dict().get("role", "unknown"),
-            "new_role": request.new_role,
-            "timestamp": datetime.now(), # Python datetime for Firestore
+            "new_role": new_role,
+            "timestamp": datetime.now(timezone.utc), # Python datetime for Firestore
             "time": time.time() # Unix timestamp for easier sorting/filtering if needed
         }
         
@@ -209,19 +205,13 @@ async def delete_user(target_uid: str, user_info: dict = Depends(require_admin))
     return {"success": True, "message": "User deleted"}
 
 @router.post("/jobs/expire-memberships")
-async def run_expiry_job(requester_uid: str = Depends(get_current_user_uid)):
+async def run_expiry_job(user_info: dict = Depends(require_superadmin)):
     """
     CRON JOB: Checks all active memberships and expires them if past valid date.
     Triggered by SuperAdmin (or authorized system service).
     """
-    print(f"[Job] Expiry job triggered by {requester_uid}")
-    
-    # 1. Verify SuperAdmin (Only they can trigger system jobs manually for now)
-    # In future, can allow a specific "Service Account" UID.
+    print(f"[Job] Expiry job triggered by {user_info['uid']}")
     db = get_firestore_db()
-    requester = db.collection("users").document(requester_uid).get()
-    if not requester.exists or requester.to_dict().get("role") != "superadmin":
-         raise HTTPException(status_code=403, detail="Only SuperAdmin can trigger jobs")
 
     # 2. Query Candidates: Active Users with Expiry Date < NOW
     # Note: Querying by date requires the Index we just added.
@@ -260,17 +250,14 @@ async def run_expiry_job(requester_uid: str = Depends(get_current_user_uid)):
 
 
 @router.post("/jobs/backfill-unique-ids")
-async def run_unique_id_backfill(requester_uid: str = Depends(get_current_user_uid)):
+async def run_unique_id_backfill(user_info: dict = Depends(require_superadmin)):
     """
     CRON/ADMIN JOB: Backfill missing or malformed uniqueUserId for all users.
     Attempts to recover legacy IDs when possible; otherwise generates new RA IDs.
     """
-    print(f"[Job] Unique ID backfill triggered by {requester_uid}")
+    print(f"[Job] Unique ID backfill triggered by {user_info['uid']}")
 
     db = get_firestore_db()
-    requester = db.collection("users").document(requester_uid).get()
-    if not requester.exists or requester.to_dict().get("role") != "superadmin":
-        raise HTTPException(status_code=403, detail="Only SuperAdmin can trigger jobs")
 
     users = db.collection("users").stream()
     updated = 0

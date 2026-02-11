@@ -12,7 +12,8 @@ def save_message_to_firebase(
     user_id: str,
     session_id: str,
     role: str,
-    content: str
+    content: str,
+    personality_id: Optional[str] = None
 ) -> Optional[str]:
     """
     Save a message to Firebase Firestore.
@@ -30,12 +31,15 @@ def save_message_to_firebase(
             .collection('chatSessions').document(session_id) \
             .collection('messages')
         
-        doc_ref = messages_ref.add({
+        payload = {
             'role': role,
             'content': content,
             'timestamp': datetime.now(),
             'createdAt': datetime.now().isoformat()
-        })
+        }
+        if personality_id:
+            payload['personalityId'] = personality_id
+        doc_ref = messages_ref.add(payload)
         
         return doc_ref[1].id
         
@@ -46,7 +50,8 @@ def save_message_to_firebase(
 def load_chat_history(
     user_id: str,
     session_id: str,
-    limit: int = 50
+    limit: int = 50,
+    personality_id: Optional[str] = None
 ) -> List[Dict]:
     """
     Load chat history from Firebase Firestore.
@@ -71,8 +76,12 @@ def load_chat_history(
                 'id': doc.id,
                 'role': data.get('role'),
                 'content': data.get('content'),
-                'timestamp': data.get('createdAt')
+                'timestamp': data.get('createdAt'),
+                'personalityId': data.get('personalityId')
             })
+        
+        if personality_id:
+            messages = [m for m in messages if m.get('personalityId') == personality_id]
         
         return messages
         

@@ -5,6 +5,7 @@ Includes gray-zone tie-breaker with gpt-4o-mini.
 """
 import asyncio
 import math
+import os
 import time
 from typing import Dict, List, Optional, Tuple
 from openai import AsyncOpenAI
@@ -20,7 +21,7 @@ EMBEDDING_MODEL = "openai/text-embedding-3-small"
 TIEBREAKER_MODEL = "openai/gpt-4o-mini"
 THRESHOLD_HIGH = 0.75
 THRESHOLD_MEDIUM = 0.60
-TIMEOUT_SECONDS = 0.3
+TIMEOUT_SECONDS = float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "2.0"))
 
 # ============================================
 # INTENT DEFINITIONS (7 intents × 5-8 examples)
@@ -60,13 +61,21 @@ INTENT_EXAMPLES: Dict[str, List[str]] = {
         "which is better and why",
         "evaluate these options"
     ],
-    "ui_design": [
+    "ui_strategy": [
         "design a landing page for my startup",
         "create a portfolio website UI",
         "make a hero section with a call to action",
         "build a modern pricing page layout",
-        "design a dashboard UI in HTML and CSS",
-        "generate a marketing website homepage"
+        "generate a marketing website homepage",
+        "create a design system and style guide"
+    ],
+    "ui_implementation": [
+        "build a landing page in html and css",
+        "code a hero section with a call to action",
+        "implement a pricing page layout",
+        "create a dashboard UI in react",
+        "build a navbar and footer in tailwind",
+        "code a marketing homepage with animations"
     ],
     "business": [
         "business strategy advice",
@@ -102,7 +111,8 @@ KEYWORD_RULES: Dict[str, List[str]] = {
     "coding_simple": ["explain", "what does", "example", "how to", "basic", "simple"],
     "coding_complex": ["debug", "fix", "error", "failing", "optimize", "refactor", "design", "architecture"],
     "analysis_internal": ["why", "compare", "analyze", "pros", "cons", "better", "evaluate", "which"],
-    "ui_design": ["landing page", "hero section", "portfolio", "ui", "ux", "design system", "wireframe", "mockup", "pricing page", "marketing page", "website design", "navbar", "cta", "color palette"],
+    "ui_strategy": ["landing page", "hero section", "portfolio", "ui", "ux", "design system", "wireframe", "mockup", "pricing page", "marketing page", "website design", "color palette", "style guide", "brand"],
+    "ui_implementation": ["html", "css", "tailwind", "react", "component", "implement", "build", "code", "frontend", "jsx", "responsive", "animation"],
     "business": ["business", "startup", "strategy", "revenue", "pricing", "market", "growth"],
     "web_factual": ["latest", "today", "current", "now", "recent", "news", "price", "weather"],
     "web_analysis": ["trend", "predict", "impact", "changes", "situation", "happening"]
@@ -116,7 +126,8 @@ INTENT_ROUTES: Dict[str, Dict] = {
     "coding_simple": {"needs_web": False, "needs_reasoning": False, "model": "qwen"},
     "coding_complex": {"needs_web": False, "needs_reasoning": True, "model": "qwen"},
     "analysis_internal": {"needs_web": False, "needs_reasoning": True, "model": "gemini"},
-    "ui_design": {"needs_web": False, "needs_reasoning": False, "model": "gemini"},
+    "ui_strategy": {"needs_web": False, "needs_reasoning": False, "model": "gemini"},
+    "ui_implementation": {"needs_web": False, "needs_reasoning": False, "model": "qwen"},
     "business": {"needs_web": False, "needs_reasoning": False, "model": "openai"},
     "web_factual": {"needs_web": True, "needs_reasoning": False, "model": "gemini"},
     "web_analysis": {"needs_web": True, "needs_reasoning": True, "model": "gemini"}
@@ -276,6 +287,8 @@ Rules:
 - coding_simple: basic code questions, explanations
 - coding_complex: debugging, optimization, system design  
 - analysis_internal: comparisons, evaluations, pros/cons
+- ui_strategy: UI/UX strategy, layout, design direction (no code required)
+- ui_implementation: implement UI in code (HTML/CSS/JS/React/etc)
 - business: strategy, startup, revenue questions
 - web_factual: current events, prices, weather, news
 - web_analysis: trend analysis, predictions, market analysis
@@ -311,42 +324,42 @@ Reply with ONLY the intent name, nothing else."""
 async def load_intent_embeddings() -> bool:
     """Load embeddings from Firestore into memory cache (Non-blocking)."""
     global _intent_cache, _cache_loaded
-    
+
     if _cache_loaded:
         return True
-    
+
     try:
         db = get_firestore_db()
         if not db:
             print("[Embedding] Firestore not available")
             return False
-        
+
         def _fetch_sync():
             """Synchronous Firestore fetching to run in thread"""
             cache_data = {}
-            for intent in INTENT_EXAMPLES.keys():
-                try:
-                    doc = db.collection('intent_embeddings').document(intent).get()
-                    if doc.exists:
-                        data = doc.to_dict()
-                        cache_data[intent] = data.get('examples', [])
-                except Exception as ex:
-                    print(f"[Embedding] Failed to fetch {intent}: {ex}")
+            try:
+                for doc in db.collection("intent_embeddings").stream():
+                    data = doc.to_dict() or {}
+                    examples = data.get("examples", [])
+                    if examples:
+                        cache_data[doc.id] = examples
+            except Exception as ex:
+                print(f"[Embedding] Failed to stream embeddings: {ex}")
             return cache_data
 
         # Run blocking I/O in a separate thread
         import asyncio
         fetched_cache = await asyncio.to_thread(_fetch_sync)
-        
+
         if fetched_cache:
             _intent_cache.update(fetched_cache)
             _cache_loaded = True
             print(f"[Embedding] Loaded {len(_intent_cache)} intents into cache")
             return True
-        
+
         print("[Embedding] No embeddings found in Firestore")
         return False
-        
+
     except Exception as e:
         print(f"[Embedding] Error loading embeddings: {e}")
         return False

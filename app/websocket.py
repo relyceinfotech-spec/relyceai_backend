@@ -20,6 +20,7 @@ from app.chat.context import (
     get_raw_message_count
 )
 from app.chat.history import save_message_to_firebase
+from app.rate_limit import check_rate_limit
 
 class ConnectionManager:
     """
@@ -257,9 +258,16 @@ async def handle_websocket_message(
 
     if not content.strip():
         return
+
+    if not check_rate_limit(user_id):
+        await manager.send_personal_message(
+            json.dumps({"type": "error", "content": "Rate limit exceeded (30 req/min). Try again later."}),
+            websocket
+        )
+        return
     
     # Clear any previous stop flag
-        manager.clear_stop_flag(chat_key)
+    manager.clear_stop_flag(chat_key)
     
     # Notify all devices - processing started (IMMEDIATE FEEDBACK)
     await manager.broadcast_to_chat(
@@ -284,8 +292,12 @@ async def handle_websocket_message(
         )
         return
     
-    # Get context for LLM
-    context_messages = get_context_for_llm(user_id, chat_id)
+    resolved_personality_id = personality_id
+    if personality and not resolved_personality_id:
+        resolved_personality_id = personality.get("id")
+
+    # Get context for LLM (personality-aware)
+    context_messages = get_context_for_llm(user_id, chat_id, resolved_personality_id)
     
     # Stream response to all connected devices
     full_response = ""
@@ -326,11 +338,11 @@ async def handle_websocket_message(
         )
         
         # Update context with this exchange
-        update_context_with_exchange(user_id, chat_id, content, full_response)
+        update_context_with_exchange(user_id, chat_id, content, full_response, resolved_personality_id)
         
         # Save to Firebase (async, don't block)
-        save_message_to_firebase(user_id, chat_id, "user", content)
-        save_message_to_firebase(user_id, chat_id, "assistant", full_response)
+        save_message_to_firebase(user_id, chat_id, "user", content, resolved_personality_id)
+        save_message_to_firebase(user_id, chat_id, "assistant", full_response, resolved_personality_id)
         
         # =========================================================================
         # Post-Processing: Context Summarization (Deferred to improve latency)
@@ -341,7 +353,7 @@ async def handle_websocket_message(
                 print(f"[WS] Triggering background summarization for {chat_id}")
                 # 1. Get messages to summarize (everything except last N)
                 # We access via get_context_for_llm which returns [System, ...Raw]
-                current_context = get_context_for_llm(user_id, chat_id)
+                current_context = get_context_for_llm(user_id, chat_id, resolved_personality_id)
                 raw_msgs = [m for m in current_context if m['role'] != 'system']
                 
                 # 2. Split
