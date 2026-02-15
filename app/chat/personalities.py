@@ -7,8 +7,29 @@ import uuid
 from app.auth import get_firestore_db
 from app.llm.router import DEFAULT_PERSONA
 from app.chat.user_profile import get_user_settings
+from app.config import MAX_PERSONALITY_PROMPT_CHARS, MAX_PERSONALITY_NAME_CHARS, MAX_PERSONALITY_DESC_CHARS
 
 VALID_CONTENT_MODES = {"hybrid", "web_search", "llm_only"}
+
+
+def _validate_personality_fields(name: str, description: str, prompt: str) -> tuple[str, str, str]:
+    safe_name = (name or "").strip()
+    if not safe_name:
+        raise ValueError("Personality name is required")
+    if len(safe_name) > MAX_PERSONALITY_NAME_CHARS:
+        safe_name = safe_name[:MAX_PERSONALITY_NAME_CHARS]
+
+    safe_desc = (description or "").strip()
+    if len(safe_desc) > MAX_PERSONALITY_DESC_CHARS:
+        safe_desc = safe_desc[:MAX_PERSONALITY_DESC_CHARS]
+
+    safe_prompt = (prompt or "").strip()
+    if not safe_prompt:
+        raise ValueError("Personality prompt is required")
+    if len(safe_prompt) > MAX_PERSONALITY_PROMPT_CHARS:
+        raise ValueError(f"Personality prompt too long (max {MAX_PERSONALITY_PROMPT_CHARS} chars)")
+
+    return safe_name, safe_desc, safe_prompt
 
 
 def _get_relyce_behavior_mode(user_id: str) -> Optional[str]:
@@ -182,7 +203,10 @@ def create_custom_personality(user_id: str, name: str, description: str, prompt:
     valid_modes = ["hybrid", "web_search", "llm_only"]
     if content_mode not in valid_modes:
         content_mode = "hybrid"
-    
+
+    # Validate personality fields
+    name, description, prompt = _validate_personality_fields(name, description, prompt)
+
     try:
         db = get_firestore_db()
         if not db:
@@ -252,7 +276,10 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
     valid_modes = ["hybrid", "web_search", "llm_only"]
     if content_mode not in valid_modes:
         content_mode = "hybrid"
-    
+
+    # Validate personality fields
+    name, description, prompt = _validate_personality_fields(name, description, prompt)
+
     # Explicit check for system locked
     if any(p['id'] == personality_id for p in SYSTEM_PERSONALITIES):
         return False

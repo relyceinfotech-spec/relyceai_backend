@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from app.auth import get_firestore_db, get_current_user, get_claim_role
 from datetime import datetime, timezone
 import threading
+from firebase_admin import firestore
 
 router = APIRouter()
 _id_lock = threading.Lock()
@@ -16,64 +17,87 @@ def check_membership_expiry(user_ref, user_data, uid):
     SAFE: Never downgrades if date is missing or invalid.
     """
     membership = user_data.get("membership")
-    
+
     # 1. Safety Checks
     if not membership:
         return
-        
+
     current_plan = membership.get("plan", "free")
     if current_plan == "free":
         return
 
-    expiry_value = membership.get("expiryDate") # Using expiryDate as per frontend schema
+    expiry_value = membership.get("expiryDate")  # Using expiryDate as per frontend schema
     if not expiry_value:
-        return # Skip if no expiry date (e.g. lifetime/unknown)
+        return  # Skip if no expiry date (e.g. lifetime/unknown)
 
-    # 2. Expiry Logic
+    def _parse_expiry(value):
+        if hasattr(value, "to_datetime"):
+            return value.to_datetime()
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
     try:
-        # Parse stored date. Accept ISO strings and Firestore Timestamps.
-        if hasattr(expiry_value, "to_datetime"):
-            expiry_date = expiry_value.to_datetime()
-        elif isinstance(expiry_value, datetime):
-            expiry_date = expiry_value
-        else:
-            expiry_date = datetime.fromisoformat(str(expiry_value).replace('Z', '+00:00'))
-        
-        # If naive (no timezone), force it to UTC
+        expiry_date = _parse_expiry(expiry_value)
         if expiry_date.tzinfo is None:
-             expiry_date = expiry_date.replace(tzinfo=timezone.utc)
-        
-        # Get current time in UTC
-        now = datetime.now(timezone.utc) 
-        
-        # Debug Log (Helpful to see why users are expiring)
+            expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
         print(f"[Users] Expiry Check {uid}: Now={now} vs Expiry={expiry_date}")
 
-        if now > expiry_date:
-            print(f"[Users] Expiry: Downgrading user {uid} from {current_plan} to free. (Expired at {expiry_date})")
-            
-            # 3. Downgrade & Log
+        if now <= expiry_date:
+            return
+
+        db = get_firestore_db()
+        if not db:
+            return
+
+        @firestore.transactional
+        def _expire_membership(transaction):
+            snap = user_ref.get(transaction=transaction)
+            if not snap.exists:
+                return False
+            data = snap.to_dict() or {}
+            membership_current = data.get("membership") or {}
+            plan_current = membership_current.get("plan", "free")
+            if plan_current == "free":
+                return False
+            expiry_current = membership_current.get("expiryDate")
+            if not expiry_current:
+                return False
+
+            try:
+                expiry_current_dt = _parse_expiry(expiry_current)
+                if expiry_current_dt.tzinfo is None:
+                    expiry_current_dt = expiry_current_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                return False
+
+            if datetime.now(timezone.utc) <= expiry_current_dt:
+                return False
+
             updates = {
                 "membership.plan": "free",
                 "membership.planName": "Free",
                 "membership.status": "expired",
-                "membership.isExpired": True, 
-                "membership.updatedAt": datetime.now(timezone.utc)
+                "membership.isExpired": True,
+                "membership.updatedAt": datetime.now(timezone.utc),
             }
-            user_ref.update(updates)
-            
-            # Audit Log
-            db = get_firestore_db()
-            db.collection("auditLogs").add({
+            transaction.update(user_ref, updates)
+
+            audit_ref = db.collection("auditLogs").document()
+            transaction.set(audit_ref, {
                 "action": "MEMBERSHIP_CHANGED",
-                "from": current_plan,
+                "from": plan_current,
                 "to": "free",
                 "reason": "expiry",
                 "by": "system",
                 "target": uid,
-                "timestamp": datetime.now(timezone.utc)
+                "timestamp": datetime.now(timezone.utc),
             })
-            
+            return True
+
+        _expire_membership(db.transaction())
     except Exception as e:
         print(f"[Users] Expiry check failed for {uid}: {e}")
 
@@ -115,41 +139,37 @@ def infer_plan_from_membership(membership: dict) -> str:
 def generate_unique_id(db):
     """
     Generates a unique ID like RA001, RA002 using a Firestore counter.
-    Uses simple get/set with lock instead of transaction (which can fail on named DBs).
+    Uses atomic Firestore Increment for race-condition-safe ID generation.
     """
     counter_ref = db.collection('counters').document('userIds')
     
-    with _id_lock:  # Thread safety within this instance
-        try:
-            # Get current counter
-            counter_doc = counter_ref.get()
-            
-            if counter_doc.exists:
-                current_id = counter_doc.to_dict().get("currentId", 0)
+    try:
+        @firestore.transactional
+        def _increment_counter_transaction(transaction):
+            doc = counter_ref.get(transaction=transaction)
+            current_id = 0
+            if doc.exists:
+                current_id = doc.to_dict().get("currentId", 0)
                 if not isinstance(current_id, int):
                     current_id = int(current_id) if current_id else 0
-                new_id = current_id + 1
-            else:
-                new_id = 1
-            
-            # Update counter
-            counter_ref.set({
+            new_id = current_id + 1
+            transaction.set(counter_ref, {
                 "currentId": new_id,
                 "lastUpdated": datetime.now(timezone.utc)
             }, merge=True)
-            
-            result_id = f"RA{new_id:03d}"
-            print(f"[Users] Generated ID: {result_id}")
-            return result_id
-            
-        except Exception as e:
-            print(f"[Users] ID Generation error: {e}")
-            # Fallback: Just use a timestamp-based random ID to prevent blocking user creation
-            # The previous "scan all users" fallback was too dangerous/slow.
-            import random
-            fallback_id = f"RA{int(datetime.now().timestamp())}{random.randint(10,99)}"
-            print(f"[Users] Using fallback timestamp ID: {fallback_id}")
-            return fallback_id
+            return new_id
+        
+        new_id = _increment_counter_transaction(db.transaction())
+        result_id = f"RA{new_id:03d}"
+        print(f"[Users] Generated ID: {result_id}")
+        return result_id
+        
+    except Exception as e:
+        print(f"[Users] ID Generation error: {e}")
+        import random
+        fallback_id = f"RA{int(datetime.now().timestamp())}{random.randint(10,99)}"
+        print(f"[Users] Using fallback timestamp ID: {fallback_id}")
+        return fallback_id
 
 
 @router.post("/init")
@@ -157,6 +177,7 @@ async def init_user(user_info: dict = Depends(get_current_user)):
     """
     Initialize a user's role if it's missing.
     Guarantees 'role': 'user' exists.
+    ALWAYS returns uniqueUserId.
     """
     uid = user_info["uid"]
     email = user_info.get("email")
@@ -172,9 +193,6 @@ async def init_user(user_info: dict = Depends(get_current_user)):
             user_data = doc.to_dict()
             updates = {}
             
-            # HARDENING: For existing users, only FILL IN missing defaults.
-            # Never overwrite existing role or membership values.
-
             if not user_data.get("uniqueUserId"):
                 new_unique_id = generate_unique_id(db)
                 print(f"[Users] Init: Assigning new ID {new_unique_id} to {uid} (field missing)")
@@ -201,29 +219,22 @@ async def init_user(user_info: dict = Depends(get_current_user)):
 
             if updates:
                 user_ref.update(updates)
-                # Re-fetch user_data if we updated it, to ensure expiry check uses fresh data
-                # BUT: updates variable only has partial keys. 
-                # Simplest: Update user_data dict locally for the check
                 user_data.update(updates)
                 
-            # --- EXPIRY CHECK ---
-            # Disabled in /users/init to avoid accidental downgrades.
+            final_unique_id = user_data.get("uniqueUserId") or updates.get("uniqueUserId")
+            if not final_unique_id:
+                new_id = generate_unique_id(db)
+                user_ref.update({"uniqueUserId": new_id})
+                final_unique_id = new_id
+                print(f"[Users] Init: Emergency ID assignment {new_id} to {uid}")
 
-            if updates:
-                return {
-                    "success": True,
-                    "status": "updated",
-                    "updates": list(updates.keys()),
-                    "uniqueUserId": updates.get("uniqueUserId") or user_data.get("uniqueUserId")
-                }
-            else:
-                 return {
-                     "success": True,
-                     "status": "already_has_role_and_membership",
-                     "uniqueUserId": user_data.get("uniqueUserId")
-                 }
+            return {
+                "success": True,
+                "status": "updated" if updates else "already_initialized",
+                "updates": list(updates.keys()) if updates else [],
+                "uniqueUserId": final_unique_id
+            }
         else:
-            # If user doc doesn't exist, create it with default role, membership AND ID
             print(f"[Users] Init: Creating new user doc for {uid}")
             
             new_unique_id = generate_unique_id(db)
@@ -250,6 +261,19 @@ async def init_user(user_info: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"[Users] Init error for {uid}: {e}")
         raise HTTPException(status_code=500, detail="Failed to initialize user")
+
+@router.get("/me")
+async def get_me(user_info: dict = Depends(get_current_user)):
+    """
+    Return the authenticated user's profile document.
+    """
+    uid = user_info["uid"]
+    db = get_firestore_db()
+    user_ref = db.collection("users").document(uid)
+    doc = user_ref.get()
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    return {"success": True, "user": doc.to_dict()}
 
 
 @router.post("/membership/downgrade")

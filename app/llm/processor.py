@@ -7,7 +7,7 @@ import json
 import re
 from typing import AsyncGenerator, List, Dict, Any, Optional
 from openai import OpenAI
-from app.config import OPENAI_API_KEY, LLM_MODEL, GEMINI_MODEL, CODING_MODEL, ERNIE_THINKING_MODEL
+from app.config import OPENAI_API_KEY, LLM_MODEL, GEMINI_MODEL, CODING_MODEL, UI_MODEL, REASONING_EFFORT, ERNIE_THINKING_MODEL
 from app.llm.router import (
     select_tools_for_mode,
     analyze_and_route_query,
@@ -22,6 +22,7 @@ from app.llm.router import (
     get_openrouter_client,
 )
 from app.llm.routing_log import log_routing_decision
+from app.llm.guards import normalize_user_query, build_guard_system_messages
 
 TEMPERATURE_MAP = {
     "general": 0.65,
@@ -47,10 +48,31 @@ LOGIC_CODING_INTENTS = {
     "ui_react",
 }
 
+UI_SUB_INTENTS = {
+    "ui_implementation",
+    "ui_demo_html",
+    "ui_react",
+}
+
 CREATIVE_INTENTS = {
     "content_creation",
     "ui_design",
     "ui_strategy",
+}
+
+REASONING_SUB_INTENTS = {
+    "coding_simple",
+    "code_explanation",
+    "coding_complex",
+    "debugging",
+    "system_design",
+    "sql",
+    "ui_implementation",
+    "ui_demo_html",
+    "ui_react",
+    "ui_design",
+    "ui_strategy",
+    "reasoning",
 }
 
 # ============================================
@@ -95,7 +117,7 @@ def should_use_thinking_model(query: str, sub_intent: str) -> bool:
     query_lower = query.lower()
     
     # Simple intents NEVER need thinking (hard rule)
-    simple_intents = ["casual_chat", "general", "code_explanation", "sql", "content_creation", "ui_design", "ui_demo_html", "ui_react"]
+    simple_intents = ["casual_chat", "general", "code_explanation", "sql", "content_creation", "ui_design", "ui_demo_html", "ui_react", "ui_implementation"]
     if sub_intent in simple_intents:
         return False
     
@@ -136,25 +158,43 @@ def _resolve_temperature(personality: Optional[Dict], fallback_specialty: str = 
 
 def _get_max_tokens_for_sub_intent(sub_intent: str) -> Optional[int]:
     if sub_intent == "ui_demo_html":
-        return 2200
+        return 3200
     if sub_intent in ["ui_react", "ui_implementation"]:
-        return 2600
+        return 3600
     return None
 
-REASONING_VISIBLE_SUB_INTENTS = {
-    "coding_simple",
-    "code_explanation",
-    "coding_complex",
-    "debugging",
-    "system_design",
-    "sql",
-    "ui_implementation",
-    "ui_demo_html",
-    "ui_react",
-    "ui_design",
-    "ui_strategy",
-    "reasoning",
-}
+
+
+def _get_reasoning_config(sub_intent: str, user_settings: Optional[Dict]) -> Optional[Dict[str, Any]]:
+    """
+    Build OpenRouter reasoning config for coding/UI-heavy generation.
+    Returns None when reasoning should not be requested.
+    """
+    if sub_intent not in REASONING_SUB_INTENTS:
+        return None
+    visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
+    exclude = visibility == "off"
+    effort = (REASONING_EFFORT or "low").lower()
+    allowed = {"xhigh", "high", "medium", "low", "minimal", "none"}
+    if effort not in allowed:
+        effort = "low"
+    if effort == "none":
+        return {"exclude": True}
+    return {"effort": effort, "exclude": exclude, "enabled": True}
+
+
+def _apply_reasoning(create_kwargs: Dict[str, Any], model_to_use: str, sub_intent: str, user_settings: Optional[Dict]) -> None:
+    """Attach OpenRouter reasoning config when applicable."""
+    if model_to_use == LLM_MODEL:
+        return
+    reasoning = _get_reasoning_config(sub_intent, user_settings)
+    if not reasoning:
+        return
+    extra_body = create_kwargs.get("extra_body") or {}
+    extra_body["reasoning"] = reasoning
+    create_kwargs["extra_body"] = extra_body
+
+REASONING_VISIBLE_SUB_INTENTS = REASONING_SUB_INTENTS
 
 def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Optional[Dict] = None) -> bool:
     if mode != "normal":
@@ -167,76 +207,6 @@ def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Opti
     if sub_intent == "casual_chat":
         return False
     return sub_intent in REASONING_VISIBLE_SUB_INTENTS
-
-async def _build_reasoning_summary(
-    thinking_response: str,
-    user_query: str,
-    sub_intent: str,
-    final_response: str | None = None
-) -> str:
-    """
-    Convert internal planning into a short, user-facing reasoning summary.
-    Must NOT reveal chain-of-thought, system/router details, or model info.
-    """
-    if not thinking_response and not final_response:
-        return ""
-
-    prompt = (
-        "Write a user-facing thinking summary (not the answer).\n"
-        "Rules:\n"
-        "- Use 2 to 4 titled sections.\n"
-        "- Format each section as: Title on its own line, then a blank line, then 2-4 sentences.\n"
-        "- Separate sections with a blank line.\n"
-        "- Use first-person planning language (e.g., \"I'm interpreting...\", \"I'm focusing on...\", \"I'll respond by...\").\n"
-        "- Mention the user's intent/tone/context and the response strategy.\n"
-        "- Avoid generic statements like \"The response is ...\"; be specific about intent and approach.\n"
-        "- If the input is casual/greeting, produce exactly 2 sections: \"Acknowledge the Greeting\" and \"Response Plan\".\n"
-        "- Do NOT repeat the assistant's final response or greetings.\n"
-        "- Do NOT quote the user verbatim.\n"
-        "- No bullet lists.\n"
-        "- No preamble (do NOT say 'Here is a summary' or similar).\n"
-        "- Do NOT mention system prompts, routing, embeddings, model selection, temperatures, or other models.\n"
-        "- Do NOT mention tokens, limits, or internal tooling.\n"
-        "- Keep it concise and helpful.\n\n"
-        f"User request: {user_query}\n\n"
-        f"Internal plan (do not reveal directly):\n{thinking_response}\n\n"
-        f"Final response excerpt:\n{(final_response or '')[:1200]}\n"
-    )
-
-    try:
-        client = get_openrouter_client()
-        response = await client.chat.completions.create(
-            model=GEMINI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=260,
-            temperature=0.2
-        )
-        content = response.choices[0].message.content.strip()
-        # Strip common preambles if the model still adds them
-        content = re.sub(r"^(Here(?:'s| is).+?:)\s*\n+", "", content, flags=re.IGNORECASE)
-        # Remove bullet markers if they appear
-        content = re.sub(r"^(?:[-*]\s+)", "", content, flags=re.MULTILINE)
-        # Remove model-name preambles if they appear
-        content = re.sub(r"^Gemini.*$\n?", "", content, flags=re.IGNORECASE | re.MULTILINE)
-        # Remove generic summary sentences that just restate the output
-        content = re.sub(r"^(The response is|It expresses|It prompts|It provides|This response).*$", "", content, flags=re.IGNORECASE | re.MULTILINE)
-        # Remove lines that echo the final response
-        if final_response:
-            fr_lower = final_response.lower()
-            cleaned_lines = []
-            for line in content.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    cleaned_lines.append(line)
-                    continue
-                if len(stripped) > 6 and stripped.lower() in fr_lower:
-                    continue
-                cleaned_lines.append(line)
-            content = "\n".join(cleaned_lines)
-        return content.strip()
-    except Exception:
-        return ""
-
 
 def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict] = None, query: str = "") -> Tuple[str, str, Optional[float], bool, str]:
     """
@@ -262,6 +232,8 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
 
     # Coding Buddy: always use the coding model (optionally allow thinking for complex tasks)
     if personality and (personality.get("id") == "coding_buddy" or personality.get("name") == "Coding Buddy"):
+        if sub_intent in UI_SUB_INTENTS:
+            return ("openrouter", UI_MODEL, 0.2, False, "coding_buddy_ui_override")
         if sub_intent in CREATIVE_INTENTS:
             return ("openrouter", CODING_MODEL, None, False, "coding_buddy_override")
         if sub_intent in ["debugging", "system_design", "coding_complex"] and needs_thinking:
@@ -272,6 +244,10 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     # System-design override (explicit priority)
     if sub_intent == "system_design":
         return ("openrouter", CODING_MODEL, None, False, "system_design_override")
+
+    # UI intents: prefer stronger UI model with lower temperature
+    if sub_intent in UI_SUB_INTENTS:
+        return ("openrouter", UI_MODEL, 0.2, False, "ui_override")
 
     # Coding intents: use coding model, allow thinking for complex debugging/system design
     if sub_intent in LOGIC_CODING_INTENTS:
@@ -311,6 +287,22 @@ class LLMProcessor:
     def __init__(self):
         self.model = LLM_MODEL
 
+    @staticmethod
+    def _inject_guard_messages(messages: List[Dict], user_query: Optional[str]) -> List[Dict]:
+        guards = build_guard_system_messages(user_query or "")
+        if not guards or not messages:
+            return messages
+        guarded = list(messages)
+        insert_at = next((i for i, m in enumerate(guarded) if m.get("role") == "user"), len(guarded))
+        for guard in reversed(guards):
+            guarded.insert(insert_at, {"role": "system", "content": guard})
+        return guarded
+
+    def _guard_kwargs(self, kwargs: Dict[str, Any], user_query: Optional[str]) -> Dict[str, Any]:
+        if "messages" in kwargs:
+            kwargs["messages"] = self._inject_guard_messages(kwargs["messages"], user_query)
+        return kwargs
+
     def _get_sampling(self, personality: Optional[Dict], sub_intent: Optional[str] = None) -> Dict[str, Any]:
         """
         Backend-side authority: clamp and cap temperature and add specialty-based sampling hints.
@@ -329,10 +321,13 @@ class LLMProcessor:
 
         is_creative_intent = sub_intent in CREATIVE_INTENTS if sub_intent else False
         is_logic_coding_intent = sub_intent in LOGIC_CODING_INTENTS if sub_intent else False
+        is_ui_intent = sub_intent in UI_SUB_INTENTS if sub_intent else False
 
         # Hard caps for safety-critical domains
         if specialty == "legal":
             temp = min(temp, 0.3)
+        elif is_ui_intent:
+            temp = min(temp, 0.2)
         elif is_logic_coding_intent or (specialty == "coding" and not is_creative_intent):
             temp = min(temp, 0.3)
 
@@ -348,18 +343,53 @@ class LLMProcessor:
 
         return sampling
     
-    def _sanitize_output_text(self, text: str) -> str:
+    def _sanitize_output_text(self, text: str, allow_double_hyphen: bool = False) -> str:
         """
         Normalize punctuation to avoid em-dashes/double-hyphen in outputs.
+        Also unescapes HTML entities to ensure code renders correctly.
         """
         if not text:
             return text
-        # Replace em dash and en dash with a simple hyphen
-        sanitized = text.replace("—", " - ").replace("–", " - ")
-        # Reduce double-hyphen to single hyphen spacing
-        sanitized = sanitized.replace("--", " - ")
+            
+        import html
+        text = html.unescape(text)
+        
+        sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
+        sanitized = sanitized.replace("—", " - ").replace("–", " - ")
+
         return sanitized
     
+    def _fix_html_css_output(self, text: str) -> str:
+        if not text:
+            return text
+        content = text
+        
+        content = re.sub(r'<!\s*-\s*-', '<!--', content)
+        content = re.sub(r'-\s*-\s*>', '-->', content)
+        content = re.sub(r'<!\s*-\s*-\s*\[', '<!--[', content)
+        content = re.sub(r'\]\s*-\s*-\s*>', ']-->', content)
+        
+        def fix_css_property(match):
+            indent = match.group(1)
+            name = match.group(2)
+            return f'{indent}--{name}:'
+        content = re.sub(r'(\n\s*)-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
+        content = re.sub(r'(\s{2,})-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
+        
+        content = re.sub(r'var\s*\(\s*-\s+', 'var(--', content)
+        content = re.sub(r'var\s*\(\s*-\s*-\s*', 'var(--', content)
+        
+        content = re.sub(r'--\s+([a-zA-Z])', r'--\1', content)
+        content = re.sub(r'--([a-zA-Z][a-zA-Z0-9-]*)\s+([a-zA-Z])', r'--\1\2', content)
+        
+        content = content.replace("group: card;", "")
+        content = content.replace("group: ;", "")
+        
+        if "line-clamp:" not in content and "-webkit-line-clamp:" in content:
+            content = re.sub(r'(\s*)-webkit-line-clamp:\s*([0-9]+);', r'\1line-clamp: \2;\n\1-webkit-line-clamp: \2;', content)
+        
+        return content
+
     async def summarize_context(self, messages: List[Dict], existing_summary: str = "") -> str:
         """
         Summarize a list of messages into a concise context string.
@@ -379,14 +409,16 @@ class LLMProcessor:
         
         prompt_content += (
             "INSTRUCTIONS:\n"
-            "Update the summary to include the new messages. \n"
-            "Summarize the conversation into 5–7 bullet points.\n"
-            "Preserve:\n"
-            "- Technical decisions\n"
-            "- User intent\n"
-            "- Constraints (privacy, admin rules)\n"
-            "- Important entities (Firestore, Redis, etc.)\n"
-            "Do NOT add new info. Keep it concise."
+            "Update the structured memory using the new messages.\n"
+            "Output must use EXACTLY these sections in this order:\n"
+            "### User Constraints\n"
+            "### Code Entities\n"
+            "### Decisions Made\n"
+            "### Open Tasks\n"
+            "### Important Assumptions\n"
+            "Under each heading, use bullet points. If no items, write 'None'.\n"
+            "Keep items short. Preserve names of functions/classes/files/APIs exactly as seen.\n"
+            "Do NOT add new info. Do NOT include any other text."
         )
         
         try:
@@ -413,6 +445,7 @@ class LLMProcessor:
         Handle internal queries (greetings, math, code, logic).
         Now supports PERSONALITY customization.
         """
+        user_query = normalize_user_query(user_query)
         if personality:
             system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, mode=mode)
         else:
@@ -429,14 +462,16 @@ class LLMProcessor:
             
         # Check for Coding Buddy override
         model_to_use = self.model
-        if sub_intent in LOGIC_CODING_INTENTS:
+        if sub_intent in UI_SUB_INTENTS:
+            model_to_use = UI_MODEL
+        elif sub_intent in LOGIC_CODING_INTENTS:
             model_to_use = CODING_MODEL
         if personality and personality.get("id") == "coding_buddy":
-            model_to_use = CODING_MODEL
-            print(f"[LLM] ⚡ Switching to {model_to_use} for Coding Buddy")
+            model_to_use = UI_MODEL if sub_intent in UI_SUB_INTENTS else CODING_MODEL
+            print(f"[LLM] Switching to {model_to_use} for Coding Buddy")
 
         try:
-            reason = "coding_override" if (sub_intent in LOGIC_CODING_INTENTS or (personality and personality.get("id") == "coding_buddy")) else "default_persona_model"
+            reason = "ui_override" if sub_intent in UI_SUB_INTENTS else "coding_override" if (sub_intent in LOGIC_CODING_INTENTS or (personality and personality.get("id") == "coding_buddy")) else "default_persona_model"
             log_routing_decision(user_id, {
                 "intent": "INTERNAL",
                 "sub_intent": sub_intent,
@@ -447,7 +482,7 @@ class LLMProcessor:
         except Exception as e:
             print(f"[RoutingLog] Failed: {e}")
 
-        client = get_openrouter_client() if model_to_use == CODING_MODEL else get_openai_client()
+        client = get_openai_client() if model_to_use == LLM_MODEL else get_openrouter_client()
         create_kwargs = {
             "model": model_to_use,
             "messages": [
@@ -459,8 +494,12 @@ class LLMProcessor:
         if max_tokens:
             create_kwargs["max_tokens"] = max_tokens
         temperature = self._get_temperature(personality)
+        if sub_intent in UI_SUB_INTENTS and temperature is not None:
+            temperature = min(temperature, 0.2)
         if temperature is not None:
             create_kwargs["temperature"] = temperature
+        _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
+        create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
         return self._sanitize_output_text(response.choices[0].message.content)
     
@@ -479,6 +518,7 @@ class LLMProcessor:
         
         Returns: (response, tools_activated)
         """
+        user_query = normalize_user_query(user_query)
         # Select tools based on mode
         selected_tools = await select_tools_for_mode(user_query, mode)
         tools_dict = get_tools_for_mode(mode)
@@ -545,6 +585,8 @@ class LLMProcessor:
         create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
         if temperature is not None:
             create_kwargs["temperature"] = temperature
+        _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
+        create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
         
         return self._sanitize_output_text(response.choices[0].message.content), selected_tools
@@ -562,6 +604,7 @@ class LLMProcessor:
         Main entry point - routes to appropriate handler.
         Returns complete response dict.
         """
+        user_query = normalize_user_query(user_query)
         # Analyze intent using the consolidated router
         analysis = await analyze_and_route_query(user_query, mode, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
@@ -605,6 +648,7 @@ class LLMProcessor:
         Streaming version of process_message.
         Yields tokens as they're generated.
         """
+        user_query = normalize_user_query(user_query)
         import time
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
@@ -664,8 +708,8 @@ class LLMProcessor:
                 mode, sub_intent, personality, user_query
             )
 
-            # Gemini does not emit reasoning tokens; suppress thinking panel for Gemini outputs
-            if model_to_use == GEMINI_MODEL:
+            # Suppress thinking panel when no reasoning is requested for Gemini
+            if model_to_use == GEMINI_MODEL and not _get_reasoning_config(sub_intent, user_settings):
                 show_reasoning_panel = False
             
             # Track if gating skipped thinking
@@ -740,26 +784,35 @@ class LLMProcessor:
                         "stream": True,
                         "temperature": 0.7
                     }
+                    planning_kwargs = self._guard_kwargs(planning_kwargs, user_query)
                     stream = await client.chat.completions.create(**planning_kwargs)
                 else:
+                    create_kwargs = self._guard_kwargs(create_kwargs, user_query)
                     stream = await client.chat.completions.create(**create_kwargs)
                 
+                # Signal start of thinking to UI
+                yield "[THINKING]"
+
                 async for chunk in stream:
                     if chunk.choices[0].delta.content:
                         content_chunk = chunk.choices[0].delta.content
                         thinking_response += content_chunk
+                        # Stream the thinking content to the UI
+                        yield self._sanitize_output_text(content_chunk)
+                
                 trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
+                
+                # Signal end of thinking
+                yield "[/THINKING]"
 
                 # Pass 2: Generate final output with appropriate model
-                if sub_intent in LOGIC_CODING_INTENTS:
+                if sub_intent in UI_SUB_INTENTS:
+                    output_model = UI_MODEL
+                elif sub_intent in LOGIC_CODING_INTENTS:
                     output_model = CODING_MODEL
                 else:
                     output_model = GEMINI_MODEL
 
-                reasoning_summary = ""
-                if show_reasoning_panel and output_model != GEMINI_MODEL:
-                    reasoning_summary = await _build_reasoning_summary(thinking_response, user_query, sub_intent)
-                
                 trace.model_chain.append(output_model)
                 trace.log("OUTPUT_START", f"model={output_model}")
                 
@@ -793,24 +846,39 @@ class LLMProcessor:
                 }
                 if max_tokens:
                     pass2_kwargs["max_tokens"] = max_tokens
-                
-                stream = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield self._sanitize_output_text(chunk.choices[0].delta.content)
-                if reasoning_summary:
-                    yield "[THINKING]"
-                    yield self._sanitize_output_text(reasoning_summary)
-                    yield "[/THINKING]"
+                if sub_intent in UI_SUB_INTENTS:
+                    pass2_kwargs["stream"] = False
+                    pass2_kwargs = self._guard_kwargs(pass2_kwargs, user_query)
+                    response = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
+                    response_text = (response.choices[0].message.content or "")
+                    fixed = self._fix_html_css_output(response_text)
+                    sanitized = self._sanitize_output_text(fixed, allow_double_hyphen=True)
+                    for i in range(0, len(sanitized), 800):
+                        yield sanitized[i:i+800]
+                else:
+                    pass2_kwargs = self._guard_kwargs(pass2_kwargs, user_query)
+                    stream = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
+                    async for chunk in stream:
+                        if chunk.choices[0].delta.content:
+                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
             else:
                 # Single-pass: Direct streaming (captures reasoning tokens from models like GLM)
+                if sub_intent in UI_SUB_INTENTS:
+                    create_kwargs["stream"] = False
+                    create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+                    response = await client.chat.completions.create(**create_kwargs)
+                    response_text = (response.choices[0].message.content or "")
+                    fixed = self._fix_html_css_output(response_text)
+                    sanitized = self._sanitize_output_text(fixed, allow_double_hyphen=True)
+                    for i in range(0, len(sanitized), 800):
+                        yield sanitized[i:i+800]
+                    return
+                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
                 stream = await client.chat.completions.create(**create_kwargs)
+
                 print(f"[LATENCY] Internal: Stream Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
                 
                 emit_raw_reasoning = show_reasoning_panel
-                collect_for_summary = show_reasoning_panel and not emit_raw_reasoning
-                response_chunks: List[str] = [] if collect_for_summary else []
-                reasoning_chunks: List[str] = [] if collect_for_summary else []
                 in_reasoning = False
                 allow_reasoning_tokens = show_reasoning_panel
                 async for chunk in stream:
@@ -818,19 +886,31 @@ class LLMProcessor:
                     
                     # Check for GLM/model built-in reasoning tokens
                     if allow_reasoning_tokens:
+                        reasoning_chunks_to_emit = []
                         reasoning = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
                         if reasoning:
-                            if emit_raw_reasoning:
-                                if not in_reasoning:
-                                    in_reasoning = True
-                                    trace.log("REASONING_START", f"model={model_to_use} (built-in)")
-                                    yield "[THINKING]"
-                                yield self._sanitize_output_text(reasoning)
-                            else:
-                                reasoning_chunks.append(reasoning)
-                                if not in_reasoning:
-                                    in_reasoning = True
-                                    trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+                            reasoning_chunks_to_emit.append(reasoning)
+                        details = getattr(delta, 'reasoning_details', None)
+                        if details:
+                            for item in details:
+                                if isinstance(item, dict):
+                                    text_part = item.get("text") or item.get("summary")
+                                else:
+                                    text_part = getattr(item, "text", None) or getattr(item, "summary", None)
+                                if text_part:
+                                    reasoning_chunks_to_emit.append(text_part)
+                        if reasoning_chunks_to_emit:
+                            for reasoning in reasoning_chunks_to_emit:
+                                if emit_raw_reasoning:
+                                    if not in_reasoning:
+                                        in_reasoning = True
+                                        trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+                                        yield "[THINKING]"
+                                    yield self._sanitize_output_text(reasoning)
+                                else:
+                                    if not in_reasoning:
+                                        in_reasoning = True
+                                        trace.log("REASONING_START", f"model={model_to_use} (built-in)")
                     
                     # Regular content
                     if delta.content:
@@ -840,8 +920,6 @@ class LLMProcessor:
                             if emit_raw_reasoning:
                                 yield "[/THINKING]"
                         sanitized_chunk = self._sanitize_output_text(delta.content)
-                        if collect_for_summary:
-                            response_chunks.append(sanitized_chunk)
                         yield sanitized_chunk
                 
                 # Close reasoning if stream ended during reasoning
@@ -849,23 +927,6 @@ class LLMProcessor:
                     trace.log("REASONING_COMPLETE", "built-in reasoning done")
                     if emit_raw_reasoning:
                         yield "[/THINKING]"
-
-                if collect_for_summary and response_chunks:
-                    final_response = "".join(response_chunks).strip()
-                    if final_response:
-                        reasoning_text = "".join(reasoning_chunks).strip()
-                        if reasoning_text:
-                            reasoning_summary = await _build_reasoning_summary(
-                                reasoning_text, user_query, sub_intent, final_response
-                            )
-                        else:
-                            reasoning_summary = await _build_reasoning_summary(
-                                "", user_query, sub_intent, final_response
-                            )
-                        if reasoning_summary:
-                            yield "[THINKING]"
-                            yield self._sanitize_output_text(reasoning_summary)
-                            yield "[/THINKING]"
         else:
             # External Mode with Tools
             tools_dict = get_tools_for_mode(mode)
@@ -992,6 +1053,8 @@ class LLMProcessor:
                 create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
                 if final_temp is not None:
                     create_kwargs["temperature"] = final_temp
+                _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
+                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
                 stream = await client.chat.completions.create(**create_kwargs)
                 
                 async for chunk in stream:
@@ -1018,17 +1081,24 @@ class LLMProcessor:
                 }
 
                 thinking_response = ""
+                
+                # Signal start of thinking
+                yield "[THINKING]"
+                
+                thinking_kwargs = self._guard_kwargs(thinking_kwargs, user_query)
                 thinking_stream = await get_openrouter_client().chat.completions.create(**thinking_kwargs)
                 async for chunk in thinking_stream:
                     if chunk.choices[0].delta.content:
                         content_chunk = chunk.choices[0].delta.content
                         thinking_response += content_chunk
+                        # Stream thinking content
+                        yield self._sanitize_output_text(content_chunk)
+                        
                 trace_ext.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
-
-                reasoning_summary = ""
-                if show_reasoning_panel and final_model != GEMINI_MODEL:
-                    reasoning_summary = await _build_reasoning_summary(thinking_response, user_query, sub_intent)
                 
+                # Signal end of thinking
+                yield "[/THINKING]"
+
                 # Pass 2: Final model synthesizes the answer
                 trace_ext.model_chain.append(final_model)
                 trace_ext.log("SYNTHESIS_START", f"Final model synthesizing")
@@ -1050,14 +1120,11 @@ class LLMProcessor:
                 if final_temp is not None:
                     synthesis_kwargs["temperature"] = final_temp
                 
+                synthesis_kwargs = self._guard_kwargs(synthesis_kwargs, user_query)
                 stream = await final_client.chat.completions.create(**synthesis_kwargs)
                 async for chunk in stream:
                     if chunk.choices[0].delta.content:
                         yield self._sanitize_output_text(chunk.choices[0].delta.content)
-                if reasoning_summary:
-                    yield "[THINKING]"
-                    yield self._sanitize_output_text(reasoning_summary)
-                    yield "[/THINKING]"
             else:
                 # Simple web search: direct synthesis (no reasoning needed)
                 trace_ext.confidence_gating_skipped = True
@@ -1072,6 +1139,7 @@ class LLMProcessor:
                 create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
                 if final_temp is not None:
                     create_kwargs["temperature"] = final_temp
+                _apply_reasoning(create_kwargs, final_model, sub_intent, user_settings)
                 stream = await final_client.chat.completions.create(**create_kwargs)
                 
                 async for chunk in stream:

@@ -107,9 +107,9 @@ async def update_membership(request: UpdateMembershipRequest, user_info: dict = 
         raise HTTPException(status_code=404, detail="Target user not found")
 
     now = datetime.now(timezone.utc)
-    # Calculate expiry
+    # Calculate expiry - use timedelta to avoid leap year edge case with replace(year=...)
     if request.billing_cycle == "yearly":
-        expiry_date = now.replace(year=now.year + 1)
+        expiry_date = now + timedelta(days=365)
     else:
         expiry_date = now + timedelta(days=30)
 
@@ -156,17 +156,69 @@ async def update_membership(request: UpdateMembershipRequest, user_info: dict = 
 
     return {"success": True, "message": "Membership updated"}
 
-
-@router.delete("/users/{target_uid}")
-async def delete_user(target_uid: str, user_info: dict = Depends(require_admin)):
+@router.get("/users/{target_uid}")
+async def get_user(target_uid: str, user_info: dict = Depends(require_admin)):
     """
-    Admin-only user deletion through backend.
+    Admin-only user fetch (server-side Firestore read).
     """
     db = get_firestore_db()
     target_ref = db.collection("users").document(target_uid)
     target_doc = target_ref.get()
     if not target_doc.exists:
         raise HTTPException(status_code=404, detail="Target user not found")
+    return {"success": True, "user": target_doc.to_dict()}
+
+
+@router.delete("/users/{target_uid}")
+async def delete_user(target_uid: str, hard: bool = False, user_info: dict = Depends(require_admin)):
+    """
+    Admin-only user deletion through backend.
+    Defaults to soft delete unless hard=true is provided.
+    """
+    db = get_firestore_db()
+    target_ref = db.collection("users").document(target_uid)
+    target_doc = target_ref.get()
+    if not target_doc.exists:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    now = datetime.now(timezone.utc)
+
+    # Disable user in Firebase Auth and revoke tokens
+    try:
+        firebase_auth.update_user(target_uid, disabled=True)
+        firebase_auth.revoke_refresh_tokens(target_uid)
+    except Exception as e:
+        print(f"[Admin] Failed to disable user {target_uid}: {e}")
+
+    if not hard:
+        # Soft delete: keep data, mark deleted
+        target_ref.update({
+            "isDeleted": True,
+            "status": "deleted",
+            "deletedAt": now,
+            "deletedBy": user_info["uid"],
+        })
+
+        db.collection("auditLogs").add({
+            "action": "USER_SOFT_DELETED",
+            "by": user_info["uid"],
+            "target": target_uid,
+            "timestamp": now,
+            "time": now.timestamp()
+        })
+
+        return {"success": True, "message": "User soft-deleted"}
+
+    # Hard delete backup
+    try:
+        db.collection("deletedUsers").document(target_uid).set({
+            "data": target_doc.to_dict(),
+            "deletedAt": now,
+            "deletedBy": user_info["uid"],
+            "mode": "hard"
+        }, merge=True)
+    except Exception as e:
+        print(f"[Admin] Failed to backup user {target_uid}: {e}")
 
     # Delete chat sessions and messages
     sessions = db.collection("users").document(target_uid).collection("chatSessions").stream()
@@ -193,16 +245,15 @@ async def delete_user(target_uid: str, user_info: dict = Depends(require_admin))
 
     target_ref.delete()
 
-    now = datetime.now()
     db.collection("auditLogs").add({
-        "action": "USER_DELETED",
+        "action": "USER_HARD_DELETED",
         "by": user_info["uid"],
         "target": target_uid,
         "timestamp": now,
         "time": now.timestamp()
     })
 
-    return {"success": True, "message": "User deleted"}
+    return {"success": True, "message": "User hard-deleted"}
 
 @router.post("/jobs/expire-memberships")
 async def run_expiry_job(user_info: dict = Depends(require_superadmin)):

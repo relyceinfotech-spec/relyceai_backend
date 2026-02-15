@@ -129,6 +129,16 @@ Use this information naturally. Don't repeat it back unless asked.
 
 # Fact extraction patterns (fast regex-based, no LLM needed)
 import re
+import html
+
+def _sanitize_user_input(value: str, max_length: int = 100) -> str:
+    """Sanitize user input to prevent XSS and injection attacks."""
+    if not value:
+        return ""
+    value = str(value).strip()
+    value = re.sub(r'[<>"\'`{}[\]\\]', '', value)
+    value = html.escape(value)
+    return value[:max_length]
 
 FACT_PATTERNS = [
     # Name patterns - case-insensitive for user convenience
@@ -167,9 +177,9 @@ def extract_facts_from_message(message: str) -> Dict:
         match = re.search(pattern, message_lower, re.IGNORECASE)
         if match:
             value = match.group(1).strip()
-            # Capitalize names properly
             if fact_type in ['name', 'location']:
                 value = value.title()
+                value = _sanitize_user_input(value, max_length=50)
             facts[fact_type] = value
     
     return facts

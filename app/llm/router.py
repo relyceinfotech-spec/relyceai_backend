@@ -6,11 +6,14 @@ Imports logic from existing Python files
 import json
 import re
 import requests
+import time
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
+from app.llm.guards import normalize_user_query, build_guard_system_messages
 from app.config import (
     OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS,
-    OPENROUTER_API_KEY, GEMINI_MODEL, ERNIE_THINKING_MODEL
+    OPENROUTER_API_KEY, GEMINI_MODEL, ERNIE_THINKING_MODEL,
+    SERPER_CONNECT_TIMEOUT, SERPER_READ_TIMEOUT, SERPER_MAX_RETRIES, SERPER_RETRY_BACKOFF
 )
 
 # Initialize clients lazily
@@ -22,7 +25,10 @@ def get_openai_client() -> AsyncOpenAI:
     if _client is None:
         if not OPENAI_API_KEY:
              raise RuntimeError("OPENAI_API_KEY not set")
-        _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        _client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            timeout=600.0
+        )
     return _client
 
 def get_openrouter_client() -> AsyncOpenAI:
@@ -33,7 +39,8 @@ def get_openrouter_client() -> AsyncOpenAI:
             raise RuntimeError("OPENROUTER_API_KEY not set")
         _openrouter_client = AsyncOpenAI(
             api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1"
+            base_url="https://openrouter.ai/api/v1",
+            timeout=600.0
         )
     return _openrouter_client
 
@@ -102,6 +109,9 @@ BASE_FORMATTING_RULES = """
 - **Commands**: One command per line.
 - **Lists**: Ensure list numbers/bullets are strictly aligned.
 - **File Names**: **MUST** use the format `**File: [Name]**` immediately before the code block.
+- **HTML/CSS Validity**: Use valid HTML comments `<!-- comment -->` (no spaces in delimiters).  
+  For CSS custom properties, define `--name` and reference via `var(--name)` only. Never write `color: --name`, `- name:`, or `var( - name)`.  
+  Avoid invalid CSS like `group: card;`. If you use `-webkit-line-clamp`, also include `line-clamp:`.
 
 - **Sources**: If using web tools, list sources at the very bottom: `Source: [Link]`
 - **Title**: Start with a simple text Title if the answer is long.
@@ -235,7 +245,8 @@ Adapt to the user's language and culture naturally:
 **STRICT RULES:**
 - ALWAYS use triple-backticks with language names for code.
 - Be warm and engaging with emojis where appropriate.
-- AVOID using em-dashes (—), double-dashes (--), or underscores (_) in text. Use commas, periods, or spaces instead.
+- AVOID using em-dashes (—), double-dashes (--), or underscores (_) **in prose**. 
+  In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`).
 
 {BASE_FORMATTING_RULES}"""
 
@@ -256,6 +267,9 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     Select relevant tools based on chat mode.
     Imported from existing files.
     """
+    user_query = normalize_user_query(user_query)
+    guard_messages = build_guard_system_messages(user_query)
+
     if mode == "normal":
         tools = NORMAL_TOOLS
         mode_descriptor = "relevant tools"
@@ -265,35 +279,38 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     else:  # deepsearch
         tools = DEEPSEARCH_TOOLS
         mode_descriptor = "top 3-5 tools for comprehensive research"
-    
+
     tools_list = ", ".join(tools.keys())
-    
+
     if mode == "deepsearch":
-        system_prompt = (
-            f"You are a Senior Research Architect. The user wants a 'Deep Search' on: '{user_query}'.\n"
-            f"Available Tools: [{tools_list}]\n"
-            "Select the top 3-5 tools that will provide the most comprehensive, detailed, and varied data.\n"
-            "Rules:\n"
-            "- ALWAYS include 'Search'.\n"
-            "- Include 'News' for current events.\n"
-            "- Include 'Scholar' or 'Patents' ONLY for technical/academic topics.\n"
-            "- Include 'Places'/'Maps' for locations.\n"
-            "Return the tool names as a comma-separated list (e.g., 'Search, News, Videos')."
-        )
+        system_prompt = f"""You are a Senior Research Architect.
+Available Tools: [{tools_list}]
+Select the top 3-5 tools that will provide the most comprehensive, detailed, and varied data.
+Rules:
+- ALWAYS include 'Search'.
+- Include 'News' for current events.
+- Include 'Scholar' or 'Patents' ONLY for technical or academic topics.
+- Include 'Places' or 'Maps' for locations.
+Return the tool names as a comma-separated list (e.g., 'Search, News, Videos')."""
     else:
-        system_prompt = f"Select {mode_descriptor} from [{tools_list}] for: '{user_query}'. Return comma-separated list."
-    
+        system_prompt = f"Select {mode_descriptor} from [{tools_list}]. Return comma-separated list."
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for guard in guard_messages:
+        messages.append({"role": "system", "content": guard})
+    messages.append({"role": "user", "content": user_query})
+
     response = await get_openai_client().chat.completions.create(
         model=LLM_MODEL,
-        messages=[{"role": "user", "content": system_prompt}]
+        messages=messages
     )
-    
+
     selected_str = response.choices[0].message.content.strip()
     selected_tools = [t.strip() for t in selected_str.split(',') if t.strip() in tools]
-    
+
     if not selected_tools:
         return ["Search", "News"] if mode == "deepsearch" else ["Search"]
-    
+
     return selected_tools
 
 
@@ -345,7 +362,7 @@ INTERNAL_MODE_PROMPTS = {
     "ui_strategy": "You are a Principal UI/UX Strategist. Provide design direction, information architecture, layout decisions, visual style, typography, color system, and component guidance. Do NOT write code. Deliver a concise, actionable design brief.",
     "ui_demo_html": (
         "You are a Senior Frontend Engineer and UI/UX craftsman. Build a stable demo UI using ONLY "
-        "HTML, CSS, and vanilla JS. Output THREE files in this order: index.html, style.css, script.js. "
+        "HTML, CSS, and vanilla JS. Output THREE files in this order: index.html, style.css, script.js. If the user explicitly asks for a single file, single HTML, or single code block, output ONE file named index.html with internal <style> and <script> tags and do NOT output style.css or script.js. "
         "Default to no frameworks. If the user explicitly requests Tailwind or Bootstrap, you MAY use the CDN "
         "but still output plain HTML (no React). No inline styles. Keep each file under 300 lines. "
         "Output MUST start with the first file immediately. Do NOT add any intro text, feature list, or design explanation. "
@@ -364,6 +381,10 @@ INTERNAL_MODE_PROMPTS = {
         "If a file would exceed 300 lines, stop at a clean structural boundary and append a final comment line "
         "with CONTINUE_AVAILABLE metadata for that file, then stop output. "
         "If you stop early with CONTINUE_AVAILABLE, do NOT add the 'Save as' line yet. "
+        "Use valid HTML comments in HTML: <!-- comment --> (no spaces in the delimiters). "
+        "In CSS, define custom properties as --name and use them via var(--name) only. "
+        "Do NOT write color: --name, -- name, - name:, or var( - name), and do not treat hex colors like custom properties. "
+        "Avoid invalid CSS like group: card;. If you use -webkit-line-clamp, also include line-clamp:. "
         "Use HTML comments for HTML, and block comments for CSS/JS. "
         "Example: <!-- CONTINUE_AVAILABLE {\"file\":\"index.html\",\"mode\":\"ui_demo_html\",\"lines\":278} --> "
         "or /* CONTINUE_AVAILABLE {\"file\":\"style.css\",\"mode\":\"ui_demo_html\",\"lines\":278} */. "
@@ -371,7 +392,7 @@ INTERNAL_MODE_PROMPTS = {
         "On continuation requests, continue ONLY the same file from the exact last line, with no repetition. "
         "Use modern layout, rich visuals, responsive design, polished interactions, and clean structure. "
         "Avoid monochrome or flat grey palettes. Use a clear color system with 2-3 accents, strong contrast, "
-        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions)."
+        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions). CSS QUALITY RULES: Use flexbox or grid with correct hierarchy. Use a consistent spacing scale like 8px. Use mobile first responsive design. Avoid broken layout or unnecessary styles."
     ),
     "ui_react": (
         "You are a Senior Frontend Engineer and UI/UX craftsman. Build a React + Tailwind UI component. "
@@ -392,15 +413,16 @@ INTERNAL_MODE_PROMPTS = {
         "comment with CONTINUE_AVAILABLE metadata, then stop output. "
         "If you stop early with CONTINUE_AVAILABLE, do NOT add the 'Save as' line yet. "
         "Example: // CONTINUE_AVAILABLE {\"file\":\"App.jsx\",\"mode\":\"ui_react\",\"lines\":392}. "
+        "If you include comments, use JSX/JS comments, not HTML comments. "
         "On continuation requests, continue ONLY the same file from the exact last line, with no repetition. "
         "Use modern layout, rich visuals, responsive design, polished interactions, and clean structure. "
         "Avoid monochrome or flat grey palettes. Use a clear color system with 2-3 accents, strong contrast, "
-        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions)."
+        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions). CSS QUALITY RULES: Use flexbox or grid with correct hierarchy. Use a consistent spacing scale like 8px. Use mobile first responsive design. Avoid broken layout or unnecessary styles."
     ),
     "ui_implementation": (
         "You are a Senior Frontend Engineer and UI/UX craftsman. Build the UI in production-ready code. "
         "If the user explicitly asks for React, Next.js, or Tailwind, output a SINGLE React file with Tailwind. "
-        "Otherwise, default to stable demo output with THREE files: index.html, style.css, script.js (no frameworks). "
+        "Otherwise, default to stable demo output with THREE files: index.html, style.css, script.js (no frameworks). If the user explicitly asks for a single file or single HTML, output ONE file named index.html with internal <style> and <script> tags and do NOT output style.css or script.js. "
         "Use modern layout, rich visuals, responsive design, polished interactions, and clean structure. "
         "Output MUST start with the file immediately. Do NOT add any intro text, feature list, or design explanation. "
         "Use the exact per-file format described above, and include a single 'Save as: filename.ext' line after each file. "
@@ -409,9 +431,13 @@ INTERNAL_MODE_PROMPTS = {
         "If a file would exceed the line limits (300 for HTML/CSS/JS, 400 for React), stop at a clean boundary "
         "and append a CONTINUE_AVAILABLE comment for that file, then stop output. "
         "If you stop early with CONTINUE_AVAILABLE, do NOT add the 'Save as' line yet. "
+        "Use valid HTML comments in HTML: <!-- comment --> (no spaces in the delimiters). "
+        "In CSS, define custom properties as --name and use them via var(--name) only. "
+        "Do NOT write color: --name, -- name, - name:, or var( - name), and do not treat hex colors like custom properties. "
+        "Avoid invalid CSS like group: card;. If you use -webkit-line-clamp, also include line-clamp:. "
         "On continuation requests, continue ONLY the same file from the exact last line, with no repetition. "
         "Avoid monochrome or flat grey palettes. Use a clear color system with 2-3 accents, strong contrast, "
-        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions)."
+        "and a distinctive visual direction. Return ONLY code with proper file labels (unless asking questions). CSS QUALITY RULES: Use flexbox or grid with correct hierarchy. Use a consistent spacing scale like 8px. Use mobile first responsive design. Avoid broken layout or unnecessary styles."
     ),
     "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
 }
@@ -436,6 +462,7 @@ async def analyze_and_route_query(
     Now Context-Aware: Uses recent chat history to deterime intent (Sticky Mode).
     Returns: {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
     """
+    user_query = normalize_user_query(user_query)
     # 0. PERSONALITY CONTENT MODE OVERRIDE (Only in Normal Mode)
     # If a personality forces a specific behavior, we obey it immediately.
     import time
@@ -576,6 +603,16 @@ async def analyze_and_route_query(
         
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
+
+    tech_intent_keywords = [
+        "html", "css", "tailwind", "bootstrap", "react", "jsx", "tsx",
+        "frontend", "front end", "landing page", "hero section", "navbar", "cta",
+        "website", "web design", "homepage", "ui", "ux", "wireframe", "mockup",
+        "code", "build", "implement", "javascript", "js", "component"
+    ]
+
+    def _has_tech_intent(query: str) -> bool:
+        return any(k in query for k in tech_intent_keywords)
     
     # 1. Greetings (Strict Internal -> Casual) - FAST PATH, no LLM needed
     greeting_list = [
@@ -584,7 +621,7 @@ async def analyze_and_route_query(
         "hey macha", "hi macha", "macha", "da", "bro", "hey bro", "hi bro", "machan", "dei",
         "vanakkam", "namaste", "kya haal", "wassup", "whats up", "howdy"
     ]
-    if q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list):
+    if (q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list)) and not _has_tech_intent(q):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # 1.1 Tamil/Tanglish Casual Questions - FAST PATH
@@ -611,7 +648,7 @@ async def analyze_and_route_query(
         "reviews", "rating", "buy", "cost", "deal", "discount", "release",
         "near me", "nearby", "address", "map", "open now", "hours", "schedule"
     ]
-    if len(q) < 40 and not any(sk in q for sk in search_intent_keywords):
+    if len(q) < 40 and not any(sk in q for sk in search_intent_keywords) and not _has_tech_intent(q):
         # Likely a casual conversational question - don't waste time on external search
         # The LLM can answer personal/casual questions without web data
         if "?" in q or q.endswith("?"):
@@ -635,7 +672,7 @@ async def analyze_and_route_query(
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
     # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"
     convo_triggers = ["you", "your", " we ", " we?", " we.", " us ", " us?", "myself", "can we", "shall we"]
-    if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers):
+    if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers) and not _has_tech_intent(q):
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # 2. Tech Keywords / Patterns (Heuristic Classification)
@@ -683,7 +720,7 @@ async def analyze_and_route_query(
         return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
 
     # 3. Starts with greeting
-    if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you ", "what's up "]):
+    if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you ", "what's up "]) and not _has_tech_intent(q):
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
     # Define tool schema
@@ -727,12 +764,15 @@ async def analyze_and_route_query(
         # 🏎️ Use the configured LLM model for ultra-fast classification
         t_router = time.time()
         print(f"[Router] Calling {LLM_MODEL} for classification...")
+        user_query = normalize_user_query(user_query)
+        guard_messages = build_guard_system_messages(user_query)
+        messages = [{"role": "system", "content": system_prompt + history_str}]
+        for guard in guard_messages:
+            messages.append({"role": "system", "content": guard})
+        messages.append({"role": "user", "content": user_query})
         response = await get_openai_client().chat.completions.create(
             model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt + history_str},
-                {"role": "user", "content": user_query}
-            ],
+            messages=messages,
             response_format={"type": "json_object"},
             max_completion_tokens=80
         )
@@ -760,15 +800,26 @@ def execute_serper_batch_sync(endpoint_url: str, queries: List[str], param_key: 
     """
     payload_queries = [{param_key: q} for q in queries] if isinstance(queries, list) else [{param_key: queries}]
     payload = json.dumps(payload_queries)
-    
-    try:
-        response = requests.post(endpoint_url, headers=get_headers(), data=payload)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"error": f"API Error {response.status_code}: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
+
+    last_error = None
+    for attempt in range(SERPER_MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                endpoint_url,
+                headers=get_headers(),
+                data=payload,
+                timeout=(SERPER_CONNECT_TIMEOUT, SERPER_READ_TIMEOUT)
+            )
+            if response.status_code == 200:
+                return response.json()
+            last_error = f"API Error {response.status_code}: {response.text}"
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < SERPER_MAX_RETRIES:
+            time.sleep(SERPER_RETRY_BACKOFF * (2 ** attempt))
+
+    return {"error": last_error or "Serper request failed"}
 
 async def execute_serper_batch(endpoint_url: str, queries: List[str], param_key: str = "q") -> Dict[str, Any]:
     """
@@ -1039,5 +1090,6 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 2. **For technical/code questions:** First explain briefly, then provide code in labeled markdown blocks (```bash, ```python, etc.). Show Mac/Linux and Windows versions if different.
 3. **Keep it concise** - Match your response length to the complexity of the question.
 4. Do NOT include Sources or meta-content for casual conversation.
-5. AVOID using em-dashes (—), double-dashes (--), or underscores (_) in text. Use commas or periods instead."""
+5. AVOID using em-dashes (—), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
+   In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
 

@@ -10,10 +10,10 @@ router = APIRouter()
 client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 DEFAULT_PRICING = {
-    "starter": {"monthly": 199, "yearly": 1999},
+    # "starter": {"monthly": 199, "yearly": 1999},
     "plus": {"monthly": 999, "yearly": 9999},
     "pro": {"monthly": 1999, "yearly": 19999},
-    "business": {"monthly": 2499, "yearly": 24999}
+    # "business": {"monthly": 2499, "yearly": 24999}
 }
 
 VALID_BILLING_CYCLES = {"monthly", "yearly"}
@@ -139,12 +139,10 @@ async def verify_payment(
         # 1.5 Fetch payment + order details for validation
         try:
             payment_details = client.payment.fetch(razorpay_payment_id)
-            amount_paid = payment_details.get('amount', 0) / 100 # Convert to Rupees
-            print(f"[Payment] Fetched actual amount: {amount_paid}")
+            amount_paid = payment_details.get('amount', 0) / 100
         except Exception as fetch_error:
-            print(f"[Payment] Warning: Could not fetch payment details: {fetch_error}")
-            amount_paid = 0
-            payment_details = {}
+            print(f"[Payment] CRITICAL: Could not fetch payment details: {fetch_error}")
+            raise HTTPException(status_code=500, detail="Payment verification unavailable. Please contact support.")
 
         try:
             order_details = client.order.fetch(razorpay_order_id)
@@ -284,7 +282,7 @@ async def verify_payment(
             "verified": True
         })
         
-        print(f"[Payment] Verified and updated for user {user_id} - Plan: {resolved_plan_id} - Amount: {amount_to_store}")
+        print(f"[Payment] Verified and updated for user {user_id} - Plan: {resolved_plan_id}")
         return {"success": True, "message": "Payment verified and membership updated"}
         
     except razorpay.errors.SignatureVerificationError:

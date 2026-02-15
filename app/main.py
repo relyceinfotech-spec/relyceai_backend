@@ -3,6 +3,7 @@ Relyce AI - FastAPI Main Application
 Production-grade ChatGPT-style API with REST and WebSocket support
 """
 import json
+import asyncio
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -10,8 +11,22 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+from starlette.websockets import WebSocketState
 
-from app.config import HOST, PORT, CORS_ORIGINS, CORS_ORIGIN_REGEX
+from app.config import (
+    HOST,
+    PORT,
+    CORS_ORIGINS,
+    CORS_ORIGIN_REGEX,
+    CORS_ALLOWED_METHODS,
+    CORS_ALLOWED_HEADERS,
+    FORCE_HTTPS,
+    MAX_CHAT_MESSAGE_CHARS,
+    RATE_LIMIT_PER_MINUTE,
+    SECURITY_HEADERS_ENABLED,
+    SECURITY_CSP,
+)
 from app.models import (
     ChatRequest, ChatResponse, SearchRequest,
     HealthResponse, WebSocketMessage, Personality
@@ -78,15 +93,42 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# HTTPS redirect & HSTS (enable in production)
+if FORCE_HTTPS:
+    app.add_middleware(HTTPSRedirectMiddleware)
+
+    @app.middleware("http")
+    async def add_hsts_header(request, call_next):
+        response = await call_next(request)
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+        return response
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=CORS_ALLOWED_METHODS,
+    allow_headers=CORS_ALLOWED_HEADERS,
 )
+
+# Security headers (skip CSP on docs/redoc to avoid breaking Swagger UI)
+if SECURITY_HEADERS_ENABLED:
+    @app.middleware("http")
+    async def add_security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "interest-cohort=()")
+        response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
+        path = request.url.path
+        if not (path.startswith("/docs") or path.startswith("/redoc") or path.startswith("/openapi.json")):
+            response.headers.setdefault("Content-Security-Policy", SECURITY_CSP)
+            response.headers.setdefault("X-Frame-Options", "DENY")
+        return response
 
 
 # ============================================
@@ -111,7 +153,7 @@ from pydantic import BaseModel, EmailStr
 from app.rate_limiter import check_rate_limit as check_login_rate_limit, record_failed_attempt, clear_attempts
 
 class RateLimitRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 @app.post("/auth/check-limit")
 async def check_login_limit(request: RateLimitRequest, req: Request):
@@ -204,9 +246,11 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
     Processes message and returns complete response.
     """
     try:
+        if len(request.message or "") > MAX_CHAT_MESSAGE_CHARS:
+            raise HTTPException(status_code=413, detail="Message too long")
         user_id = user_info["uid"]
         if not check_chat_rate_limit(user_id):
-            raise HTTPException(status_code=429, detail="Rate limit exceeded (30 req/min). Try again later.")
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({RATE_LIMIT_PER_MINUTE} req/min). Try again later.")
         request.user_id = user_id
 
         # Resolve personality
@@ -289,9 +333,11 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
     Streaming chat endpoint using Server-Sent Events (SSE).
     Returns tokens as they're generated.
     """
+    if len(request.message or "") > MAX_CHAT_MESSAGE_CHARS:
+        raise HTTPException(status_code=413, detail="Message too long")
     user_id = user_info["uid"]
     if not check_chat_rate_limit(user_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded (30 req/min). Try again later.")
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({RATE_LIMIT_PER_MINUTE} req/min). Try again later.")
 
     async def generate():
         try:
@@ -415,8 +461,8 @@ async def web_search(request: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/history/{user_id}/{session_id}")
-async def get_history(user_id: str, session_id: str, limit: int = 50, user_info: dict = Depends(get_current_user)):
+@app.get("/history/{session_id}")
+async def get_history(session_id: str, limit: int = 50, user_info: dict = Depends(get_current_user)):
     """Get chat history for a session"""
     try:
         uid = user_info["uid"]
@@ -443,15 +489,15 @@ app.include_router(files.router, prefix="", tags=["Files"]) # Mount at root to m
 @app.websocket("/ws/chat")
 async def websocket_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None),
     chat_id: Optional[str] = Query(None)
 ):
     """
     WebSocket chat endpoint with multi-device support.
     
-    Connection URL: ws://localhost:8000/ws/chat?token=FIREBASE_TOKEN&chat_id=SESSION_ID
+    Connection URL: ws://localhost:8080/ws/chat?chat_id=SESSION_ID
     
     Message format (JSON):
+    - Authenticate: {"type": "auth", "token": "FIREBASE_TOKEN", "chat_id": "SESSION_ID"}
     - Send message: {"type": "message", "content": "Hello", "chat_mode": "normal"}
     - Stop generation: {"type": "stop"}
     - Ping: {"type": "ping"}
@@ -466,9 +512,50 @@ async def websocket_endpoint(
     # Accept connection immediately to handle errors gracefully
     await websocket.accept()
 
-    # Require valid token
+    async def safe_send(payload: dict) -> bool:
+        """Send only if the socket is still open."""
+        try:
+            if websocket.client_state != WebSocketState.CONNECTED:
+                return False
+            await websocket.send_text(json.dumps(payload))
+            return True
+        except Exception:
+            return False
+
+    # Authenticate via initial auth message (preferred) or query param (legacy)
+    token = None
+    resolved_chat_id = chat_id
+
+    try:
+        auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=6)
+        auth_msg = json.loads(auth_raw)
+        if auth_msg.get("type") == "auth":
+            token = auth_msg.get("token")
+            if not resolved_chat_id:
+                resolved_chat_id = auth_msg.get("chat_id")
+        else:
+            await safe_send({"type": "error", "content": "Unauthorized: Missing auth"})
+            await websocket.close(code=1008)
+            return
+    except asyncio.TimeoutError:
+        await safe_send({"type": "error", "content": "Unauthorized: Auth timeout"})
+        await websocket.close(code=1008)
+        return
+    except Exception:
+        await safe_send({"type": "error", "content": "Unauthorized: Invalid auth"})
+        await websocket.close(code=1008)
+        return
+
+    if token:
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if not token or len(token) < 10:
+            await safe_send({"type": "error", "content": "Invalid token format"})
+            await websocket.close(code=1008)
+            return
+
     if not token:
-        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Missing token"}))
+        await safe_send({"type": "error", "content": "Unauthorized: Missing token"})
         await websocket.close(code=1008)
         return
 
@@ -480,22 +567,30 @@ async def websocket_endpoint(
         is_valid, user_info = False, None
 
     if not is_valid or not user_info:
-        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Invalid token"}))
+        await safe_send({"type": "error", "content": "Unauthorized: Invalid token"})
         await websocket.close(code=1008)
         return
 
     user_id = user_info.get("uid")
     if not user_id:
-        await websocket.send_text(json.dumps({"type": "error", "content": "Unauthorized: Invalid user"}))
+        await safe_send({"type": "error", "content": "Unauthorized: Invalid user"})
         await websocket.close(code=1008)
         return
     
     # Use provided chat_id or generate one
-    if not chat_id:
-        chat_id = f"chat_{datetime.now().timestamp()}"
+    if not resolved_chat_id:
+        resolved_chat_id = f"chat_{datetime.now().timestamp()}"
     
     # Connect
-    connection_id = await manager.connect(websocket, chat_id, user_id)
+    try:
+        connection_id = await manager.connect(websocket, resolved_chat_id, user_id)
+    except Exception as e:
+        await safe_send({"type": "error", "content": str(e)})
+        await websocket.close(code=1013)
+        return
+
+    # Notify client auth success
+    await safe_send({"type": "auth_ok"})
     
     try:
         while True:
@@ -512,10 +607,10 @@ async def websocket_endpoint(
                 )
                 
     except WebSocketDisconnect:
-        manager.disconnect(connection_id)
+        await manager.disconnect(connection_id)
     except Exception as e:
         print(f"[WS] Error: {e}")
-        manager.disconnect(connection_id)
+        await manager.disconnect(connection_id)
 
 
 # ============================================

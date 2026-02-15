@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Literal, Dict
 from datetime import datetime
 import uuid
+from app.config import MAX_CHAT_MESSAGE_CHARS
 
 # Chat Modes
 ChatMode = Literal["normal", "business", "deepsearch"]
@@ -32,7 +33,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     """REST API chat request"""
-    message: str
+    message: str = Field(..., min_length=1, max_length=MAX_CHAT_MESSAGE_CHARS)
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     chat_mode: ChatMode = "normal"

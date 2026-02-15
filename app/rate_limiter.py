@@ -4,7 +4,7 @@ Firestore-based rate limiting with progressive delays
 Layer 2 Security: Server-side brute-force protection
 """
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Tuple
 from app.auth import get_firestore_db
 
@@ -58,7 +58,7 @@ def check_rate_limit(email: str, ip: str) -> dict:
     last_attempt = data.get("last_attempt")
     locked_until = data.get("locked_until")
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     # Check if record expired (30 min inactivity)
     if last_attempt:
@@ -102,7 +102,7 @@ def record_failed_attempt(email: str, ip: str) -> dict:
     doc_ref = db.collection(COLLECTION_NAME).document(key)
     doc = doc_ref.get()
     
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     
     if doc.exists:
         data = doc.to_dict()

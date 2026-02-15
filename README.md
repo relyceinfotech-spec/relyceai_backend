@@ -40,7 +40,7 @@ FIREBASE_CLIENT_EMAIL=...
 
 ```bash
 # From backend directory
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 
 # Or directly
 python -m app.main
@@ -60,11 +60,14 @@ python -m app.main
 
 ### WebSocket
 
-Connect to: `ws://localhost:8000/ws/chat?token=FIREBASE_TOKEN&chat_id=SESSION_ID`
+Connect to: `ws://localhost:8080/ws/chat`
 
 **Message Types:**
 
 ```json
+// Authenticate (send immediately after connect)
+{"type": "auth", "token": "FIREBASE_TOKEN", "chat_id": "SESSION_ID"}
+
 // Send message
 {"type": "message", "content": "Hello", "chat_mode": "normal"}
 

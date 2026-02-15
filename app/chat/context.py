@@ -1,12 +1,13 @@
 """
 Relyce AI - Chat Context Manager
-Manages conversation context (in-memory for now, Redis-ready)
+Manages conversation context (in-memory with Firestore hydration)
 """
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+import asyncio
 
-# In-memory context storage (Redis-ready structure)
+# In-memory context storage (Firestore-hydrated structure)
 # Format: context_store[user_id][chat_id] = [messages]
 _context_store: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdict(list))
 _context_timestamps: Dict[str, Dict[str, datetime]] = defaultdict(dict)
@@ -14,13 +15,29 @@ _context_summaries: Dict[str, Dict[str, str]] = defaultdict(lambda: defaultdict(
 _context_personalities: Dict[str, Dict[str, str]] = defaultdict(dict)
 
 # Context settings
-MAX_CONTEXT_MESSAGES = 20  # Absolute safety cap (RAM protection)
-SUMMARY_TRIGGER_MESSAGES = 12 # Trigger summarization when this many messages exist
-KEEP_LAST_MESSAGES = 6 # Keep this many raw messages after summarization
-CONTEXT_TTL_MINUTES = 60  # 60 minutes TTL
+# Context settings
+MAX_CONTEXT_MESSAGES = 50
+SUMMARY_TRIGGER_MESSAGES = 12 # Trigger summarization when we have enough history
+KEEP_LAST_MESSAGES = 8        # Strict limit requested by user
+CONTEXT_TTL_MINUTES = 60
+
+async def cleanup_expired_contexts():
+    """Periodic cleanup of expired contexts to prevent memory leaks."""
+    while True:
+        await asyncio.sleep(3600)
+        now = datetime.now(timezone.utc)
+        expired_count = 0
+        for user_id in list(_context_timestamps.keys()):
+            for chat_id in list(_context_timestamps[user_id].keys()):
+                ts = _context_timestamps[user_id][chat_id]
+                if ts and (now - ts.replace(tzinfo=timezone.utc) if ts.tzinfo else now - ts) > timedelta(minutes=CONTEXT_TTL_MINUTES):
+                    clear_context(user_id, chat_id)
+                    expired_count += 1
+        if expired_count > 0:
+            print(f"[Context] Cleaned up {expired_count} expired contexts")
 
 def get_context_key(user_id: str, chat_id: str) -> str:
-    """Generate context key (Redis-compatible format)"""
+    """Generate context key"""
     return f"context:{user_id}:{chat_id}"
 
 def get_raw_message_count(user_id: str, chat_id: str) -> int:
@@ -137,6 +154,10 @@ def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str
     
     # 2. Add Recent Messages (Short-term memory)
     raw_messages = get_context(user_id, chat_id, personality_id)
+    
+    # Strict Limit: Only send last N messages to LLM as requested
+    raw_messages = raw_messages[-KEEP_LAST_MESSAGES:]
+    
     for msg in raw_messages:
         role = msg["role"]
         if role == "bot":
