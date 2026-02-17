@@ -415,7 +415,9 @@ async def handle_websocket_message(
             context_messages=context_messages,
             personality=personality,
             user_settings=effective_settings,
-            user_id=user_id
+
+            user_id=user_id,
+            session_id=chat_id
         ):
             # Check stop flag
             if manager.should_stop(chat_key):
@@ -455,6 +457,22 @@ async def handle_websocket_message(
                 print(f"[WS] Background history save failed: {e}")
 
         asyncio.create_task(save_history_background())
+
+        # === User Profiler: Learn from this streaming interaction ===
+        if user_id and user_id != "anonymous":
+            try:
+                from app.llm.user_profiler import user_profiler
+                profile = await user_profiler.load_profile(user_id)
+                user_profiler.update_from_interaction(
+                    profile,
+                    sub_intent=chat_mode,
+                    query=content,
+                    response_length=len(full_response),
+                    emotions=[],  # Emotions already processed in processor
+                    model_used=chat_mode
+                )
+            except Exception as e:
+                print(f"[WS] Profiler update failed (non-blocking): {e}")
         
         # =========================================================================
         # Post-Processing: Context Summarization (Deferred to improve latency)

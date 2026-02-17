@@ -38,6 +38,10 @@ from app.chat.user_profile import get_user_settings, get_session_personality_id,
 from app.chat.history import save_message_to_firebase, load_chat_history, increment_message_count
 from app.rate_limit import check_rate_limit as check_chat_rate_limit
 from app.websocket import manager, handle_websocket_message
+from app.llm.emotion_engine import emotion_engine
+from app.llm.feedback_engine import feedback_engine
+from app.llm.prompt_optimizer import prompt_optimizer
+from app.llm.user_profiler import user_profiler
 
 from app.payment import router as payment_router
 
@@ -76,12 +80,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! Embedding task init failed: {e}")
 
+    # Load self-learning scores from Firestore (strategy scores + prompt variants)
+    try:
+        async def _load_learning_scores():
+            try:
+                await feedback_engine.load_scores()
+                print("[Startup] - Feedback engine scores loaded")
+            except Exception as e:
+                print(f"[Startup] ! Feedback score load failed: {e}")
+            try:
+                await prompt_optimizer.load_stats()
+                print("[Startup] - Prompt optimizer stats loaded")
+            except Exception as e:
+                print(f"[Startup] ! Prompt optimizer load failed: {e}")
+
+        asyncio.create_task(_load_learning_scores())
+    except Exception as e:
+        print(f"[Startup] ! Learning score task init failed: {e}")
+
     print(f"[Startup] - Server ready on {HOST}:{PORT}")
     print("=" * 60)
     
     yield
     
     # Shutdown
+    await emotion_engine.shutdown()
+    await feedback_engine.shutdown()
+    await prompt_optimizer.save_stats()
+    await user_profiler.shutdown()
     print("[Shutdown] - Relyce AI Backend shutting down...")
 
 
@@ -295,7 +321,8 @@ async def chat(request: ChatRequest, user_info: dict = Depends(get_current_user)
             context_messages=context_messages,
             personality=personality,
             user_settings=effective_settings,
-            user_id=user_id
+            user_id=user_id,
+            session_id=request.session_id
         )
         
         # Update context
@@ -390,7 +417,8 @@ async def chat_stream(request: ChatRequest, user_info: dict = Depends(get_curren
                 context_messages=context_messages,
                 personality=personality,
                 user_settings=effective_settings,
-                user_id=user_id # Pass User ID for facts
+                user_id=user_id, # Pass User ID for facts
+                session_id=request.session_id
             ):
                 if token.strip().startswith("[INFO]"):
                     clean_info = token.replace("[INFO]", "").strip()
@@ -591,6 +619,12 @@ async def websocket_endpoint(
 
     # Notify client auth success
     await safe_send({"type": "auth_ok"})
+
+    # Pre-warm emotion cache for this session
+    try:
+        await emotion_engine.prewarm(resolved_chat_id)
+    except Exception:
+        pass  # Non-critical, don't block connection
     
     try:
         while True:

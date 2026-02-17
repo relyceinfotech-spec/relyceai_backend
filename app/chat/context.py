@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import asyncio
+from app.llm.context_optimizer import context_optimizer
 
 # In-memory context storage (Firestore-hydrated structure)
 # Format: context_store[user_id][chat_id] = [messages]
@@ -155,10 +156,15 @@ def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str
     # 2. Add Recent Messages (Short-term memory)
     raw_messages = get_context(user_id, chat_id, personality_id)
     
-    # Strict Limit: Only send last N messages to LLM as requested
-    raw_messages = raw_messages[-KEEP_LAST_MESSAGES:]
+    # Smart Context Optimization: importance scoring + compression
+    # Replaces simple sliding window with intelligent context management
+    optimized_messages = context_optimizer.optimize(
+        raw_messages,
+        keep_last_n=KEEP_LAST_MESSAGES,
+        summary=summary
+    )
     
-    for msg in raw_messages:
+    for msg in optimized_messages:
         role = msg["role"]
         if role == "bot":
             role = "assistant"

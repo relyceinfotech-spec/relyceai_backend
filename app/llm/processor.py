@@ -20,9 +20,17 @@ from app.llm.router import (
     INTERNAL_SYSTEM_PROMPT,
     get_openai_client,
     get_openrouter_client,
+    TONE_MAP,
 )
 from app.llm.routing_log import log_routing_decision
 from app.llm.guards import normalize_user_query, build_guard_system_messages
+from app.llm.emotion_engine import emotion_engine
+from app.llm.feedback_engine import feedback_engine
+from app.llm.strategy_memory import strategy_memory
+from app.llm.prompt_optimizer import prompt_optimizer
+from app.llm.user_profiler import user_profiler
+from app.llm.debug_agent import debug_agent
+from app.llm.context_optimizer import context_optimizer
 
 TEMPERATURE_MAP = {
     "general": 0.65,
@@ -439,7 +447,9 @@ class LLMProcessor:
         user_settings: Optional[Dict] = None,
         mode: str = "normal",
         sub_intent: str = "general",
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        emotions: List[str] = [],
+        emotional_instruction: Optional[str] = None
     ) -> str:
         """
         Handle internal queries (greetings, math, code, logic).
@@ -460,6 +470,15 @@ class LLMProcessor:
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
             
+        # Apply Emotion/Tone Instruction
+        if emotional_instruction:
+            system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+        else:
+            # Fallback to multi-label static map
+            for emotion in emotions:
+                if emotion in TONE_MAP:
+                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+             
         # Check for Coding Buddy override
         model_to_use = self.model
         if sub_intent in UI_SUB_INTENTS:
@@ -511,7 +530,9 @@ class LLMProcessor:
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
         sub_intent: str = "general",
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        emotions: List[str] = [],
+        emotional_instruction: Optional[str] = None
     ) -> tuple[str, List[str]]:
         """
         Handle external queries that need web search.
@@ -549,6 +570,14 @@ class LLMProcessor:
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
+
+        # Apply Emotion/Tone Instruction
+        if emotional_instruction:
+            system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+        else:
+            for emotion in emotions:
+                if emotion in TONE_MAP:
+                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
 
         
         messages = [{"role": "system", "content": system_prompt}]
@@ -598,7 +627,8 @@ class LLMProcessor:
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Main entry point - routes to appropriate handler.
@@ -608,33 +638,101 @@ class LLMProcessor:
         # Analyze intent using the consolidated router
         analysis = await analyze_and_route_query(user_query, mode, personality=personality)
         intent = analysis.get("intent", "EXTERNAL")
+        sub_intent = analysis.get("sub_intent", "general")
+        emotions = analysis.get("emotions", [])
         
+        import time as _time
+        _start = _time.time()
+
+        # === Intelligence Layer: Load state ===
+        emotional_instruction = None
+        strategy_instruction = None
+        prompt_variant_name = "default"
+        prompt_variant_instruction = ""
+        skill_level = 0.5
+
+        if session_id:
+            state = await emotion_engine.load_state(session_id, user_id=user_id)
+            state = emotion_engine.update_state(state, emotions, sub_intent)
+            await emotion_engine.save_state(session_id, state, user_id=user_id)
+            emotional_instruction = emotion_engine.get_instruction(state)
+            skill_level = state.skill_level
+
+        # Strategy Memory: Learn from query + get instruction
+        if user_id:
+            user_strategy = await strategy_memory.load_strategy(user_id)
+            user_strategy = strategy_memory.update_from_query(user_strategy, user_query)
+            await strategy_memory.save_strategy(user_id, user_strategy)
+            strategy_instruction = strategy_memory.get_instruction(user_strategy)
+
+        # Prompt Optimizer: Select variant
+        prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
+
         if intent == "INTERNAL":
             response_text = await self.process_internal_query(
                 user_query,
                 personality,
                 user_settings,
                 mode=mode,
-                sub_intent=analysis.get("sub_intent", "general"),
-                user_id=user_id
+                sub_intent=sub_intent,
+                user_id=user_id,
+                emotions=emotions,
+                emotional_instruction=emotional_instruction
             )
+            result_response = self._sanitize_output_text(response_text)
+        else:
+            response_text, tools = await self.process_external_query(
+                user_query, mode, context_messages, personality, user_settings, 
+                sub_intent, user_id, 
+                emotions=emotions,
+                emotional_instruction=emotional_instruction
+            )
+            result_response = self._sanitize_output_text(response_text)
+
+        # === Feedback Engine: Log interaction ===
+        _latency = (_time.time() - _start) * 1000
+        feedback_engine.log_interaction(
+            session_id=session_id or "",
+            user_id=user_id or "",
+            query=user_query,
+            intent=intent,
+            sub_intent=sub_intent,
+            model_used=mode,
+            emotions=emotions,
+            skill_level=skill_level,
+            response_length=len(result_response),
+            latency_ms=_latency,
+            prompt_variant=prompt_variant_name
+        )
+
+        # === User Profiler: Update from interaction ===
+        if user_id:
+            try:
+                _profile = await user_profiler.load_profile(user_id)
+                user_profiler.update_from_interaction(
+                    _profile, sub_intent, user_query,
+                    len(result_response), emotions,
+                    model_used=mode, prompt_variant=prompt_variant_name
+                )
+            except Exception as e:
+                print(f"[UserProfiler] Update failed: {e}")
+
+        if intent == "INTERNAL":
             return {
                 "success": True,
-                "response": self._sanitize_output_text(response_text),
+                "response": result_response,
                 "mode_used": "internal",
                 "tools_activated": []
             }
         else:
-            response_text, tools = await self.process_external_query(
-                user_query, mode, context_messages, personality, user_settings, analysis.get("sub_intent", "general"), user_id
-            )
             return {
                 "success": True,
-                "response": self._sanitize_output_text(response_text),
+                "response": result_response,
                 "mode_used": mode,
                 "tools_activated": tools
             }
     
+
     async def process_message_stream(
         self, 
         user_query: str, 
@@ -642,7 +740,8 @@ class LLMProcessor:
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> AsyncGenerator[str, None]:
         """
         Streaming version of process_message.
@@ -679,19 +778,128 @@ class LLMProcessor:
                 system_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
             else:
                 system_prompt = base_prompt
+
+            # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
+            emotions = analysis.get("emotions", [])
+            for emotion in emotions:
+                if emotion in TONE_MAP:
+                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+
+            # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
+            emotions = analysis.get("emotions", [])
+            
+            # === Intelligence Layer (Streaming) ===
+            # Strategy Memory
+            strategy_instruction = None
+            if user_id:
+                user_strategy = await strategy_memory.load_strategy(user_id)
+                user_strategy = strategy_memory.update_from_query(user_strategy, user_query)
+                await strategy_memory.save_strategy(user_id, user_strategy)
+                strategy_instruction = strategy_memory.get_instruction(user_strategy)
+
+            # Prompt Optimizer
+            prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
+
+            # Persist Emotional State (with user_id for skill persistence)
+            skill_level = 0.5
+            is_debug_mode = False
+            frustration_prob = 0.0
+            proactive_instruction = None
+            if session_id:
+                state = await emotion_engine.load_state(session_id, user_id=user_id)
+                state = emotion_engine.update_state(state, emotions, analysis.get("sub_intent", "general"))
+                await emotion_engine.save_state(session_id, state, user_id=user_id)
+                skill_level = state.skill_level
+                
+                # Get dynamic instruction
+                emotional_instruction = emotion_engine.get_instruction(state)
+                if emotional_instruction:
+                    print(f"[EmotionEngine] Injecting instruction: {emotional_instruction}")
+                    system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+
+                # === Frustration Prediction (Priority #6) ===
+                frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
+                if frustration_prob > 0.4:
+                    print(f"[EmotionEngine] Frustration prediction: {frustration_prob:.2f}")
+                proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
+                if proactive_instruction:
+                    system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
+                    print(f"[EmotionEngine] Proactive help injected (prob={frustration_prob:.2f})")
+
+                # === Autonomous Debug Mode (Priority #5) ===
+                if debug_agent.should_activate(emotions, state, sub_intent):
+                    is_debug_mode = True
+                    debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
+                    system_prompt = f"{system_prompt}\n\n{debug_prompt}"
+                    yield debug_agent.get_info_message()
+                    print(f"[DebugAgent] Activated for {sub_intent} (frustration={state.frustration:.2f})")
+            else:
+                # Fallback to transient emotions if no session_id
+                for emotion in emotions:
+                    if emotion in TONE_MAP:
+                        system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+
+            # === User Profiler (Priority #2) ===
+            user_profile = None
+            if user_id:
+                user_profile = await user_profiler.load_profile(user_id)
+                personalization = user_profiler.get_personalization_instruction(user_profile)
+                if personalization:
+                    system_prompt = f"{system_prompt}\n\n{personalization}"
+                    print(f"[UserProfiler] Personalization injected ({user_profile.total_interactions} interactions)")
+
+            # Inject strategy instruction
+            if strategy_instruction:
+                system_prompt = f"{system_prompt}\n\n{strategy_instruction}"
+
+            # Inject prompt variant
+            if prompt_variant_instruction:
+                system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
+
             print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
 
-            # Construct messages with Context (Option 2 Support)
+            # === Context Intelligence (Priority #4) ===
+            # Apply smart context compression before building messages
+            optimized_context = context_messages
+            if context_messages and len(context_messages) > 4:
+                pre_count = len(context_messages)
+                pre_chars = sum(len(m.get('content', '')) for m in context_messages)
+                optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
+                post_chars = sum(len(m.get('content', '')) for m in optimized_context)
+                if pre_chars != post_chars:
+                    print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} → {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
+
+            # Construct messages with Context
             messages = [{"role": "system", "content": system_prompt}]
             
-            # Inject context messages (including potential Summary system message)
-            if context_messages:
-                # If we have a summary system message injected by websocket.py, it will be first
-                # We simply append all context messages. 
-                # Note: Logic to prune/summarize is handled in websocket.py/main.py before calling this.
-                messages.extend(context_messages)
+            if optimized_context:
+                messages.extend(optimized_context)
             
             messages.append({"role": "user", "content": user_query})
+
+            # === Emit Intelligence Metadata for Frontend ===
+            import json as _json
+            intel_tags = []
+            if user_profile and user_profile.total_interactions >= 5:
+                if user_profile.prefers_code_first > 0.7:
+                    intel_tags.append("code-first")
+                if user_profile.prefers_concise > 0.7:
+                    intel_tags.append("concise")
+                if user_profile.prefers_step_by_step > 0.7:
+                    intel_tags.append("step-by-step")
+                if user_profile.prefers_examples > 0.7:
+                    intel_tags.append("examples")
+            
+            intel_payload = {
+                "mode": sub_intent,
+                "debug_active": is_debug_mode,
+                "frustration": round(frustration_prob, 2) if session_id else 0,
+                "confidence": round(max(0, 1.0 - (frustration_prob if session_id else 0)), 2),
+                "skill_level": round(skill_level, 2),
+                "personalization": intel_tags,
+                "proactive_help": bool(proactive_instruction) if session_id else False
+            }
+            yield f"[INFO]INTEL:{_json.dumps(intel_payload)}"
 
             print(f"[LATENCY] Internal: Preparing stream... (Time: {time.time() - start_time:.4f}s)")
             t_stream_start = time.time()

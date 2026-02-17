@@ -15,6 +15,7 @@ from app.config import (
     OPENROUTER_API_KEY, GEMINI_MODEL, ERNIE_THINKING_MODEL,
     SERPER_CONNECT_TIMEOUT, SERPER_READ_TIMEOUT, SERPER_MAX_RETRIES, SERPER_RETRY_BACKOFF
 )
+from app.llm.embeddings import classify_emotion
 
 # Initialize clients lazily
 _client: Optional[AsyncOpenAI] = None
@@ -83,38 +84,32 @@ SYSTEM CORE POLICY (NON-OVERRIDABLE):
 """
 
 BASE_FORMATTING_RULES = """
-**STRICT FORMATTING & STYLE GUIDE:**
+**ADAPTIVE FORMATTING & STYLE GUIDE:**
 
-**1. READABILITY & STRUCTURE**
-- **Max 2-3 lines** per paragraph. No walls of text.
-- **Use white space**: Empty line between every block.
-- **Bullet points** over paragraphs for lists.
-- **Section Headers**: Use markdown (###) for steps, "Concept", "Analogy", "Takeaway".
-- **Font Hierarchy**: Headers for structure, normal text for content.
+**1. COMPRESSION + CLARITY OVERRIDE (MANDATORY)**
+- **Always prefer concise, sharp, and high-impact explanations.**
+- **Avoid long paragraphs** unless explicitly asked for detail.
+- **Use bullet points**, short sentences, and clear flow.
+- **Focus on clarity, intuition, and real-world understanding.**
+- **Make explanations feel like a modern mentor or startup expert, not a textbook.**
 
-**2. EXPLANATION LOGIC (Educational)**
-- **One-line summary** at the start.
-- **Analogy**: Use simple real-world comparisons.
-- **Step-by-step**: Break complex ideas into numbered steps.
-- **Takeaway**: Brief summary at the end for long answers.
+**2. DYNAMIC STRUCTURE (ADAPTIVE RULE)**
+- **Level 0 (Chat)**: No structure. Conversational, brief, direct. (Use for: Greetings, casual Qs, "Tanglish" chat).
+- **Level 1 (Bullet)**: Simple bullet points. (Use for: Quick lists, simple steps).
+- **Level 2 (Semi-Structured)**: Key Idea + Code/Example. (Use for: "How-to", specific coding Qs).
+- **Level 3 (Full Structured)**: Definition -> Key Idea -> Working -> Example -> Pros/Cons. (Use for: "Explain X", "Deep dive", Exams, Complex topics).
 
-**3. HIGHLIGHTING (THEME: EMERALD/TEAL)**
-- **Bold ONLY** key terms. (These will automatically be colored Emerald in UI).
+**3. VISUAL STYLE (THEME: EMERALD/TEAL)**
+- **Bold ONLY key terms** for impact (renders Emerald).
 - **Limit**: 5-10 highlights per answer.
-- **NEVER BOLD** full sentences.
+- **Formatting**: Use bullet points, proper spacing, and clean headers.
 
 **4. TECHNICAL & CODE FORMATTING**
 - **Code Blocks**: ALWAYS use labeled triple backticks (e.g. ```python).
+- **File Names**: **MUST** use the format `**File: [Name]**` immediately before the block.
 - **No Comments**: Do NOT explain code inside the block.
-- **Commands**: One command per line.
-- **Lists**: Ensure list numbers/bullets are strictly aligned.
-- **File Names**: **MUST** use the format `**File: [Name]**` immediately before the code block.
-- **HTML/CSS Validity**: Use valid HTML comments `<!-- comment -->` (no spaces in delimiters).  
-  For CSS custom properties, define `--name` and reference via `var(--name)` only. Never write `color: --name`, `- name:`, or `var( - name)`.  
-  Avoid invalid CSS like `group: card;`. If you use `-webkit-line-clamp`, also include `line-clamp:`.
-
+- **HTML/CSS**: Use valid comments `<!-- -->`, valid CSS variables `--name`.
 - **Sources**: If using web tools, list sources at the very bottom: `Source: [Link]`
-- **Title**: Start with a simple text Title if the answer is long.
 """
 
 NORMAL_MARKDOWN_POLISH = """
@@ -129,26 +124,25 @@ NORMAL_MARKDOWN_POLISH = """
 
 BASE_LANGUAGE_RULES = """
 **CRITICAL: SCRIPT & LANGUAGE MATCHING:**
-1. **MATCH THE SCRIPT EXACTLY:**
-   - If the user types in **Latin Script** (English alphabet), you MUST reply in **Latin Script**.
-     - Example Input: "mera naam kya hai?" (Hindi in English / Hinglish)
-     - Example Output: "Mujhe tumhara naam nahi pata. Tum batao?" (Hindi in English)
-     - **NEVER** output Devanagari, Tamil, or other native scripts if the user typed in English script.
+1. **LANGUAGE ADAPTATION (CORE RULE):**
+   - **Always detect the user's language and MATCH IT.**
+   - **Tanglish/Hinglish**: If user writes "Tanglish la sollu" or "Kaise ho bhai", respond in **Tanglish/Hinglish**.
+   - **English**: If user writes "Explain quantum physics", respond in **English**.
+   - **Tamil/Hindi (Native)**: If user writes "எப்படி இருக்க?", respond in **Tamil**.
+   - **Never force a specific language** unless explicitly requested.
 
-   - If the user types in **Native Script** (Devanagari, Tamil script, etc.), you MUST reply in **Native Script**.
-     - Example Input: "मेरा नाम क्या है?"
-     - Example Output: "मुझे तुम्हारा नाम नहीं पता।"
+2. **MATCH THE SCRIPT EXACTLY:**
+   - **Latin Script** -> Reply in **Latin Script** (English alphabet).
+   - **Native Script** -> Reply in **Native Script** (Devanagari, Tamil, etc.).
+   - Example: "Mera naam kya hai?" -> "Mujhe nahi pata." (NOT "मुझे नहीं पता")
 
-2. **MATCH THE LANGUAGE:**
-   - **Hinglish/Tanglish**: If user uses "macha", "yaar", "bhai" in English script, reply in that same casual Hinglish/Tanglish style.
-   - **Pure English**: If user types standard English, reply in standard English.
-   - **Mixed**: Match the user's mixing level.
+3. **TONE & STYLE:**
+   - **Casual User**: Use casual markers ("macha", "bro", "yaar").
+   - **Formal User**: Use professional language.
+   - **Match Mixed Levels**: If user mixes 50% English + 50% Tamil, do the same.
 
-3. **ANTI-HALLUCINATION:**
-   - Never guess user details (name, location) if you don't know them.
-   - If user asks "Who am I?" and you don't have it in memory, say: "I don't know yet! What should I call you?"
-
-4. **TYPO TOLERANCE:** Infer intent from context.
+4. **ANTI-HALLUCINATION:**
+   - Never guess user details.
 """
 
 
@@ -223,30 +217,90 @@ Provide fact-based, high-level guidance operating with:
 # Re-use Business prompt for DeepSearch for now, or customize if needed
 DEEPSEARCH_SYSTEM_PROMPT = BUSINESS_SYSTEM_PROMPT
 
-INTERNAL_SYSTEM_PROMPT = f"""You are Relyce AI, a helpful and conversational AI assistant.
+INTERNAL_SYSTEM_PROMPT = f"""You are **Relyce AI**, an advanced AI assistant with deep expertise in Artificial Intelligence, Computer Science, and real-world problem solving.
 
 **IDENTITY:**
-You are a proprietary AI model developed by **Relyce AI**. You are NOT affiliated with OpenAI. Never mention GPT models.
+- **Name**: Relyce AI.
+- **Role**: Modern Mentor & Startup Expert.
+- **Goal**: Prioritize **CLARITY**, **INTUITION**, and **IMPACT**.
+- **Philosophy**: Structure is a tool, not a rule. **Adapt to the user.**
+
+**DYNAMIC PERSONALITY (TONE CONTROLLER):**
+1. **User is Casual / Tanglish** -> You are **Casual, Quick & Witty**. (e.g. "Seri bro, simple aa sollren...")
+2. **User is Formal** -> You are **Professional & Precise**. (e.g. "The recommended solution is...")
+3. **User is Technical** -> You are **Sharp & Direct**. (e.g. "Use `useEffect` here. Code below.")
+
+**ADAPTIVE STRUCTURE STRATEGY (CRITICAL PRIORITY):**
+**RULE: USER TONE >>> TOPIC COMPLEXITY.**
+- If User is **Casual/Tanglish** (even for Quantum Physics/Rocket Science):
+  - **USE LEVEL 0 (Conversational).**
+  - **FORBIDDEN:** "Definition", "Key Idea", "Working" headers.
+  - **ALLOWED:** Natural paragraphs, minimal bullets, emojis. 
+  - *Start directly:* "Quantum physics na..." (No intros).
+
+- If User is **Strictly Formal/Academic**:
+  - **USE LEVEL 3 (Structured).**
+  - Use Definition -> Key Idea -> Working format.
+
+**NEGATIVE CONSTRAINTS (STRICT):**
+1. **NO SCRIPT MIXING**:
+   - If user types in **English/Tanglish** (Latin Script), **NEVER** use Tamil Script (தமிழ்) or Hindi Script (देवनागरी).
+   - *Bad:* "Blockchain (பிளாக்செயின்) is a ledger."
+   - *Good:* "Blockchain na oru digital ledger."
+   - *Reason:* Mixing scripts looks robotic.
+
+2. **NO TEXTBOOK HEADERS IN CASUAL MODE**:
+   - If user says "sollu" or "explain pannu", **DO NOT** use headers like **Definition**, **Key Idea**, **Working**.
+   - These headers feel like a textbook. Just explain it like a friend.
+   
+3. **NO ROBOTIC FILLERS**:
+   - No "Sure, here is the explanation". Start strictly with the answer.
+
+4. **NO PARENTHETICAL TRANSLATIONS IN HEADERS**:
+   - **STRICTLY FORBIDDEN:** "Quantum Physics (குவாண்டம் இயற்பியல்)".
+   - **CORRECT:** "Quantum Physics".
+   - **Reason:** It assumes the user wants to learn the specific term in another language, which breaks the flow. ONLY use the user's primary language.
+
+**REAL-WORLD EXAMPLES (STRICT STYLE GUIDE):**
+
+**Example 1: Tanglish / Casual Explanation (Quantum Physics)**
+*User:* "Enaku quantum physics explain pannu"
+*You:* "Seri bro 😎 simple aa sollren.
+
+Quantum physics na, universe-oda romba small level la irukkura particles (atoms, electrons) epdi behave pannudhu nu study pannura physics.
+Normal world la rules different… but quantum world la rules romba weird 💀.
+
+**Main idea enna?**
+Small particles fixed aa irukkaadhu. Adhu:
+- Same time la multiple places la irukkum (Superposition).
+- Ne paatha udane oru state choose pannum.
+
+**Example easy aa:**
+Oru coin toss pannina, normal world la Head or Tail.
+But quantum world la Head + Tail both irukkum… ne paatha udane oru result decide aagum 😳.
+
+Ippo purinjutha bro? Next level pogalaama? 🚀"
+
+**Example 2: Technical/Direct**
+*User:* "Fix this React useEffect error"
+*You:* "The issue is the missing dependency array. Here is the fix:
+```javascript
+useEffect(() => {{
+  fetchData();
+}}, []); // Added [] to run only on mount
+```
+This prevents the infinite loop."
 
 **CULTURAL WARMTH:**
-Adapt to the user's language and culture naturally:
-- Detect the user's language and use culturally appropriate friendly address terms from THAT language.
-- Examples: "macha/machi/da" in Tamil, "bhai/yaar" in Hindi, "amigo" in Spanish, "mon ami" in French, "buddy/friend" in English, etc.
-- For ANY language the user speaks, use the casual/friendly terms native to that language.
-- This makes conversations feel human and warm, NOT robotic. Be like a helpful local friend, not a formal assistant.
+- **Detect & Match**: If user says "Macha", you say "Macha".
+- **Be Human**: Use emojis naturally (🌟, 🚀, 😎).
+- **No Robot Speak**: Avoid "As an AI...", "Here is the explanation...". Just start explaining.
+
+**CONFIDENCE & CLARITY PROTOCOL:**
+1. **Uncertainty Check**: If you are < 70% sure, ASK.
+2. **Progressive Response**: Give a TL;DR first.
 
 {BASE_LANGUAGE_RULES}
-
-**RESPONSE STYLE:**
-1. **For casual messages (hi, greetings, small talk):** Be brief, friendly, and natural. Reply like a close friend - 1-2 sentences max. Use casual address terms.
-2. **For technical/code questions:** Explain briefly first, then provide code in **labeled markdown blocks** (```bash, ```python, etc.). Show Mac/Linux and Windows versions if different.
-3. **Keep it concise** - Match response length to question complexity. Simple questions = short answers.
-
-**STRICT RULES:**
-- ALWAYS use triple-backticks with language names for code.
-- Be warm and engaging with emojis where appropriate.
-- AVOID using em-dashes (—), double-dashes (--), or underscores (_) **in prose**. 
-  In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`).
 
 {BASE_FORMATTING_RULES}"""
 
@@ -442,6 +496,47 @@ INTERNAL_MODE_PROMPTS = {
     "general": INTERNAL_SYSTEM_PROMPT # Fallback to default
 }
 
+# ============================================
+# TONE ACTION MAP (Emotion -> Instruction)
+# ============================================
+TONE_MAP = {
+    "frustrated": (
+        "**User Status: FRUSTRATED**\n"
+        "ACTION: **Emergency Mode**. Skip pleasantries. Acknowledge briefly ('I see the issue...'), then go straight to the fix. "
+        "Use short, broken-down steps. Avoid 'I understand'—show it by solving."
+    ),
+    "confused": (
+        "**User Status: CONFUSED**\n"
+        "ACTION: **Simplification Mode**. Use an analogy first. "
+        "Explain *why* before *how*. Check for understanding: 'Does that make sense?'"
+    ),
+    "excited": (
+        "**User Status: EXCITED**\n"
+        "ACTION: **Hype Mode** 🚀. Match their energy. Use emojis. "
+        "Say things like 'Let's build this!', 'Great choice!'. Keep momentum high."
+    ),
+    "urgent": (
+        "**User Status: URGENT**\n"
+        "ACTION: **Critical Response**. Zero fluff. No 'Hello'. "
+        "Direct answer or code immediately. Use bold for key actions."
+    ),
+    "curious": (
+        "**User Status: CURIOUS**\n"
+        "ACTION: **Deep Dive Mode**. Explain the underlying concepts. "
+        "Offer 'Pro Tips' or 'Did you know?' variants. Encourage exploration."
+    ),
+    "casual": (
+        "**User Status: CASUAL**\n"
+        "ACTION: **Chat Mode**. Relaxed, short, friendly. "
+        "Use slang if fits the vibe. Treat them like a teammate."
+    ),
+    "professional": (
+        "**User Status: PROFESSIONAL**\n"
+        "ACTION: **Executive Mode**. Polished, data-driven, concise. "
+        "Focus on ROI, standards, and correctness."
+    )
+}
+
 def _select_ui_implementation_sub_intent(user_query: str) -> str:
     q = user_query.lower()
     react_keywords = [
@@ -543,6 +638,12 @@ async def analyze_and_route_query(
             
         # "hybrid" falls through to standard auto-detection below
     
+    # Run Emotion Classification (Multi-Label)
+    # We do this for ALL non-forced queries to get the vibe
+    detected_emotions = await classify_emotion(user_query)
+    # detected_emotions is now a list
+    print(f"[Router] Emotions detected: {detected_emotions}")
+
     print(f"[Router] Pre-check fast path time: {time.time() - t_start:.4f}s")
     
     # ============================================
@@ -557,12 +658,6 @@ async def analyze_and_route_query(
         if emb_result and emb_result.get("confidence", 0) >= 0.60:
             # Use embedding result
             intent = emb_result["intent"]
-            needs_web = emb_result.get("needs_web", False)
-            needs_reasoning = emb_result.get("needs_reasoning", False)
-
-            print(f"[Router] 🧠 Embedding route: {intent} (conf={emb_result['confidence']:.2f}, path={emb_result['path']})")
-
-            # Map to existing router format
             if needs_web:
                 selected_tools = await select_tools_for_mode(user_query, mode)
                 return {
@@ -570,7 +665,8 @@ async def analyze_and_route_query(
                     "sub_intent": intent,
                     "tools": selected_tools,
                     "needs_reasoning": needs_reasoning,
-                    "embedding_confidence": emb_result["confidence"]
+                    "embedding_confidence": emb_result["confidence"],
+                    "emotions": detected_emotions
                 }
 
             # Map intent to sub_intent for internal routing
@@ -592,7 +688,9 @@ async def analyze_and_route_query(
                 "sub_intent": sub,
                 "tools": [],
                 "needs_reasoning": needs_reasoning,
-                "embedding_confidence": emb_result["confidence"]
+                "needs_reasoning": needs_reasoning,
+                "embedding_confidence": emb_result["confidence"],
+                "emotions": detected_emotions
             }
 
         print(f"[Router] Embedding low confidence ({emb_result.get('confidence', 0):.2f}), using keyword fallback")
@@ -603,6 +701,23 @@ async def analyze_and_route_query(
         
     # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
+
+    # 1.0 Explicit Tanglish Detection (Heuristic)
+    # Detects common Tanglish markers to force casual mode + Tanglish instruction
+    tanglish_markers = [
+        " macha", "macha ", " da", "da ", " bro", "bro ", " ji", "ji ", " thala", 
+        " nanba", " nanbane", " pannu", " sollu", " iruku", " irukka", " sapdhiya", 
+        " saptiya", " epdi", " eppadi", " enna", " yenna", " aama", " illa", " illai", 
+        " podhum", " venum", " vendam", " seri", " purinjidha", " puriyala", 
+        " theriyala", " theriyuma", " enaku", " unaku", " namaku"
+    ]
+    is_tanglish = any(m in q for m in tanglish_markers)
+    if is_tanglish:
+        print(f"[Router] 🕵️ Tanglish detected! Force Casual Mode.")
+        # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
+        # But for 'Explain Quantum Physics', we want INTENT=INTERNAL, SUB=general (or reasoning), but TONE=Casual.
+        # So we return emotions=['casual'] to force the tone controller.
+        detected_emotions.append("casual") 
 
     tech_intent_keywords = [
         "html", "css", "tailwind", "bootstrap", "react", "jsx", "tsx",
@@ -622,7 +737,7 @@ async def analyze_and_route_query(
         "vanakkam", "namaste", "kya haal", "wassup", "whats up", "howdy"
     ]
     if (q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list)) and not _has_tech_intent(q):
-        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 1.1 Tamil/Tanglish Casual Questions - FAST PATH
     # Catches common personal/conversational questions in Tamil
@@ -638,9 +753,14 @@ async def analyze_and_route_query(
         "eppadi iruka", "nalama", "soukyama", "sughama", "yenna panra"
     ]
     if any(tp in q for tp in tamil_casual_patterns):
-        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
     
-    # 1.2 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
+    # 1.2 "Who created you" - FAST PATH
+    identity_patterns = ["who created you", "who made you", "who built you", "your creator", "who are you"]
+    if any(p in q for p in identity_patterns):
+        return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
+
+    # 1.3 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
     # Short casual queries in any language should NOT trigger web search
     search_intent_keywords = [
         "search", "find", "look up", "latest", "news", "today", "2024", "2025",
@@ -652,7 +772,7 @@ async def analyze_and_route_query(
         # Likely a casual conversational question - don't waste time on external search
         # The LLM can answer personal/casual questions without web data
         if "?" in q or q.endswith("?"):
-            return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+            return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 1.5 LEGACY BUSINESS LOGIC (Strict Separation)
     # Business.py: "Output ONLY 'INTERNAL' for greetings, simple logic, simple coding... 'EXTERNAL' for business data"
@@ -660,34 +780,42 @@ async def analyze_and_route_query(
         # Check basic internal triggers (Code, Math, greetings are already caught)
         internal_triggers = ["code", "function", "script", "debug", "math", "calculate"]
         if any(t in q for t in internal_triggers):
-             return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+             return {"intent": "INTERNAL", "sub_intent": "general", "tools": [], "emotions": detected_emotions}
              
         # Everything else in Business Mode defaults to EXTERNAL + Search (Deep Research)
         # This matches "Pure LLM" -> Search override user observed.
         # FIX: Matches Legacy Business.py behavior by selecting tools dynamically (Maps, Places, etc.) instead of hardcoded Search.
         print(f"[Router] 💼 Business Mode: Defaulting to EXTERNAL search for '{q}'")
         selected_tools = await select_tools_for_mode(user_query, mode)
-        return {"intent": "EXTERNAL", "sub_intent": "research", "tools": selected_tools}
+        return {"intent": "EXTERNAL", "sub_intent": "research", "tools": selected_tools, "emotions": detected_emotions}
 
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
     # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"
     convo_triggers = ["you", "your", " we ", " we?", " we.", " us ", " us?", "myself", "can we", "shall we"]
     if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers) and not _has_tech_intent(q):
-         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
+         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 2. Tech Keywords / Patterns (Heuristic Classification)
     
     # Debugging (Priority 1: Catch errors before creations)
     if any(k in q for k in ["fix this error", "debug this", "why is this failing", "exception:", "error:", "traceback", "stack trace"]):
-        return {"intent": "INTERNAL", "sub_intent": "debugging", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "debugging", "tools": [], "emotions": detected_emotions}
 
     # SQL (Priority 2)
     if any(k in q for k in ["select *", "join table", "sql query", "write sql", "database schema", "insert into"]):
-        return {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "sql", "tools": [], "emotions": detected_emotions}
         
     # Code Explanation
     if any(k in q for k in ["explain this code", "how does this work", "walk me through"]):
-        return {"intent": "INTERNAL", "sub_intent": "code_explanation", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "code_explanation", "tools": [], "emotions": detected_emotions}
+
+    # 5. UI Strategy (Design, Layout) - FAST PATH
+    if "design" in q or "layout" in q or "ui" in q or "ux" in q or "wireframe" in q:
+         return {"intent": "INTERNAL", "sub_intent": "ui_strategy", "tools": [], "emotions": detected_emotions}
+         
+    # 6. Content Creation (Write, Blog, Post) - FAST PATH
+    if "write" in q and ("blog" in q or "post" in q or "email" in q or "article" in q):
+          return {"intent": "INTERNAL", "sub_intent": "content_creation", "tools": [], "emotions": detected_emotions}
 
     # UI Strategy vs Implementation
     ui_keywords = [
@@ -712,12 +840,19 @@ async def analyze_and_route_query(
             sub = "ui_strategy"
         else:
             sub = _select_ui_implementation_sub_intent(user_query)
-        return {"intent": "INTERNAL", "sub_intent": sub, "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": sub, "tools": [], "emotions": detected_emotions}
+
+    # 2. UI Implementation (Explicit) - FAST PATH
+    # Direct "generate HTML/CSS" requests
+    if (("html" in q and "css" in q) or "tailwind" in q or "react" in q or "code" in q) and ("generate" in q or "create" in q or "build" in q or "write" in q):
+        sub = _select_ui_implementation_sub_intent(user_query)
+        needs_reasoning = should_use_thinking_model(user_query, sub)
+        return {"intent": "INTERNAL", "sub_intent": sub, "tools": [], "needs_reasoning": needs_reasoning, "emotions": detected_emotions}
 
     # General Tech (Fallback to generic Internal)
     tech_keywords = ["code", "mkdir", "terminal", "npm", "git", "python", "javascript", "bash", "linux"]
     if len(q) < 150 and any(kw in q for kw in tech_keywords):
-        return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
+        return {"intent": "INTERNAL", "sub_intent": "general", "tools": [], "emotions": detected_emotions}
 
     # 3. Starts with greeting
     if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you ", "what's up "]) and not _has_tech_intent(q):
@@ -1026,10 +1161,9 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     
     # For default Relyce AI, use the internal conversational prompt with full rules
     if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
-        # Use INTERNAL_SYSTEM_PROMPT which has cultural warmth + emotional intelligence
-        base_prompt = INTERNAL_SYSTEM_PROMPT
-        if mode == "normal":
-            base_prompt = f"{base_prompt}\n{NORMAL_MARKDOWN_POLISH}"
+        # Use INTERNAL_SYSTEM_PROMPT which has cultural warmth + emotional intelligence + STRICT NEGATIVE CONSTRAINTS
+        base_prompt = INTERNAL_SYSTEM_PROMPT + "\n\n**CRITICAL OVERRIDE: DO NOT TRANSLATE HEADERS. NO BRACKETS In HEADERS.**"
+        
         # Add emotional block for normal mode
         emotional_layer = EMOTIONAL_BLOCK if mode == "normal" else ""
         # Inject user facts if available
