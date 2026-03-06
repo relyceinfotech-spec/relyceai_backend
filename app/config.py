@@ -11,15 +11,15 @@ load_dotenv()
 # API Keys
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5-nano")
+LLM_MODEL = os.getenv("LLM_MODEL", "x-ai/grok-4-fast")
 
 # OpenRouter Configuration
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-GEMINI_MODEL = "google/gemini-2.5-flash-lite:nitro"
-CODING_MODEL = os.getenv("CODING_MODEL", "z-ai/glm-4.7-flash")
-UI_MODEL = os.getenv("UI_MODEL", "qwen/qwen2.5-coder-32b-instruct")
+FAST_MODEL = "x-ai/grok-4-fast"
+CODING_MODEL = os.getenv("CODING_MODEL", "x-ai/grok-4-fast")
+UI_MODEL = os.getenv("UI_MODEL", "x-ai/grok-4-fast")
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")
-ERNIE_THINKING_MODEL = "baidu/ernie-4.5-21b-a3b-thinking"
+ERNIE_THINKING_MODEL = "x-ai/grok-4-fast"
 
 # Embedding Configuration (via OpenRouter)
 EMBEDDING_MODEL = "openai/text-embedding-3-small"
@@ -27,6 +27,13 @@ TIEBREAKER_MODEL = "openai/gpt-4o-mini"
 EMBEDDING_THRESHOLD_HIGH = 0.75
 EMBEDDING_THRESHOLD_MEDIUM = 0.60
 EMBEDDING_TIMEOUT_MS = 300
+
+# Weaviate Vector Memory Configuration
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "")
+WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY", "")
+MAX_MEMORIES_PER_USER = int(os.getenv("MAX_MEMORIES_PER_USER", "200"))
+MEMORY_DEDUP_THRESHOLD = 0.85  # Cosine similarity threshold for deduplication
+MEMORY_EXTRACTION_MODEL = os.getenv("MEMORY_EXTRACTION_MODEL", "x-ai/grok-4-fast")
 
 # Firebase Configuration
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
@@ -118,6 +125,9 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", 30))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", 60))
 RATE_LIMIT_FAIL_OPEN = os.getenv("RATE_LIMIT_FAIL_OPEN", "false").lower() == "true"
 
+# Agent mode rate limit (stricter — heavier compute per request)
+AGENT_RATE_LIMIT_PER_MINUTE = int(os.getenv("AGENT_RATE_LIMIT_PER_MINUTE", 4))
+
 # Serper Tool Endpoints
 from urllib.parse import urlparse
 
@@ -200,3 +210,8 @@ MAX_PERSONALITY_PROMPT_CHARS = int(os.getenv("MAX_PERSONALITY_PROMPT_CHARS", 200
 MAX_PERSONALITY_NAME_CHARS = int(os.getenv("MAX_PERSONALITY_NAME_CHARS", 60))
 MAX_PERSONALITY_DESC_CHARS = int(os.getenv("MAX_PERSONALITY_DESC_CHARS", 200))
 
+# Sandbox Execution Limits (Phase 6)
+SANDBOX_ENABLED = os.getenv("SANDBOX_ENABLED", "true").lower() == "true"
+SANDBOX_TIMEOUT = int(os.getenv("SANDBOX_TIMEOUT", 10))  # seconds
+SANDBOX_MEMORY_LIMIT_MB = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", 256))
+SANDBOX_CPU_SECONDS = int(os.getenv("SANDBOX_CPU_SECONDS", 5))

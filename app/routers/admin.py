@@ -106,12 +106,28 @@ async def update_membership(request: UpdateMembershipRequest, user_info: dict = 
     if not target_doc.exists:
         raise HTTPException(status_code=404, detail="Target user not found")
 
+    target_data = target_doc.to_dict() or {}
+    membership = target_data.get("membership", {})
+    existing_expiry_str = membership.get("expiryDate")
+    
     now = datetime.now(timezone.utc)
-    # Calculate expiry - use timedelta to avoid leap year edge case with replace(year=...)
+    base_date = now
+
+    if existing_expiry_str:
+        try:
+            # If standard isoformat
+            existing_expiry = datetime.fromisoformat(existing_expiry_str.replace("Z", "+00:00"))
+            if existing_expiry > now:
+                base_date = existing_expiry
+        except Exception as e:
+            print(f"[Admin] Could not parse existing expiry date: {e}")
+            pass
+
+    # Calculate expiry
     if request.billing_cycle == "yearly":
-        expiry_date = now + timedelta(days=365)
+        expiry_date = base_date + timedelta(days=365)
     else:
-        expiry_date = now + timedelta(days=30)
+        expiry_date = base_date + timedelta(days=30)
 
     updates = {
         "membership.plan": request.plan,
@@ -166,7 +182,19 @@ async def get_user(target_uid: str, user_info: dict = Depends(require_admin)):
     target_doc = target_ref.get()
     if not target_doc.exists:
         raise HTTPException(status_code=404, detail="Target user not found")
-    return {"success": True, "user": target_doc.to_dict()}
+        
+    user_data = target_doc.to_dict()
+    
+    # Process membership expiry before returning the profile
+    try:
+        check_membership_expiry(target_ref, user_data, target_uid)
+        # Fetch fresh data if it was downgraded
+        target_doc = target_ref.get()
+        user_data = target_doc.to_dict()
+    except Exception as e:
+        print(f"[Admin] Failed to check expiry during /users/{target_uid}: {e}")
+        
+    return {"success": True, "user": user_data}
 
 
 @router.delete("/users/{target_uid}")

@@ -7,15 +7,18 @@ import json
 import re
 import requests
 import time
+from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
 from app.llm.guards import normalize_user_query, build_guard_system_messages
 from app.config import (
     OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS,
-    OPENROUTER_API_KEY, GEMINI_MODEL, ERNIE_THINKING_MODEL,
+    OPENROUTER_API_KEY, FAST_MODEL, ERNIE_THINKING_MODEL,
     SERPER_CONNECT_TIMEOUT, SERPER_READ_TIMEOUT, SERPER_MAX_RETRIES, SERPER_RETRY_BACKOFF
 )
 from app.llm.embeddings import classify_emotion
+
+import httpx
 
 # Initialize clients lazily
 _client: Optional[AsyncOpenAI] = None
@@ -26,9 +29,16 @@ def get_openai_client() -> AsyncOpenAI:
     if _client is None:
         if not OPENAI_API_KEY:
              raise RuntimeError("OPENAI_API_KEY not set")
+        
+        http_client = httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=60.0)
+        )
         _client = AsyncOpenAI(
             api_key=OPENAI_API_KEY,
-            timeout=600.0
+            timeout=60.0,
+            http_client=http_client
         )
     return _client
 
@@ -38,10 +48,22 @@ def get_openrouter_client() -> AsyncOpenAI:
     if _openrouter_client is None:
         if not OPENROUTER_API_KEY:
             raise RuntimeError("OPENROUTER_API_KEY not set")
+            
+        http_client = httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0),
+            limits=httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=60.0)
+        )
         _openrouter_client = AsyncOpenAI(
             api_key=OPENROUTER_API_KEY,
             base_url="https://openrouter.ai/api/v1",
-            timeout=600.0
+            default_headers={
+                "HTTP-Referer": "https://relyce.ai", 
+                "X-Title": "Relyce AI",
+                "Connection": "keep-alive"
+            },
+            timeout=60.0,
+            http_client=http_client
         )
     return _openrouter_client
 
@@ -110,16 +132,22 @@ BASE_FORMATTING_RULES = """
 - **No Comments**: Do NOT explain code inside the block.
 - **HTML/CSS**: Use valid comments `<!-- -->`, valid CSS variables `--name`.
 - **Sources**: If using web tools, list sources at the very bottom: `Source: [Link]`
+
+**5. PARAGRAPHS AND SPACING (STRICT)**
+- DO NOT use empty lines or double newlines between paragraphs or lists.
+- Use SINGLE newlines only (`\n`). Keep things extremely compact.
+- Keep your entire response as short and concise as possible.
+- Heavily utilize markdown formatting (titles, bolding, italics) to establish visual hierarchy without relying on empty whitespace.
 """
 
 NORMAL_MARKDOWN_POLISH = """
 **NORMAL MODE PRESENTATION (Generic Only):**
-- Always use clear section headings with ## or ###.
+- Always use clear section headings with `##` or `###`.
 - Prefer bullet lists over long paragraphs.
 - Keep paragraphs to 2-3 lines max.
-- Add a blank line between sections.
+- Always use a SINGLE blank line (`\n`) between sections and paragraphs. DO NOT double space.
 - Bold only key terms.
-- Use --- for section separators only when needed.
+- Use `---` for section separators only when needed.
 """
 
 BASE_LANGUAGE_RULES = """
@@ -184,12 +212,12 @@ You must provide zero-hallucination, fact-based guidance operating with:
 **STRICT OUTPUT FORMATTING:**
 You must strictly follow this visual structure. Do NOT use numbered lists (1, 2, 3) for the headers.
 
-- First line: A short, descriptive **Title** (No Markdown bolding, just plain text).
-- Second line: A blank line.
-- Third section: The **Answer** (The detailed response).
-- Fourth section: A blank line.
+- First line: A short, descriptive **Title** formatted as a markdown `##` header.
+- Second line: A blank line (`\n\n`).
+- Third section: The **Answer** (The detailed response, heavily using bullet points and short paragraphs).
+- Fourth section: A blank line (`\n\n`).
 - Final section: List **all Sources** used. 
-  * Format strictly as: Source: [Link or Filename]
+  * Format strictly as: `Source: [Link or Filename]`
 """
 
 NORMAL_SYSTEM_PROMPT = f"""{DEFAULT_PERSONA}
@@ -322,6 +350,15 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     Imported from existing files.
     """
     user_query = normalize_user_query(user_query)
+    q = user_query.lower()
+    
+    # ⚡ FAST PATH: Obvious tools based on keywords or intent clues
+    if any(k in q for k in ["news", "latest", "today", "current", "update"]):
+        return ["Search", "News"] if mode == "deepsearch" else ["Search"]
+    
+    if any(k in q for k in ["place", "location", "near me", "map", "direction"]):
+        return ["Places", "Search"] if mode == "deepsearch" else ["Search"]
+
     guard_messages = build_guard_system_messages(user_query)
 
     if mode == "normal":
@@ -354,8 +391,9 @@ Return the tool names as a comma-separated list (e.g., 'Search, News, Videos')."
         messages.append({"role": "system", "content": guard})
     messages.append({"role": "user", "content": user_query})
 
-    response = await get_openai_client().chat.completions.create(
-        model=LLM_MODEL,
+    # Switch to faster model for tool selection to reduce TTFT
+    response = await get_openrouter_client().chat.completions.create(
+        model=TIEBREAKER_MODEL, # Use gpt-4o-mini
         messages=messages
     )
 
@@ -563,108 +601,47 @@ async def analyze_and_route_query(
     import time
     t_start = time.time()
     
-    if mode == "normal" and personality:
-        # ---------------------------------------------------------------------
-        # Relyce AI: respect content_mode overrides, hybrid uses embeddings
-        # ---------------------------------------------------------------------
-        if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
-            content_mode = personality.get("content_mode", "hybrid")
-            if content_mode == "llm_only":
-                return {"intent": "INTERNAL", "sub_intent": "general", "tools": []}
-            if content_mode == "web_search":
-                return {"intent": "EXTERNAL", "sub_intent": "research", "tools": ["Search"]}
-            # hybrid mode: fall through to embedding-based classification below
+    # Robust Initialization
+    needs_reasoning = False
+    needs_web = False
 
-        content_mode = personality.get("content_mode", "hybrid")
-        print(f"[Router DEBUG] Checking Personality: {personality.get('name')} | Mode: {content_mode}")
-        
-        if content_mode == "llm_only":
-            # Pure LLM: Force internal, no tools — but still classify sub_intent for better routing
-            sub = "general"
-            needs_reasoning = False
-            try:
-                from app.llm.embeddings import classify_intent_with_timeout
-                emb_result = await classify_intent_with_timeout(user_query)
-                if emb_result:
-                    intent = emb_result.get("intent")
-                    needs_reasoning = emb_result.get("needs_reasoning", False)
-                    sub_intent_map = {
-                        "casual": "casual_chat",
-                        "coding_simple": "code_explanation",
-                        "coding_complex": "debugging",
-                        "analysis_internal": "reasoning",
-                        "ui_strategy": "ui_strategy",
-                        "ui_implementation": "ui_implementation",
-                        "ui_design": "ui_strategy",
-                        "business": "general"
-                    }
-                    sub = sub_intent_map.get(intent, "general")
-                    if sub == "ui_implementation":
-                        sub = _select_ui_implementation_sub_intent(user_query)
-            except Exception:
-                pass
-
-            # Keyword fallback when embeddings time out or are low-confidence
-            if sub == "general":
-                q = user_query.lower()
-                if any(k in q for k in ["debug", "fix", "error", "stack trace", "traceback", "bug", "crash"]):
-                    sub = "debugging"
-                    needs_reasoning = True
-                elif any(k in q for k in ["system design", "architecture", "scalable", "scalability", "load", "throughput"]):
-                    sub = "system_design"
-                    needs_reasoning = True
-                elif any(k in q for k in ["sql", "query", "select", "join", "index"]):
-                    sub = "sql"
-                else:
-                    impl_keywords = ["html", "css", "tailwind", "react", "jsx", "component", "frontend", "implement", "build", "code", "clone"]
-                    strategy_keywords = ["ui", "ux", "design", "layout", "style guide", "design system", "wireframe", "mockup", "branding"]
-                    if any(k in q for k in impl_keywords):
-                        sub = _select_ui_implementation_sub_intent(user_query)
-                    elif any(k in q for k in strategy_keywords):
-                        sub = "ui_strategy"
-
-            if sub == "general":
-                specialty = personality.get("specialty", "general")
-                if specialty == "coding":
-                    sub = "coding_simple"
-
-            print(f"[Router] 🔒 Personality '{personality.get('name')}' forces PURE LLM (sub={sub}). (Time: {time.time() - t_start:.4f}s)")
-            return {"intent": "INTERNAL", "sub_intent": sub, "tools": [], "needs_reasoning": needs_reasoning}
-            
-        elif content_mode == "web_search":
-            # Web Search: Force external, Search tool
-            print(f"[Router] 🌍 Personality '{personality.get('name')}' forces WEB SEARCH. (Time: {time.time() - t_start:.4f}s)")
-            return {"intent": "EXTERNAL", "sub_intent": "research", "tools": ["Search"]}
-            
-        # "hybrid" falls through to standard auto-detection below
-    
-    # Run Emotion Classification (Multi-Label)
-    # We do this for ALL non-forced queries to get the vibe
-    detected_emotions = await classify_emotion(user_query)
-    # detected_emotions is now a list
-    print(f"[Router] Emotions detected: {detected_emotions}")
-
-    print(f"[Router] Pre-check fast path time: {time.time() - t_start:.4f}s")
+    # Relyce AI: personalities no longer override logic branches
+    # Normal chat always flows to automatic detection
     
     # ============================================
-    # EMBEDDING-BASED CLASSIFICATION (NEW)
-    # Runs before keyword fallback for hybrid mode
+    # PARALLEL ANALYSIS: Emotion + Intent
     # ============================================
+    from app.llm.embeddings import classify_emotion, classify_intent_with_timeout
+
+    # Run in parallel for speed (with strict timeouts)
+    emotion_task = asyncio.wait_for(classify_emotion(user_query), timeout=2.0)
+    intent_task = classify_intent_with_timeout(user_query)
+
     try:
-        from app.llm.embeddings import classify_intent_with_timeout
-
-        emb_result = await classify_intent_with_timeout(user_query)
-
+        detected_emotions, emb_result = await asyncio.gather(emotion_task, intent_task)
+    except asyncio.TimeoutError:
+        print("[Router] Emotion or Intent task timed out, using defaults")
+        detected_emotions = ["neutral"]
+        emb_result = None
+    except Exception as e:
+        print(f"[Router] Parallel analysis error: {e}")
+        detected_emotions = ["neutral"]
+        emb_result = None
+    
+    print(f"[Router] Emotions detected: {detected_emotions}")
+    
+    try:
         if emb_result and emb_result.get("confidence", 0) >= 0.60:
             # Use embedding result
             intent = emb_result["intent"]
+            needs_web = emb_result.get("needs_web", False)
             if needs_web:
                 selected_tools = await select_tools_for_mode(user_query, mode)
                 return {
-                    "intent": "EXTERNAL",
+                    "intent": "DEEP_SEARCH",
                     "sub_intent": intent,
                     "tools": selected_tools,
-                    "needs_reasoning": needs_reasoning,
+                    "needs_reasoning": emb_result.get("needs_reasoning", needs_reasoning),
                     "embedding_confidence": emb_result["confidence"],
                     "emotions": detected_emotions
                 }
@@ -684,11 +661,10 @@ async def analyze_and_route_query(
             if sub == "ui_implementation":
                 sub = _select_ui_implementation_sub_intent(user_query)
             return {
-                "intent": "INTERNAL",
+                "intent": "AGENT",
                 "sub_intent": sub,
                 "tools": [],
-                "needs_reasoning": needs_reasoning,
-                "needs_reasoning": needs_reasoning,
+                "needs_reasoning": emb_result.get("needs_reasoning", needs_reasoning),
                 "embedding_confidence": emb_result["confidence"],
                 "emotions": detected_emotions
             }
@@ -763,8 +739,10 @@ async def analyze_and_route_query(
     # 1.3 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
     # Short casual queries in any language should NOT trigger web search
     search_intent_keywords = [
-        "search", "find", "look up", "latest", "news", "today", "2024", "2025",
-        "price", "weather", "stock", "best", "top", "compare", "recommend",
+        "search", "find", "look up", "latest", "news", "current", "today", "yesterday", "now", "happening",
+        "stadium", "match", "score", "2024", "2025", "2026", "2027",
+        "happening now", "current status", "recent events", "fighting", "war in", "who won",
+        "price", "weather", "stock", "crypto", "best", "top", "compare", "recommend",
         "reviews", "rating", "buy", "cost", "deal", "discount", "release",
         "near me", "nearby", "address", "map", "open now", "hours", "schedule"
     ]
@@ -858,72 +836,9 @@ async def analyze_and_route_query(
     if len(q) < 20 and any(q.startswith(g) for g in ["hi ", "hello ", "hey ", "how are you ", "what's up "]) and not _has_tech_intent(q):
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": []}
 
-    # Define tool schema
-    tools_list = ", ".join(get_tools_for_mode(mode).keys())
-
-    # Enhanced Router Prompt for Generic Mode
-    if mode == "normal":
-        system_prompt = (
-            "Router: Output JSON.\n"
-            "Classify INTENT as 'INTERNAL' (bot can answer) or 'EXTERNAL' (needs web search).\n"
-            "If INTERNAL, also classify SUB_INTENT: [reasoning, code_explanation, debugging, system_design, sql, casual_chat, career_guidance, content_creation, ui_strategy, ui_demo_html, ui_react, ui_implementation, general].\n"
-            "If EXTERNAL, select Tools from [" + tools_list + "].\n\n"
-            "CONTEXT AWARENESS: Use the provided [Recent History] to determine intent. If the previous user request was 'code_explanation' or 'debugging', and the new query is a follow-up (e.g. 'what about this?', 'why?'), MAINTAIN the same sub_intent.\n\n"
-            "Examples:\n"
-            "- 'Write a poem' -> {intent: 'INTERNAL', sub_intent: 'content_creation'}\n"
-            "- 'Design a landing page hero section' -> {intent: 'INTERNAL', sub_intent: 'ui_strategy'}\n"
-            "- 'Build a landing page in HTML and CSS' -> {intent: 'INTERNAL', sub_intent: 'ui_demo_html'}\n"
-            "- 'Create a React landing page component' -> {intent: 'INTERNAL', sub_intent: 'ui_react'}\n"
-            "- 'Why is my react app crashing?' -> {intent: 'INTERNAL', sub_intent: 'debugging'}\n"
-            "- 'Stock price of Tesla' -> {intent: 'EXTERNAL', tools: ['Search', 'News']}\n"
-            "Format: {\"intent\": \"...\", \"sub_intent\": \"...\", \"tools\": []}"
-        )
-    else:
-        # Standard router for other modes
-        system_prompt = (
-            "Router: Output JSON.\n"
-            "1. Intent: 'INTERNAL' or 'EXTERNAL'.\n"
-            "2. Tools: Select tools from [" + tools_list + "].\n"
-            "Format: {\"intent\": \"...\", \"tools\": []}"
-        )
-
-    try:
-        # Build prompt with history
-        history_str = ""
-        if context_messages and len(context_messages) > 0:
-            # Take last 2 exchanges max
-            recent = context_messages[-2:] 
-            history_str = "\n".join([f"{m['role'].upper()}: {m['content'][:200]}..." for m in recent])
-            history_str = f"\n\n[Recent History]\n{history_str}\n"
-
-        # 🏎️ Use the configured LLM model for ultra-fast classification
-        t_router = time.time()
-        print(f"[Router] Calling {LLM_MODEL} for classification...")
-        user_query = normalize_user_query(user_query)
-        guard_messages = build_guard_system_messages(user_query)
-        messages = [{"role": "system", "content": system_prompt + history_str}]
-        for guard in guard_messages:
-            messages.append({"role": "system", "content": guard})
-        messages.append({"role": "user", "content": user_query})
-        response = await get_openai_client().chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            max_completion_tokens=80
-        )
-        print(f"[Router] {LLM_MODEL} finished in {time.time() - t_router:.4f}s")
-        
-        result = json.loads(response.choices[0].message.content)
-        
-        # Ensure sub_intent exists for INTERNAL
-        if result.get("intent") == "INTERNAL" and "sub_intent" not in result:
-             result["sub_intent"] = "general"
-             
-        return result
-    except Exception as e:
-        print(f"Router Error: {e}")
-        # Fallback to safe defaults
-        return {"intent": "EXTERNAL", "tools": ["Search"]}
+    # Full Agent Autonomy: Everything goes to AGENT mode.
+    # The agent will autonomously decide whether to use tools or answer directly.
+    return {"intent": "AGENT", "sub_intent": "general", "tools": [], "emotions": detected_emotions}
 
 
 import asyncio
@@ -998,6 +913,12 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
         context.append(f"User Occupation: {p['occupation']}")
     if p.get("aboutMe"):
         context.append(f"User Bio: {p['aboutMe']}")
+    
+    # Imported Memories (from other AI platforms)
+    memories = p.get("memories", [])
+    if memories:
+        mem_block = "\n".join(f"- {m}" for m in memories[:50])  # Cap at 50 to avoid prompt bloat
+        context.append(f"User Memories (imported context from other AI tools):\n{mem_block}")
         
     if not context:
         return ""
@@ -1012,7 +933,7 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
     )
 
 
-def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
+def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "") -> str:
     """Get the appropriate system prompt for the chat mode"""
     base_prompt = ""
     if mode == "normal":
@@ -1026,15 +947,19 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, 
     user_facts_context = ""
     if user_id:
         try:
-            from app.chat.memory import format_facts_for_prompt
-            user_facts_context = format_facts_for_prompt(user_id)
+            from app.chat.smart_memory import format_memories_for_prompt
+            # Pass user_query so memory is only fetched if they ask for it
+            user_facts_context = format_memories_for_prompt(user_id, user_query)
         except Exception as e:
             print(f"[Router] Error loading user facts: {e}")
         
-    return base_prompt + user_facts_context + _build_user_context_string(user_settings)
+    current_date = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+    time_context = f"\n\n**CURRENT DATE & TIME:** {current_date}\n"
+    
+    return base_prompt + time_context + user_facts_context + _build_user_context_string(user_settings)
 
 
-def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None) -> str:
+def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "") -> str:
     """
     Combine BASE formatting/language rules with custom personality prompt.
     Now includes SPECIALTY context for domain expertise and USER FACTS.
@@ -1044,8 +969,9 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
         user_facts_context = ""
         if user_id:
             try:
-                from app.chat.memory import format_facts_for_prompt
-                user_facts_context = format_facts_for_prompt(user_id)
+                from app.chat.smart_memory import format_memories_for_prompt
+                # If we have a way to pass query here, we'd do it. For now, rely on default behavior
+                user_facts_context = format_memories_for_prompt(user_id, user_query)
             except Exception as e:
                 print(f"[Router] Error loading user facts: {e}")
         return f"""{CORE_POLICY}
@@ -1115,15 +1041,19 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
     user_facts_context = ""
     if user_id:
         try:
-            from app.chat.memory import format_facts_for_prompt
-            user_facts_context = format_facts_for_prompt(user_id)
+            from app.chat.smart_memory import format_memories_for_prompt
+            user_facts_context = format_memories_for_prompt(user_id)
         except Exception as e:
             print(f"[Router] Error loading user facts: {e}")
+    
+    current_date = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+    time_context = f"\n\n**CURRENT DATE & TIME:** {current_date}\n"
     
     return f"""{CORE_POLICY}
 {custom_prompt}
 {specialty_context}
 {user_facts_context}
+{time_context}
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
 {_build_user_context_string(user_settings)}"""
@@ -1150,8 +1080,8 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
         user_facts_context = ""
         if user_id:
             try:
-                from app.chat.memory import format_facts_for_prompt
-                user_facts_context = format_facts_for_prompt(user_id)
+                from app.chat.smart_memory import format_memories_for_prompt
+                user_facts_context = format_memories_for_prompt(user_id)
             except Exception as e:
                 print(f"[Router] Error loading user facts: {e}")
         return f"""{CORE_POLICY}
@@ -1170,8 +1100,8 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
         user_facts_context = ""
         if user_id:
             try:
-                from app.chat.memory import format_facts_for_prompt
-                user_facts_context = format_facts_for_prompt(user_id)
+                from app.chat.smart_memory import format_memories_for_prompt
+                user_facts_context = format_memories_for_prompt(user_id)
             except Exception as e:
                 print(f"[Router] Error loading user facts: {e}")
         return f"""{CORE_POLICY}
@@ -1201,8 +1131,8 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
     user_facts_context = ""
     if user_id:
         try:
-            from app.chat.memory import format_facts_for_prompt
-            user_facts_context = format_facts_for_prompt(user_id)
+            from app.chat.smart_memory import format_memories_for_prompt
+            user_facts_context = format_memories_for_prompt(user_id)
         except Exception as e:
             print(f"[Router] Error loading user facts: {e}")
     

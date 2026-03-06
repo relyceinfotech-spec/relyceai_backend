@@ -34,3 +34,9 @@ redis>=5.0.0
 
 # Email Validation
 email-validator>=2.1.0
+
+# RAG & Document Processing
+weaviate-client>=4.5.0
+pymupdf>=1.24.0
+langchain-text-splitters>=0.0.1
+langchain-core>=0.1.40

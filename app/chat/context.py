@@ -62,7 +62,14 @@ def get_context(user_id: str, chat_id: str, personality_id: Optional[str] = None
     Get conversation context for a user's chat session.
     Returns ALL current memory messages (processor handles slicing).
     Hydrates from Firestore if memory is empty (Server Restart/TTL).
+    Also tries to hydrate the session summary if not present.
     """
+    # 0. Hydrate Summary 
+    if not _context_summaries.get(user_id, {}).get(chat_id):
+        from app.chat.history import get_chat_session
+        session_data = get_chat_session(user_id, chat_id)
+        if session_data and session_data.get('summary'):
+            _context_summaries[user_id][chat_id] = session_data['summary']
     # Check TTL
     if chat_id in _context_timestamps.get(user_id, {}):
         last_update = _context_timestamps[user_id][chat_id]
@@ -147,28 +154,28 @@ def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str
     
     # 1. Inject Summary (Long-term memory)
     summary = get_session_summary(user_id, chat_id)
-    if summary:
-        context_msgs.append({
-            "role": "system",
-            "content": f"Conversation summary so far:\n{summary}"
-        })
     
     # 2. Add Recent Messages (Short-term memory)
     raw_messages = get_context(user_id, chat_id, personality_id)
     
-    # Smart Context Optimization: importance scoring + compression
-    # Replaces simple sliding window with intelligent context management
-    optimized_messages = context_optimizer.optimize(
-        raw_messages,
-        keep_last_n=KEEP_LAST_MESSAGES,
-        summary=summary
-    )
-    
-    for msg in optimized_messages:
+    # Format messages correctly
+    formatted_messages = []
+    for msg in raw_messages:
         role = msg["role"]
         if role == "bot":
             role = "assistant"
-        context_msgs.append({"role": role, "content": msg["content"]})
+        formatted_messages.append({"role": role, "content": msg["content"]})
+        
+    # 3. Assemble Memory Architecture (System -> Summary -> Last N)
+    from app.llm.context_builder import build_context
+    context_msgs = build_context(
+        system_prompt="", # System Prompt is appended at processor level, skip it here.
+        summary=summary,
+        messages=formatted_messages
+    )
+    
+    # Remove the empty system prompt injected by build_context if we left it blank
+    context_msgs = [m for m in context_msgs if m["content"] != ""]
     
     return context_msgs
 

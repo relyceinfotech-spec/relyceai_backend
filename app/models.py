@@ -9,7 +9,7 @@ import uuid
 from app.config import MAX_CHAT_MESSAGE_CHARS
 
 # Chat Modes
-ChatMode = Literal["normal", "business", "deepsearch"]
+ChatMode = Literal["normal", "business", "deepsearch", "agent"]
 
 # Content Mode for Personas - Controls how queries are processed
 ContentMode = Literal["hybrid", "web_search", "llm_only"]
@@ -37,7 +37,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     user_id: Optional[str] = None
     chat_mode: ChatMode = "normal"
-    file_ids: List[str] = Field(default_factory=list)
+
     personality_id: Optional[str] = None
     personality: Optional[Personality] = None
     user_settings: Optional[Dict] = None

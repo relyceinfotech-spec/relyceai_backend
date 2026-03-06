@@ -5,6 +5,7 @@ Multi-device safe WebSocket implementation
 import json
 import asyncio
 import uuid
+import time
 
 try:
     import redis.asyncio as redis
@@ -13,8 +14,11 @@ except Exception:  # optional dependency
 from typing import Dict, List, Set, Optional, Tuple
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
+
+# Rate limiter for background memory extraction (max 3 concurrent workers)
+_EXTRACTION_SEMAPHORE = asyncio.Semaphore(3)
 from datetime import datetime
-from app.auth import verify_token
+from app.auth import verify_token, get_firestore_db
 from app.llm.processor import llm_processor
 from app.chat.context import get_context_for_llm, update_context_with_exchange
 from app.chat.user_profile import get_user_settings, get_session_personality_id, merge_settings
@@ -27,8 +31,18 @@ from app.chat.context import (
     get_raw_message_count
 )
 from app.chat.history import save_message_to_firebase
+from app.chat.session_rules import increment_turn as _increment_session_turn
 from app.rate_limit import check_rate_limit
 from app.config import MAX_CHAT_MESSAGE_CHARS, RATE_LIMIT_PER_MINUTE, MAX_WS_CONNECTIONS_PER_CHAT, MAX_WS_CONNECTIONS_TOTAL, REDIS_URL, REDIS_WS_CHANNEL_PREFIX
+from app.state.phase_guard import get_phase_guard
+
+# SSE deterministic sequence counter (per chat session)
+_event_seq_counters: Dict[Tuple, int] = {}
+_agent_rate_limits: Dict[str, list] = {}  # user_id -> [timestamp, ...] for agent mode rate limiting
+_agent_active_requests: set = set()  # user_ids with agent requests currently in-flight
+
+# Cancel flags for interrupt safety
+_cancel_flags: Dict[Tuple, bool] = {}
 
 class ConnectionManager:
     """
@@ -203,11 +217,15 @@ class ConnectionManager:
         message: str,
         exclude_connection: Optional[str] = None
     ) -> None:
-        if chat_key not in self.active_connections:
+        # Lock-free snapshot: dict.get() returns the live dict reference;
+        # list() copies the items tuple-list atomically enough for our needs.
+        # This avoids acquiring the asyncio.Lock on every single token,
+        # which was serializing all WebSocket sends and adding latency.
+        bucket = self.active_connections.get(chat_key)
+        if not bucket:
             return
 
-        async with self._lock:
-            connections = list(self.active_connections.get(chat_key, {}).items())
+        connections = list(bucket.items())
 
         disconnected = []
         for conn_id, websocket in connections:
@@ -259,9 +277,14 @@ class ConnectionManager:
         """
         Stream a token to all connections in a chat.
         Used for real-time streaming responses.
+        
+        NOTE: Bypasses Redis _publish_broadcast intentionally.
+        Tokens are ephemeral — cross-node fan-out adds per-token overhead
+        that directly increases visible streaming latency.
+        Only the 'done' and 'info' signals use full broadcast_to_chat.
         """
         message = json.dumps({"type": "token", "content": token})
-        await self.broadcast_to_chat(chat_key, message)
+        await self._broadcast_local(chat_key, message)
 
     def set_stop_flag(self, chat_key: Tuple[str, str], value: bool = True) -> None:
         """Set stop generation flag for a chat"""
@@ -326,6 +349,8 @@ async def handle_websocket_message(
     
     if msg_type != "message":
         return
+        
+    print(f"[WS DEBUG] Received payload: chat_mode={data.get('chat_mode')}, type={msg_type}, text_len={len(data.get('content', ''))}")
     
     # Process chat message
     content = data.get("content", "")
@@ -367,9 +392,70 @@ async def handle_websocket_message(
             websocket
         )
         return
-    
+
+    # === AGENT MODE: Tiered Rate Limit + Concurrency Guard ===
+    if chat_mode == "agent":
+        import time as _rl_time
+        _now = _rl_time.time()
+        _uid = user_id or "anonymous"
+
+        # --- Concurrency Guard: No concurrent agent requests ---
+        if _uid in _agent_active_requests:
+            await manager.send_personal_message(
+                json.dumps({"type": "error", "content": "An agent request is already in progress. Please wait for it to finish."}),
+                websocket
+            )
+            return
+
+        # --- Resolve membership plan (cached per connection) ---
+        _plan = conn_info.get("_cached_plan")
+        if not _plan:
+            try:
+                db = get_firestore_db()
+                if db and _uid != "anonymous":
+                    _user_doc = db.collection("users").document(_uid).get()
+                    if _user_doc.exists:
+                        _membership = (_user_doc.to_dict() or {}).get("membership", {})
+                        _plan = (_membership.get("plan") or "free").lower()
+                    else:
+                        _plan = "free"
+                else:
+                    _plan = "free"
+            except Exception as _e:
+                print(f"[AgentRateLimit] Plan lookup failed: {_e}")
+                _plan = "free"
+            conn_info["_cached_plan"] = _plan
+
+        # --- Tiered limits ---
+        _AGENT_LIMITS = {"free": 4, "plus": 6, "pro": 8, "business": 10}
+        _limit = _AGENT_LIMITS.get(_plan, 4)
+
+        # Sliding window check
+        if _uid not in _agent_rate_limits:
+            _agent_rate_limits[_uid] = []
+        _agent_rate_limits[_uid] = [t for t in _agent_rate_limits[_uid] if _now - t < 60]
+        if len(_agent_rate_limits[_uid]) >= _limit:
+            await manager.send_personal_message(
+                json.dumps({"type": "error", "content": f"Agent rate limit exceeded ({_limit} req/min for {_plan.capitalize()} plan). Upgrade your plan for higher limits."}),
+                websocket
+            )
+            return
+        _agent_rate_limits[_uid].append(_now)
+
+        # Mark this user as having an active agent request
+        _agent_active_requests.add(_uid)
+
     # Clear any previous stop flag
     manager.clear_stop_flag(chat_key)
+    
+    # Reset phase guard for this session (new execution = fresh state machine)
+    get_phase_guard().reset(session_id=f"{user_id}:{chat_id}")
+    
+    # Reset SSE sequence counter
+    _event_seq_counters[chat_key] = 0
+    
+    # Clear cancel flag
+    _cancel_flags[chat_key] = False
     
     # Notify all devices - processing started (IMMEDIATE FEEDBACK)
     await manager.broadcast_to_chat(
@@ -377,14 +463,19 @@ async def handle_websocket_message(
         json.dumps({"type": "info", "content": "processing"})
     )
     
+    # 🚀 Send immediate empty token to instantly transition UI from 'loading' to 'streaming' state
+    await manager.stream_to_chat(chat_key, "\u200B")
+    
     # Extract and store user facts (Run in background to not block)
-    if user_id and user_id != "anonymous":
+    # Use unique_user_id (resolved during auth) for memory storage
+    memory_user_id = conn_info.get("unique_user_id") or user_id
+    if memory_user_id and memory_user_id != "anonymous":
         try:
-            from app.chat.memory import process_and_store_facts
-            # Fire and forget fact extraction
-            asyncio.create_task(asyncio.to_thread(process_and_store_facts, user_id, content))
+            from app.chat.smart_memory import process_message as smart_memory_process
+            # Fire and forget smart memory extraction
+            asyncio.create_task(asyncio.to_thread(smart_memory_process, memory_user_id, content))
         except Exception as e:
-            print(f"[WS] Fact extraction error (non-blocking): {e}")
+            print(f"[WS] Smart memory extraction error (non-blocking): {e}")
 
     # Safety Check: Max Message Length
     if len(content) > MAX_CHAT_MESSAGE_CHARS:
@@ -407,20 +498,58 @@ async def handle_websocket_message(
     
     # Stream response to all connected devices
     full_response = ""
+    stream_generator = None
+    
+    # 🔧 BACKPRESSURE: Bounded queue between LLM producer and WebSocket consumer
+    # If client is slow, queue fills up and naturally throttles the model stream
+    BACKPRESSURE_QUEUE_SIZE = 128
+    token_queue = asyncio.Queue(maxsize=BACKPRESSURE_QUEUE_SIZE)
+    _SENTINEL = object()  # Marks end of stream
+    
+    retrieved_context_meta = {}
+    
+    async def _producer():
+        """Reads from LLM generator and enqueues tokens."""
+        nonlocal stream_generator
+        try:
+            stream_generator = llm_processor.process_message_stream(
+                content, 
+                mode=chat_mode,
+                context_messages=context_messages,
+                personality=personality,
+                user_settings=effective_settings,
+                user_id=memory_user_id,
+                session_id=chat_id
+            )
+            async for token in stream_generator:
+                await token_queue.put(token)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            await token_queue.put(e)  # Signal error to consumer
+        finally:
+            await token_queue.put(_SENTINEL)
     
     try:
-        async for token in llm_processor.process_message_stream(
-            content, 
-            mode=chat_mode,
-            context_messages=context_messages,
-            personality=personality,
-            user_settings=effective_settings,
-
-            user_id=user_id,
-            session_id=chat_id
-        ):
+        producer_task = asyncio.create_task(_producer())
+        
+        start_time = time.time()
+        while True:
+            item = await token_queue.get()
+            
+            # End of stream
+            if item is _SENTINEL:
+                break
+            
+            # Error propagation from producer
+            if isinstance(item, Exception):
+                raise item
+            
+            token = item
+            
             # Check stop flag
             if manager.should_stop(chat_key):
+                producer_task.cancel()
                 await manager.broadcast_to_chat(
                     chat_key,
                     json.dumps({"type": "info", "content": "stopped"})
@@ -430,14 +559,51 @@ async def handle_websocket_message(
             # Intercept [INFO] messages (like search status)
             if token.strip().startswith("[INFO]"):
                 clean_info = token.replace("[INFO]", "").strip()
+                
+                if clean_info.startswith("RETRIEVED_CONTEXT:"):
+                    try:
+                        retrieved_context_meta = json.loads(clean_info.replace("RETRIEVED_CONTEXT:", "", 1))
+                    except Exception:
+                        pass
+                    continue
+                
+                # Phase Guard: validate agent_state transitions
+                try:
+                    parsed = json.loads(clean_info) if clean_info.startswith("{") else {}
+                    if "agent_state" in parsed:
+                        phase_ok = get_phase_guard().transition(
+                            f"{user_id}:{chat_id}", parsed["agent_state"]
+                        )
+                        if not phase_ok:
+                            continue  # Skip regressed phase emission
+                except (json.JSONDecodeError, Exception):
+                    pass
+                
+                # SSE sequence counter
+                _event_seq_counters[chat_key] = _event_seq_counters.get(chat_key, 0) + 1
+                seq = _event_seq_counters[chat_key]
+                
                 await manager.broadcast_to_chat(
                     chat_key,
-                    json.dumps({"type": "info", "content": clean_info})
+                    json.dumps({"type": "info", "content": clean_info, "_event_seq": seq})
                 )
                 continue # Do not append to full_response or stream as token
             
+            # Check cancel flag (interrupt safety)
+            if _cancel_flags.get(chat_key, False):
+                producer_task.cancel()
+                await manager.broadcast_to_chat(
+                    chat_key,
+                    json.dumps({"type": "info", "content": '{"agent_state": "cancelled"}'})
+                )
+                break
+            
             full_response += token
+            import time as _t
+            _t_recv = _t.time()
             await manager.stream_to_chat(chat_key, token)
+            _t_sent = _t.time()
+            # Removed per-token print to prevent event loop blocking on Windows terminal
         
         # Send completion signal
         await manager.broadcast_to_chat(
@@ -448,15 +614,75 @@ async def handle_websocket_message(
         # Update context with this exchange
         update_context_with_exchange(user_id, chat_id, content, full_response, resolved_personality_id)
         
+        # === SAFE CHAT AGENT: Track session turn ===
+        try:
+            _increment_session_turn(user_id, chat_id, content, full_response)
+        except Exception as e:
+            print(f"[WS] Session turn tracking failed (non-blocking): {e}")
+        
         # Save to Firebase (background, non-blocking)
         async def save_history_background():
             try:
                 await asyncio.to_thread(save_message_to_firebase, user_id, chat_id, "user", content, resolved_personality_id)
                 await asyncio.to_thread(save_message_to_firebase, user_id, chat_id, "assistant", full_response, resolved_personality_id)
+                
+                # Smart Memory Compression
+                from app.llm.router import get_openrouter_client
+                from app.memory.summary_manager import summarize_if_needed
+                fresh_context_msgs = get_context_for_llm(user_id, chat_id, resolved_personality_id)
+                await summarize_if_needed(user_id, chat_id, fresh_context_msgs, get_openrouter_client())
             except Exception as e:
                 print(f"[WS] Background history save failed: {e}")
 
         asyncio.create_task(save_history_background())
+
+        # === Memory Extraction (background, rate-limited, 3s timeout) ===
+        # Skip if response too short (~40 tokens ≈ 200 chars) — trivial replies produce junk
+        if user_id and user_id != "anonymous" and full_response and len(full_response) > 200:
+            async def _extract_vector_memory():
+                async with _EXTRACTION_SEMAPHORE:
+                    try:
+                        from app.memory.vector_memory import extract_and_store_memories
+                        stored = await asyncio.wait_for(
+                            extract_and_store_memories(user_id, content, full_response),
+                            timeout=3.0
+                        )
+                        if stored:
+                            print(f"[WS] Vector memory: {stored} facts extracted for {user_id}")
+                    except asyncio.TimeoutError:
+                        print("[WS] Vector memory extraction timed out (3s)")
+                    except Exception as e:
+                        print(f"[WS] Vector memory extraction failed (non-blocking): {e}")
+            
+            asyncio.create_task(_extract_vector_memory())
+
+            async def _extract_knowledge_graph():
+                async with _EXTRACTION_SEMAPHORE:
+                    try:
+                        from app.memory.knowledge_graph import extract_and_store_graph
+                        stored = await asyncio.wait_for(
+                            extract_and_store_graph(user_id, content, full_response),
+                            timeout=3.0
+                        )
+                        if stored:
+                            print(f"[WS] Knowledge graph: {stored} triples extracted for {user_id}")
+                    except asyncio.TimeoutError:
+                        print("[WS] Knowledge graph extraction timed out (3s)")
+                    except Exception as e:
+                        print(f"[WS] Knowledge graph extraction failed (non-blocking): {e}")
+            
+            asyncio.create_task(_extract_knowledge_graph())
+
+        # === Retrieval Quality Scoring (background) ===
+        if retrieved_context_meta and full_response and user_id != "anonymous":
+            async def _score_retrieval_quality():
+                try:
+                    from app.context.citation_engine import score_retrievals
+                    await score_retrievals(user_id, retrieved_context_meta, full_response)
+                except Exception as e:
+                    print(f"[WS] Retrieval scoring failed (non-blocking): {e}")
+            
+            asyncio.create_task(_score_retrieval_quality())
 
         # === User Profiler: Learn from this streaming interaction ===
         if user_id and user_id != "anonymous":
@@ -474,37 +700,14 @@ async def handle_websocket_message(
             except Exception as e:
                 print(f"[WS] Profiler update failed (non-blocking): {e}")
         
-        # =========================================================================
-        # Post-Processing: Context Summarization (Deferred to improve latency)
-        # =========================================================================
-        msg_count = get_raw_message_count(user_id, chat_id)
-        if chat_mode == "normal" and msg_count >= SUMMARY_TRIGGER_MESSAGES:
+    except asyncio.CancelledError:
+        print(f"[WS] Stream cancelled by client disconnect for {chat_key}")
+        if stream_generator:
             try:
-                print(f"[WS] Triggering background summarization for {chat_id}")
-                # 1. Get messages to summarize (everything except last N)
-                # We access via get_context_for_llm which returns [System, ...Raw]
-                current_context = get_context_for_llm(user_id, chat_id, resolved_personality_id)
-                raw_msgs = [m for m in current_context if m['role'] != 'system']
-                
-                # 2. Split
-                to_summarize = raw_msgs[:-KEEP_LAST_MESSAGES] # Older messages to compact
-                
-                # 3. Generate summary (cumulative)
-                if to_summarize:
-                    existing_summary = get_session_summary(user_id, chat_id) or ""
-                    
-                    # This returns the NEW FULL summary (merged)
-                    new_cumulative_summary = await llm_processor.summarize_context(to_summarize, existing_summary)
-                    
-                    # 4. Overwrite Store (The new summary contains everything)
-                    if new_cumulative_summary:
-                       update_session_summary(user_id, chat_id, new_cumulative_summary)
-                       prune_context_messages(user_id, chat_id, KEEP_LAST_MESSAGES)
-                       print(f"[WS] Summarization complete for {chat_id}")
-                
-            except Exception as e:
-                print(f"[Context Error] Failed to summarize: {e}")
-        
+                await stream_generator.aclose()
+            except Exception:
+                pass
+        raise  # Re-raise to let the router handle the disconnect
     except Exception as e:
         error_msg = f"Error processing message: {str(e)}"
         print(f"[WS] {error_msg}")
@@ -512,3 +715,12 @@ async def handle_websocket_message(
             chat_key,
             json.dumps({"type": "error", "content": error_msg})
         )
+        if stream_generator:
+            try:
+                await stream_generator.aclose()
+            except Exception:
+                pass
+    finally:
+        # Release agent concurrency lock
+        _uid_cleanup = (user_id or "anonymous")
+        _agent_active_requests.discard(_uid_cleanup)

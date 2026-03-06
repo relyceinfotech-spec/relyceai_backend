@@ -65,6 +65,7 @@ def _save_upload_limited(upload: UploadFile, file_path: str, max_bytes: int) -> 
 @router.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
+    session_id: Optional[str] = "general",
     user_info: dict = Depends(get_current_user),
     request: Request = None,
 ):
@@ -148,7 +149,8 @@ async def upload_file(
             "filename": file.filename,
             "file_path": file_path,
             "size_mb": file_size_mb,
-            "message": "File uploaded and usage updated"
+            "message": "File uploaded and usage updated",
+            "rag_indexed": True
         }
 
     except HTTPException as he:
@@ -157,6 +159,12 @@ async def upload_file(
         print(f"[Files] Upload error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
     finally:
+        # Background RAG indexing if file exists
+        if 'file_path' in locals() and os.path.exists(file_path):
+            from app.rag.indexing import process_document_for_rag
+            import asyncio
+            asyncio.create_task(process_document_for_rag(user_info["uid"], file_path, original_name, session_id))
+
         try:
             await file.close()
         except Exception:

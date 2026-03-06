@@ -3,11 +3,13 @@ Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
 """
+import asyncio
 import json
 import re
+import html
 from typing import AsyncGenerator, List, Dict, Any, Optional
 from openai import OpenAI
-from app.config import OPENAI_API_KEY, LLM_MODEL, GEMINI_MODEL, CODING_MODEL, UI_MODEL, REASONING_EFFORT, ERNIE_THINKING_MODEL
+from app.config import OPENAI_API_KEY, LLM_MODEL, FAST_MODEL, CODING_MODEL, UI_MODEL, REASONING_EFFORT, ERNIE_THINKING_MODEL, SERPER_TOOLS
 from app.llm.router import (
     select_tools_for_mode,
     analyze_and_route_query,
@@ -21,6 +23,7 @@ from app.llm.router import (
     get_openai_client,
     get_openrouter_client,
     TONE_MAP,
+    EMOTIONAL_BLOCK,
 )
 from app.llm.routing_log import log_routing_decision
 from app.llm.guards import normalize_user_query, build_guard_system_messages
@@ -31,6 +34,26 @@ from app.llm.prompt_optimizer import prompt_optimizer
 from app.llm.user_profiler import user_profiler
 from app.llm.debug_agent import debug_agent
 from app.llm.context_optimizer import context_optimizer
+from app.llm.safe_agent import analyze_constraints, check_semantic_loss, ImpossibilityTier, DEBUG_SAFE_AGENT
+from app.llm import output_validator
+from app.chat.session_rules import increment_turn
+from app.agent.agent_orchestrator import run_agent_pipeline, build_agent_system_prompt
+from app.agent.self_monitor import evaluate_response as monitor_evaluate_response
+from app.agent.static_validator import static_validation
+from app.agent.repair_engine import repair_cycle as run_repair_cycle, generate_repair_strategy, build_repair_prompt
+from app.agent.strategy_engine import merge_reasoning_tracks
+
+active_executions = {}
+
+async def _execution_registry_cleanup():
+    """Background task to clear stalled executions older than 300 seconds."""
+    import time
+    while True:
+        await asyncio.sleep(60)
+        current_time = time.time()
+        for k, v in list(active_executions.items()):
+            if current_time - v.get("created_at", 0) > 300:
+                active_executions.pop(k, None)
 
 TEMPERATURE_MAP = {
     "general": 0.65,
@@ -83,6 +106,15 @@ REASONING_SUB_INTENTS = {
     "reasoning",
 }
 
+RAG_INSTRUCTION = """
+[CRITICAL: DOCUMENT USAGE]
+You have access to locally uploaded documents for this session. 
+- If the user asks a question related to these documents, provide a detailed answer based strictly on the document content.
+- After your main answer, add a section: "--- 💡 Related Insights from Document ---" and include 2-3 other relevant or interesting points from the uploaded file that the user might find useful.
+- If the user's question is NOT related to the documents, answer normally using your general knowledge and DO NOT include the insights section.
+- Always cite the document using [Document].
+"""
+
 # ============================================
 # PRODUCTION HARDENING: Trace ID & Gating
 # ============================================
@@ -118,36 +150,8 @@ class RequestTrace:
 def should_use_thinking_model(query: str, sub_intent: str) -> bool:
     """
     Confidence gating: Decide if query needs Ernie thinking pass.
-    
-    Logic: needsReasoning = (containsReasoningKeywords OR multiSentence)
-    Length is just an optimization hint, NOT a hard skip rule.
+    Disabling 2-pass thinking to rely on OpenRouter's native reasoning feature.
     """
-    query_lower = query.lower()
-    
-    # Simple intents NEVER need thinking (hard rule)
-    simple_intents = ["casual_chat", "general", "code_explanation", "sql", "content_creation", "ui_design", "ui_demo_html", "ui_react", "ui_implementation"]
-    if sub_intent in simple_intents:
-        return False
-    
-    # Complex indicators that ALWAYS warrant thinking (priority over length)
-    complex_indicators = [
-        "why", "how does", "explain why", "compare", "difference between",
-        "best approach", "design", "architecture", "debug", "fix this",
-        "analyze", "evaluate", "pros and cons", "trade-off", "optimize",
-        "impact", "predict", "recommend", "which is better"
-    ]
-    if any(indicator in query_lower for indicator in complex_indicators):
-        return True  # Keywords found → USE Ernie regardless of length
-    
-    # Multi-sentence queries likely need deeper reasoning
-    if query.count('.') >= 2 or query.count('?') >= 2:
-        return True
-    
-    # Short + no keywords = skip Ernie (optimization)
-    if len(query) < 80:
-        return False
-    
-    # Default: medium length queries without keywords → skip
     return False
 
 def _resolve_temperature(personality: Optional[Dict], fallback_specialty: str = "general") -> float:
@@ -192,15 +196,23 @@ def _get_reasoning_config(sub_intent: str, user_settings: Optional[Dict]) -> Opt
 
 
 def _apply_reasoning(create_kwargs: Dict[str, Any], model_to_use: str, sub_intent: str, user_settings: Optional[Dict]) -> None:
-    """Attach OpenRouter reasoning config when applicable."""
+    """Attach OpenRouter reasoning & throughput config when applicable."""
     if model_to_use == LLM_MODEL:
         return
-    reasoning = _get_reasoning_config(sub_intent, user_settings)
-    if not reasoning:
-        return
+        
     extra_body = create_kwargs.get("extra_body") or {}
-    extra_body["reasoning"] = reasoning
+    
+    # Force throughput sorting to optimize TTFT globally for OpenRouter
+    extra_body["provider"] = {"sort": "throughput"}
+    
+    reasoning = _get_reasoning_config(sub_intent, user_settings)
+    if reasoning:
+        extra_body["reasoning"] = reasoning
+        
     create_kwargs["extra_body"] = extra_body
+    
+    if create_kwargs.get("stream"):
+        create_kwargs["stream_options"] = {"include_usage": True}
 
 REASONING_VISIBLE_SUB_INTENTS = REASONING_SUB_INTENTS
 
@@ -249,34 +261,37 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
         temp = _resolve_temperature(personality, "coding")
         return ("openrouter", CODING_MODEL, temp, False, "coding_buddy_override")
 
-    # System-design override (explicit priority)
+    # Item #9: Cost-safe model routing
+    # Reasoning model for heavy tasks, flash for everything else
+    REASONING_MODEL = "deepseek/deepseek-chat"
+    
+    # System-design override → reasoning model
     if sub_intent == "system_design":
-        return ("openrouter", CODING_MODEL, None, False, "system_design_override")
+        return ("openrouter", REASONING_MODEL, None, False, "system_design_reasoning")
 
     # UI intents: prefer stronger UI model with lower temperature
     if sub_intent in UI_SUB_INTENTS:
         return ("openrouter", UI_MODEL, 0.2, False, "ui_override")
 
-    # Coding intents: use coding model, allow thinking for complex debugging/system design
+    # Debugging → reasoning model
+    if sub_intent == "debugging":
+        return ("openrouter", REASONING_MODEL, None, needs_thinking, "debugging_reasoning")
+
+    # Coding intents: use fast model (cost-safe)
     if sub_intent in LOGIC_CODING_INTENTS:
-        if sub_intent in ["debugging", "system_design"] and needs_thinking:
-            return ("openrouter", CODING_MODEL, None, True, "coding_override_thinking")
-        return ("openrouter", CODING_MODEL, None, False, "coding_override")
+        return ("openrouter", FAST_MODEL, None, False, "coding_fast")
 
-    # Business mode always uses OpenAI (except coding intents above)
+    # Business mode
     if mode == "business":
-        return ("openai", LLM_MODEL, 0.4, False, "mode_override")
+        return ("openrouter", LLM_MODEL, 0.4, False, "mode_override")
 
-    # UI/creative requests should stay creative (no coding clamp)
+    # UI/creative requests: flash (cheap)
     if sub_intent in CREATIVE_INTENTS:
-        return ("openrouter", GEMINI_MODEL, None, False, "creative_override")
+        return ("openrouter", FAST_MODEL, None, False, "creative_override")
     
-    # Analysis/Research with thinking gate
-    if sub_intent in ["analysis", "research", "reasoning"]:
-        if needs_thinking:
-            return ("openrouter", ERNIE_THINKING_MODEL, 0.2, True, "reasoning_override")
-        # Skip thinking, go direct to Gemini
-        return ("openrouter", GEMINI_MODEL, 0.4, False, "reasoning_override")
+    # Analysis/Research → reasoning model (Grounded Temperature 0.2)
+    if sub_intent in ["analysis", "research", "reasoning", "web_analysis", "web_factual"]:
+        return ("openrouter", REASONING_MODEL, 0.2, needs_thinking, "research_reasoning")
     
     # Default: General/Personality uses Gemini Flash Lite
     fallback_specialty = personality.get("specialty", "general") if personality else "general"
@@ -284,7 +299,7 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     if fallback_specialty == "coding":
         return ("openrouter", CODING_MODEL, None, False, "persona_specialty_override")
     temp = _resolve_temperature(personality, fallback_specialty)
-    return ("openrouter", GEMINI_MODEL, temp, False, "default_persona_model")
+    return ("openrouter", FAST_MODEL, temp, False, "default_persona_model")
 
 class LLMProcessor:
     """
@@ -359,7 +374,6 @@ class LLMProcessor:
         if not text:
             return text
             
-        import html
         text = html.unescape(text)
         
         sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
@@ -430,7 +444,7 @@ class LLMProcessor:
         )
         
         try:
-            response = await get_openai_client().chat.completions.create(
+            response = await get_openrouter_client().chat.completions.create(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": prompt_content}],
                 max_tokens=400
@@ -440,7 +454,7 @@ class LLMProcessor:
             return existing_summary # Return old summary if update fails
 
     
-    async def process_internal_query(
+    async def process_agent_query(
         self,
         user_query: str,
         personality: Optional[Dict] = None,
@@ -501,7 +515,7 @@ class LLMProcessor:
         except Exception as e:
             print(f"[RoutingLog] Failed: {e}")
 
-        client = get_openai_client() if model_to_use == LLM_MODEL else get_openrouter_client()
+        client = get_openrouter_client() if model_to_use == LLM_MODEL else get_openrouter_client()
         create_kwargs = {
             "model": model_to_use,
             "messages": [
@@ -522,7 +536,7 @@ class LLMProcessor:
         response = await client.chat.completions.create(**create_kwargs)
         return self._sanitize_output_text(response.choices[0].message.content)
     
-    async def process_external_query(
+    async def process_deep_search_query(
         self, 
         user_query: str, 
         mode: str = "normal",
@@ -560,11 +574,11 @@ class LLMProcessor:
         if personality and mode == "normal":
             # 🎭 Personalities are ONLY honored in Normal Mode
             from app.llm.router import get_system_prompt_for_personality
-            system_prompt = get_system_prompt_for_personality(personality, user_settings)
+            system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query)
         else:
             # Business / Deep Search / Normal (without persona) -> Use default System Prompt defined in router.py
             # This ensures Business Mode uses the EXACT "Elite Strategic Advisor" prompt from Business.py
-            system_prompt = get_system_prompt_for_mode(mode, user_settings)
+            system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query)
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
@@ -606,7 +620,7 @@ class LLMProcessor:
         except Exception as e:
             print(f"[RoutingLog] Failed: {e}")
 
-        client = get_openai_client() if client_type == "openai" else get_openrouter_client()
+        client = get_openrouter_client() if client_type == "openai" else get_openrouter_client()
         create_kwargs = {
             "model": model_to_use,
             "messages": messages
@@ -637,7 +651,7 @@ class LLMProcessor:
         user_query = normalize_user_query(user_query)
         # Analyze intent using the consolidated router
         analysis = await analyze_and_route_query(user_query, mode, personality=personality)
-        intent = analysis.get("intent", "EXTERNAL")
+        intent = analysis.get("intent", "DEEP_SEARCH")
         sub_intent = analysis.get("sub_intent", "general")
         emotions = analysis.get("emotions", [])
         
@@ -668,8 +682,8 @@ class LLMProcessor:
         # Prompt Optimizer: Select variant
         prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
 
-        if intent == "INTERNAL":
-            response_text = await self.process_internal_query(
+        if intent == "AGENT":
+            response_text = await self.process_agent_query(
                 user_query,
                 personality,
                 user_settings,
@@ -681,7 +695,7 @@ class LLMProcessor:
             )
             result_response = self._sanitize_output_text(response_text)
         else:
-            response_text, tools = await self.process_external_query(
+            response_text, tools = await self.process_deep_search_query(
                 user_query, mode, context_messages, personality, user_settings, 
                 sub_intent, user_id, 
                 emotions=emotions,
@@ -717,20 +731,12 @@ class LLMProcessor:
             except Exception as e:
                 print(f"[UserProfiler] Update failed: {e}")
 
-        if intent == "INTERNAL":
-            return {
-                "success": True,
-                "response": result_response,
-                "mode_used": "internal",
-                "tools_activated": []
-            }
-        else:
-            return {
-                "success": True,
-                "response": result_response,
-                "mode_used": mode,
-                "tools_activated": tools
-            }
+        return {
+            "success": True,
+            "response": result_response,
+            "mode_used": "agent" if intent == "AGENT" else "deep_search",
+            "tools_activated": tools if intent == "DEEP_SEARCH" else []
+        }
     
 
     async def process_message_stream(
@@ -741,7 +747,9 @@ class LLMProcessor:
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
         user_id: Optional[str] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        resume_graph: Optional[Any] = None
     ) -> AsyncGenerator[str, None]:
         """
         Streaming version of process_message.
@@ -752,609 +760,1693 @@ class LLMProcessor:
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
 
+        # ==========================================
+        # AGENT MODE: Structured Action Agent
+        # ==========================================
+        if mode == "agent":
+            async for token in self._process_agent_mode(
+                user_query, context_messages, personality, user_settings,
+                user_id, session_id, start_time,
+                task_id=task_id, resume_graph=resume_graph
+            ):
+                yield token
+            return
+
+        # Phase 1: Planning
+        yield f'[INFO]{{"agent_state": "planning", "topic": "Analyzing query & intent"}}'
+        
         # Combined Analysis (Intent + Tools)
         t_analysis_start = time.time()
-        # Pass context_messages for sticky routing (history awareness)
-        # Pass personality for Content Mode overrides (Pure LLM / Web Search)
-        analysis = await analyze_and_route_query(user_query, mode, context_messages, personality=personality)
-        intent = analysis.get("intent", "EXTERNAL")
+        
+        # 🚀 PARALLEL DATA LOADING
+        # 1. Start Analysis Task
+        analysis_task = asyncio.create_task(
+            analyze_and_route_query(user_query, mode, context_messages, personality=personality)
+        )
+        
+        # 2. Start Intelligence Loading Tasks (Not awaiting yet)
+        intel_tasks = {}
+        if user_id:
+            intel_tasks["strategy"] = asyncio.create_task(strategy_memory.load_strategy(user_id))
+            intel_tasks["profile"] = asyncio.create_task(user_profiler.load_profile(user_id))
+        if session_id:
+            intel_tasks["emotion"] = asyncio.create_task(emotion_engine.load_state(session_id, user_id=user_id))
+            if user_id:
+                from app.llm.safe_agent import analyze_constraints, CONSTRAINT_TIMEOUT_S
+                # Wrap constraint analysis in wait_for internally to handle timeout gracefully in gather
+                async def safe_constraint_task():
+                    try:
+                        return await asyncio.wait_for(
+                            analyze_constraints(user_query, user_id, session_id, context_messages),
+                            timeout=CONSTRAINT_TIMEOUT_S
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"[SafeAgent] Constraint analysis timed out ({CONSTRAINT_TIMEOUT_S*1000:.0f}ms)")
+                        return None
+                    except Exception as e:
+                        print(f"[SafeAgent] Constraint analysis failed: {e}")
+                        return None
+                intel_tasks["constraint"] = asyncio.create_task(safe_constraint_task())
+
+        # Wait for Analysis (Needed for intent routing)
+        analysis = await analysis_task
+        intent = analysis.get("intent", "DEEP_SEARCH")
         selected_tools = analysis.get("tools", [])
         sub_intent = analysis.get("sub_intent", "general")
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
-        if intent == "INTERNAL" or not selected_tools:
-            # Stream internal response
-            if personality:
-                base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
-            else:
-                from app.llm.router import _build_user_context_string
-                base_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
+        # Simplified Normal Mode: Always use unified architecture
+        # (intent and selected_tools are used to customize retrieval below)
+        # Stream internal response
+        if personality:
+            base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
+        else:
+            from app.llm.router import _build_user_context_string
+            base_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
 
-            from app.llm.router import INTERNAL_MODE_PROMPTS
-            if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
-                specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
-                system_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
-            else:
-                system_prompt = base_prompt
+        from app.llm.router import INTERNAL_MODE_PROMPTS
+        if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
+            specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
+            system_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
+        else:
+            system_prompt = base_prompt
 
-            # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
-            emotions = analysis.get("emotions", [])
-            for emotion in emotions:
-                if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+        # Wait for all memory/profile tasks securely
+        await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
 
-            # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
-            emotions = analysis.get("emotions", [])
+        # Extract intelligence results
+        def get_task_res(key):
+            if key in intel_tasks:
+                exc = intel_tasks[key].exception()
+                if not exc: return intel_tasks[key].result()
+            return None
+
+        user_strategy = get_task_res("strategy")
+        user_profile = get_task_res("profile")
+        state = get_task_res("emotion")
+        constraint_result = get_task_res("constraint")
+
+        # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
+        emotions = analysis.get("emotions", [])
+        for emotion in emotions:
+            if emotion in TONE_MAP:
+                system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+        
+        # === Intelligence Layer (Streaming) ===
+        # Strategy Memory
+        strategy_instruction = None
+        if user_id and user_strategy:
+            user_strategy = strategy_memory.update_from_query(user_strategy, user_query)
+            # Fire and forget strategy save
+            asyncio.create_task(strategy_memory.save_strategy(user_id, user_strategy))
+            strategy_instruction = strategy_memory.get_instruction(user_strategy)
+
+        # Prompt Optimizer
+        prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
+
+        # Persist Emotional State (with user_id for skill persistence)
+        skill_level = 0.5
+        is_debug_mode = False
+        frustration_prob = 0.0
+        proactive_instruction = None
+        if session_id and state:
+            state = emotion_engine.update_state(state, emotions, analysis.get("sub_intent", "general"))
+            # Async state save
+            asyncio.create_task(emotion_engine.save_state(session_id, state, user_id=user_id))
+            skill_level = state.skill_level
             
-            # === Intelligence Layer (Streaming) ===
-            # Strategy Memory
-            strategy_instruction = None
-            if user_id:
-                user_strategy = await strategy_memory.load_strategy(user_id)
-                user_strategy = strategy_memory.update_from_query(user_strategy, user_query)
-                await strategy_memory.save_strategy(user_id, user_strategy)
-                strategy_instruction = strategy_memory.get_instruction(user_strategy)
+            # Get dynamic instruction
+            emotional_instruction = emotion_engine.get_instruction(state)
+            if emotional_instruction:
+                print(f"[EmotionEngine] Injecting instruction")
+                system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
 
-            # Prompt Optimizer
-            prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
+            # === Frustration Prediction (Priority #6) ===
+            frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
+            proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
+            if proactive_instruction:
+                system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
 
-            # Persist Emotional State (with user_id for skill persistence)
-            skill_level = 0.5
-            is_debug_mode = False
-            frustration_prob = 0.0
-            proactive_instruction = None
-            if session_id:
-                state = await emotion_engine.load_state(session_id, user_id=user_id)
-                state = emotion_engine.update_state(state, emotions, analysis.get("sub_intent", "general"))
-                await emotion_engine.save_state(session_id, state, user_id=user_id)
-                skill_level = state.skill_level
-                
-                # Get dynamic instruction
-                emotional_instruction = emotion_engine.get_instruction(state)
-                if emotional_instruction:
-                    print(f"[EmotionEngine] Injecting instruction: {emotional_instruction}")
-                    system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+            # === Autonomous Debug Mode (Priority #5) ===
+            if debug_agent.should_activate(emotions, state, sub_intent):
+                is_debug_mode = True
+                debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
+                system_prompt = f"{system_prompt}\n\n{debug_prompt}"
+                yield debug_agent.get_info_message()
 
-                # === Frustration Prediction (Priority #6) ===
-                frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
-                if frustration_prob > 0.4:
-                    print(f"[EmotionEngine] Frustration prediction: {frustration_prob:.2f}")
-                proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
-                if proactive_instruction:
-                    system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
-                    print(f"[EmotionEngine] Proactive help injected (prob={frustration_prob:.2f})")
+        # === User Profiler (Priority #2) ===
+        if user_id and user_profile:
+            personalization = user_profiler.get_personalization_instruction(user_profile)
+            if personalization:
+                system_prompt = f"{system_prompt}\n\n{personalization}"
 
-                # === Autonomous Debug Mode (Priority #5) ===
-                if debug_agent.should_activate(emotions, state, sub_intent):
-                    is_debug_mode = True
-                    debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
-                    system_prompt = f"{system_prompt}\n\n{debug_prompt}"
-                    yield debug_agent.get_info_message()
-                    print(f"[DebugAgent] Activated for {sub_intent} (frustration={state.frustration:.2f})")
-            else:
-                # Fallback to transient emotions if no session_id
-                for emotion in emotions:
-                    if emotion in TONE_MAP:
-                        system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+        # Inject strategy instruction
+        if strategy_instruction:
+            system_prompt = f"{system_prompt}\n\n{strategy_instruction}"
 
-            # === User Profiler (Priority #2) ===
-            user_profile = None
-            if user_id:
-                user_profile = await user_profiler.load_profile(user_id)
-                personalization = user_profiler.get_personalization_instruction(user_profile)
-                if personalization:
-                    system_prompt = f"{system_prompt}\n\n{personalization}"
-                    print(f"[UserProfiler] Personalization injected ({user_profile.total_interactions} interactions)")
+        # Inject prompt variant
+        if prompt_variant_instruction:
+            system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
 
-            # Inject strategy instruction
-            if strategy_instruction:
-                system_prompt = f"{system_prompt}\n\n{strategy_instruction}"
+        # === SAFE CHAT AGENT: Constraint Analysis (Steps 1-11) ===
+        if constraint_result and constraint_result.constraint_prompt:
+            system_prompt = f"{system_prompt}\n\n{constraint_result.constraint_prompt}"
+            if DEBUG_SAFE_AGENT:
+                print(f"[SafeAgent] Pipeline complete: {constraint_result.log_summary()}")
 
-            # Inject prompt variant
-            if prompt_variant_instruction:
-                system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
+        print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
 
-            print(f"[LATENCY] Starting Internal Stream ({analysis.get('sub_intent', 'general')}): {time.time() - start_time:.4f}s")
+        # Setup citation tracker
+        from app.context.citation_engine import CitationTracker, CITATION_INSTRUCTION
+        citation_tracker = CitationTracker()
 
-            # === Context Intelligence (Priority #4) ===
-            # Apply smart context compression before building messages
-            optimized_context = context_messages
-            if context_messages and len(context_messages) > 4:
-                pre_count = len(context_messages)
-                pre_chars = sum(len(m.get('content', '')) for m in context_messages)
-                optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
-                post_chars = sum(len(m.get('content', '')) for m in optimized_context)
-                if pre_chars != post_chars:
-                    print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} → {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
+        # === Semantic Query Planner (zero-cost) ===
+        _query_plan = {}
+        try:
+            from app.context.query_planner import plan_query
+            _query_plan = plan_query(
+                user_query,
+                sub_intent=sub_intent,
+                has_urls=bool(re.search(r'https?://[^\s]+', user_query)),
+            )
+        except Exception as e:
+            print(f"[QueryPlanner] Failed (non-blocking): {e}")
+            _query_plan = {"needs_web": True, "needs_memory": True, "needs_chunking": True}
 
-            # Construct messages with Context
-            messages = [{"role": "system", "content": system_prompt}]
-            
-            if optimized_context:
-                messages.extend(optimized_context)
-            
-            messages.append({"role": "user", "content": user_query})
+        # Phase 2: Researching
+        yield f'[INFO]{{"agent_state": "researching", "topic": "Fetching relevant context"}}'
 
-            # === Emit Intelligence Metadata for Frontend ===
-            import json as _json
-            intel_tags = []
-            if user_profile and user_profile.total_interactions >= 5:
-                if user_profile.prefers_code_first > 0.7:
-                    intel_tags.append("code-first")
-                if user_profile.prefers_concise > 0.7:
-                    intel_tags.append("concise")
-                if user_profile.prefers_step_by_step > 0.7:
-                    intel_tags.append("step-by-step")
-                if user_profile.prefers_examples > 0.7:
-                    intel_tags.append("examples")
-            
-            intel_payload = {
-                "mode": sub_intent,
-                "debug_active": is_debug_mode,
-                "frustration": round(frustration_prob, 2) if session_id else 0,
-                "confidence": round(max(0, 1.0 - (frustration_prob if session_id else 0)), 2),
-                "skill_level": round(skill_level, 2),
-                "personalization": intel_tags,
-                "proactive_help": bool(proactive_instruction) if session_id else False
-            }
-            yield f"[INFO]INTEL:{_json.dumps(intel_payload)}"
+        # === Dynamic Context Router + PARALLEL Retrieval + Packer ===
+        _has_web_content = False
+        try:
+            from app.context.context_router import select_context_layers
+            from app.context.context_packer import pack_context
+            from app.context.retrieval_intelligence import process_retrieval
 
-            print(f"[LATENCY] Internal: Preparing stream... (Time: {time.time() - start_time:.4f}s)")
-            t_stream_start = time.time()
-            
-            # 🔀 Multi-Model Routing with Trace
-            # Initialize trace for this request
-            trace = RequestTrace()
-            trace.intent = intent
-            trace.sub_intent = sub_intent
-            trace.log("ROUTE_START", f"mode={mode}, sub_intent={sub_intent}")
-            
-            # Get routing decision with confidence gating
-            client_type, model_to_use, temperature, is_thinking_pass, route_reason = get_model_for_intent(
-                mode, sub_intent, personality, user_query
+            active_layers = select_context_layers(
+                user_query,
+                sub_intent=sub_intent,
+                has_profile=bool(user_profile),
+                has_web_content=False,  # Not fetched yet
             )
 
-            # Suppress thinking panel when no reasoning is requested for Gemini
-            if model_to_use == GEMINI_MODEL and not _get_reasoning_config(sub_intent, user_settings):
-                show_reasoning_panel = False
+            _packed_graph = None
+            _packed_memories = None
             
-            # Track if gating skipped thinking
-            if sub_intent in ["debugging", "system_design", "analysis", "research", "reasoning"] and not is_thinking_pass:
-                trace.confidence_gating_skipped = True
-                trace.log("GATING", "Skipped thinking pass (query too simple)")
-            
-            trace.model_chain.append(model_to_use)
-            trace.is_thinking_pass = is_thinking_pass
-            
-            trace.log("ROUTE_DECISION", f"client={client_type}, model={model_to_use}, temp={temperature}, thinking={is_thinking_pass}, reason={route_reason}")
+            _compacted_graph = None
+            _compacted_memory = None
+
+            # === PARALLEL retrieval with safe timeouts ===
+            _retrieval_tasks = []
+            _retrieval_keys = []
+
+            if "knowledge_graph" in active_layers and _query_plan.get("needs_memory", True):
+                async def _fetch_graph():
+                    from app.memory.knowledge_graph import retrieve_graph
+                    return await retrieve_graph(user_id, user_query, limit=5)
+                _retrieval_tasks.append(asyncio.create_task(_fetch_graph()))
+                _retrieval_keys.append("graph")
+
+            if "vector_memory" in active_layers and _query_plan.get("needs_memory", True):
+                async def _fetch_vector():
+                    from app.memory.vector_memory import retrieve_memories
+                    return await retrieve_memories(user_id, user_query, top_k=10, final_limit=5)
+                _retrieval_tasks.append(asyncio.create_task(_fetch_vector()))
+                _retrieval_keys.append("vector")
+
+            # Unified Web Search (Serper)
+            if intent == "DEEP_SEARCH" or _query_plan.get("needs_web", False):
+                async def _fetch_web_search():
+                    from app.llm.router import execute_serper_batch
+                    # Use the correct Search endpoint from SERPER_TOOLS
+                    endpoint = SERPER_TOOLS.get("Search", "https://google.serper.dev/search")
+                    return await execute_serper_batch(endpoint, [user_query])
+                _retrieval_tasks.append(asyncio.create_task(_fetch_web_search()))
+                _retrieval_keys.append("web_search")
+
+            # RAG Document Retrieval (uploaded files for this session)
+            if session_id and user_id:
+                async def _fetch_rag():
+                    from app.rag.retrieval import retrieve_rag_context
+                    return await retrieve_rag_context(user_id=user_id, query=user_query, session_id=session_id, top_k=5)
+                _retrieval_tasks.append(asyncio.create_task(_fetch_rag()))
+                _retrieval_keys.append("rag")
+
+            if _retrieval_tasks:
+                _parallel_start = time.time()
+                
+                # Extended timeout for web/graph retrieval (5 seconds)
+                done, pending = await asyncio.wait(
+                    _retrieval_tasks,
+                    timeout=5.0
+                )
+                
+                _results = [None] * len(_retrieval_tasks)
+                
+                for i, task in enumerate(_retrieval_tasks):
+                    key = _retrieval_keys[i]
+                    if task in done:
+                        if not task.cancelled() and task.exception() is None:
+                            _results[i] = task.result()
+                        elif task.exception():
+                            print(f"[{key.capitalize()}Retrieval] failed: {task.exception()}")
+                    else:
+                        # Pending task timed out
+                        task.cancel()
+                        _parallel_ms = (time.time() - _parallel_start) * 1000
+                        print(f"[RetrievalTimeout] task={key}_search duration={_parallel_ms:.0f}ms trace=sys")
+                        
+                _parallel_ms = (time.time() - _parallel_start) * 1000
+                print(f"[ParallelRetrieval] completed in {_parallel_ms:.0f}ms")
+
+                for key, result in zip(_retrieval_keys, _results):
+                    if result is None:
+                        continue
+                    if key == "graph":
+                        _packed_graph = result
+                    elif key == "vector":
+                        _packed_memories = result
+                    elif key == "rag":
+                        # result is context string from retrieve_rag_context
+                        if result and str(result).strip():
+                            citation_tracker.add_rag_results(result)
+                            system_prompt += f"\n\n**LOCALLY UPLOADED DOCUMENTS:**\n{result}"
+                            system_prompt += f"\n\n{RAG_INSTRUCTION}"
+                    elif key == "web_search":
+                        # Process Serper results via CitationTracker
+                        citation_tracker.add_serper_results(result)
+                        
+                        # Correctly extract organic results from batch response
+                        organic_results = []
+                        if isinstance(result, list) and result:
+                            # Batch response: result is a list of results for each query
+                            first_q = result[0]
+                            if isinstance(first_q, dict):
+                                organic_results = first_q.get("organic", [])
+                        elif isinstance(result, dict):
+                            # Non-batch response
+                            organic_results = result.get("organic", [])
+                            
+                        # Inject top results into system prompt
+                        if organic_results:
+                            search_context = "\n".join([
+                                f"- {r.get('title')}: {r.get('snippet')} ({r.get('link')})" 
+                                for r in organic_results[:4] if isinstance(r, dict)
+                            ])
+                            system_prompt += f"\n\n**FRESH WEB CONTEXT (March 2026):**\n{search_context}"
+
+            # === Retrieval Intelligence: deduplicate + filter ===
+            if _packed_graph or _packed_memories:
+                ril_result = process_retrieval(
+                    vector_memories=_packed_memories,
+                    graph_triples=_packed_graph,
+                    query=user_query,
+                )
+                _packed_memories = ril_result["vector_memories"]
+                _packed_graph = ril_result["graph_triples"]
+                
+                # Track citations for the filtered context
+                citation_tracker.add_vector_memories(_packed_memories)
+                citation_tracker.add_graph_triples(_packed_graph)
+
+            # === Context Compactor: dedup + merge + compress ===
+            if _packed_graph or _packed_memories:
+                try:
+                    from app.context.context_compactor import compact_context
+                    graph_texts = []
+                    if _packed_graph:
+                        for t in _packed_graph:
+                            subj = getattr(t, 'subject', '') if hasattr(t, 'subject') else ''
+                            rel = getattr(t, 'relation', '') if hasattr(t, 'relation') else ''
+                            obj = getattr(t, 'object', '') if hasattr(t, 'object') else ''
+                            graph_texts.append(f"{subj} {rel} {obj}")
+                    mem_texts = []
+                    if _packed_memories:
+                        for m in _packed_memories:
+                            mem_texts.append(getattr(m, 'text', '') if hasattr(m, 'text') else str(m))
+                    compacted = compact_context(graph_items=graph_texts, memory_items=mem_texts)
+                    # Use compacted text lists for packing
+                    _compacted_graph = compacted["graph"]
+                    _compacted_memory = compacted["memory"]
+                except Exception as e:
+                    print(f"[ContextCompactor] Failed (non-blocking): {e}")
+                    _compacted_graph = None
+                    _compacted_memory = None
+
+            # Pack all context into compact block with semantic IDs
+            if _packed_graph or _packed_memories:
+                packed_block = pack_context(
+                    graph_triples=_compacted_graph if _compacted_graph is not None else _packed_graph,
+                    vector_memories=_compacted_memory if _compacted_memory is not None else _packed_memories,
+                )
+                if packed_block:
+                    system_prompt = f"{system_prompt}\n{packed_block}"
+                    g_count = len(_packed_graph) if _packed_graph else 0
+                    m_count = len(_packed_memories) if _packed_memories else 0
+                    print(f"[ContextPacker] Injected: {g_count} triples + {m_count} memories (layers: {active_layers})")
+
+        except Exception as e:
+            print(f"[ContextRouter] Failed (non-blocking): {e}")
+
+        # === URL Auto-Fetch (AFTER Router — conditional on planner) ===
+        if _query_plan.get("needs_web", True):
             try:
-                log_routing_decision(user_id, {
-                    "intent": intent,
-                    "sub_intent": sub_intent,
-                    "mode": mode,
-                    "forced_model": model_to_use,
-                    "reason": route_reason
-                })
+                from app.input_processing.web_fetch import detect_urls, fetch_and_extract
+                from app.safety.safety_filter import wrap_web_content
+                detected_urls = detect_urls(user_query)
+                if detected_urls:
+                    for url in detected_urls[:2]:
+                        fetch_result = await asyncio.wait_for(
+                            fetch_and_extract(url), timeout=5.0
+                        )
+                        if fetch_result.get("status") == "success":
+                            page_data = fetch_result["data"]
+                            page_content = page_data.get("content", "")
+                            page_title = page_data.get("title", "")
+                            
+                            # Junk page filter
+                            if len(page_content) < 200:
+                                print(f"[WebFetch] Skipped junk page (length < 200 chars): {url}")
+                                continue
+                            
+                            # Safety Limit: Cap long pages
+                            if len(page_content) > 12000:
+                                print(f"[WebFetch] Truncating page from {len(page_content)} to 12000 chars: {url}")
+                                page_content = page_content[:12000]
+
+                            from app.input_processing.doc_chunker import needs_chunking, analyze_document
+                            if needs_chunking(page_content):
+                                insights = await asyncio.wait_for(
+                                    analyze_document(page_content), timeout=15.0
+                                )
+                                if insights:
+                                    system_prompt += wrap_web_content(insights, url, page_title)
+                                    citation_tracker.add_web_content(url, page_title)
+                                    _has_web_content = True
+                                    print(f"[WebFetch] Chunked analysis for: {url} ({len(page_content)} chars)")
+                            else:
+                                system_prompt += wrap_web_content(page_content, url, page_title)
+                                citation_tracker.add_web_content(url, page_title)
+                                _has_web_content = True
+                                print(f"[WebFetch] Injected content for: {url} ({len(page_content)} chars)")
+                        else:
+                            print(f"[WebFetch] Failed for {url}: {fetch_result.get('data', 'unknown')}")
+            except asyncio.TimeoutError:
+                print("[WebFetch] URL fetch timed out (5s)")
             except Exception as e:
-                print(f"[RoutingLog] Failed: {e}")
+                print(f"[WebFetch] URL auto-fetch failed (non-blocking): {e}")
+        else:
+            print("[QueryPlanner] Web fetch skipped (not needed)")
+
+        # Append Citation Instructions & Context Footnotes to system prompt
+        if citation_tracker.citations:
+            system_prompt += CITATION_INSTRUCTION
+            system_prompt += citation_tracker.get_footnotes()
+            print(f"[CitationEngine] Added {len(citation_tracker.citations)} source citations")
             
-            # Select the appropriate client
-            if client_type == "openai":
-                client = get_openai_client()
+            # Emit retrieved context IDs precisely for quality scoring
+            cited_vectors = [c.reference for c in citation_tracker.citations if c.source_type == "vector"]
+            cited_graphs = [c.reference for c in citation_tracker.citations if c.source_type == "graph"]
+            if cited_vectors or cited_graphs:
+                yield f"[INFO]RETRIEVED_CONTEXT:{json.dumps({'vector': cited_vectors, 'graph': cited_graphs})}"
+
+        # === Structured Reasoning Scaffold (Item #10: polished) ===
+        _scaffold = (
+            "\n\nBefore answering, think through these steps internally:\n"
+            "1. Identify the task type.\n"
+            "2. Determine which context sources are relevant.\n"
+            "3. Extract key facts from the context.\n"
+            "4. Reason carefully before producing the final answer.\n\n"
+            "Only output the final answer to the user. "
+            "Do not expose your reasoning steps."
+        )
+        # Phase 3: Synthesizing
+        yield f'[INFO]{{"agent_state": "synthesizing", "topic": "Merging & refining knowledge"}}'
+
+        system_prompt = f"{system_prompt}{_scaffold}"
+
+        # === Dynamic Response Formatter (Item #8) ===
+        try:
+            from app.context.response_formatter import format_instruction
+            _task_type = _query_plan.get("task_type", "general_chat")
+            _fmt_instruction = format_instruction(_task_type)
+            if _fmt_instruction:
+                system_prompt = f"{system_prompt}{_fmt_instruction}"
+        except Exception:
+            pass  # Non-blocking
+
+        # === Context Intelligence (Priority #4) ===
+        # Apply smart context compression before building messages
+        optimized_context = context_messages
+        if context_messages and len(context_messages) > 4:
+            pre_count = len(context_messages)
+            pre_chars = sum(len(m.get('content', '')) for m in context_messages)
+            optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
+            post_chars = sum(len(m.get('content', '')) for m in optimized_context)
+            if pre_chars != post_chars:
+                print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} → {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
+
+        # Construct messages with Context
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if optimized_context:
+            messages.extend(optimized_context)
+        
+        messages.append({"role": "user", "content": user_query})
+
+        # === Emit Intelligence Metadata for Frontend ===
+        import json as _json
+        intel_tags = []
+        if user_profile and user_profile.total_interactions >= 5:
+            if user_profile.prefers_code_first > 0.7:
+                intel_tags.append("code-first")
+            if user_profile.prefers_concise > 0.7:
+                intel_tags.append("concise")
+            if user_profile.prefers_step_by_step > 0.7:
+                intel_tags.append("step-by-step")
+            if user_profile.prefers_examples > 0.7:
+                intel_tags.append("examples")
+        
+        intel_payload = {
+            "mode": sub_intent,
+            "debug_active": is_debug_mode,
+            "frustration": round(frustration_prob, 2) if session_id else 0,
+            "confidence": round(max(0, 1.0 - (frustration_prob if session_id else 0)), 2),
+            "skill_level": round(skill_level, 2),
+            "personalization": intel_tags,
+            "proactive_help": bool(proactive_instruction) if session_id else False
+        }
+        yield f"[INFO]INTEL:{_json.dumps(intel_payload)}"
+
+        print(f"[LATENCY] Internal: Preparing stream... (Time: {time.time() - start_time:.4f}s)")
+        
+        # Phase 4: Finalizing
+        yield f'[INFO]{{"agent_state": "finalizing", "topic": "Generating response"}}'
+        
+        t_stream_start = time.time()
+        
+        # 🔀 Multi-Model Routing with Trace
+        # Initialize trace for this request
+        trace = RequestTrace()
+        trace.intent = intent
+        trace.sub_intent = sub_intent
+        trace.log("ROUTE_START", f"mode={mode}, sub_intent={sub_intent}")
+        
+        # Get routing decision with confidence gating
+        client_type, model_to_use, temperature, is_thinking_pass, route_reason = get_model_for_intent(
+            mode, sub_intent, personality, user_query
+        )
+
+        # Suppress thinking panel when no reasoning is requested for Gemini
+        if model_to_use == FAST_MODEL and not _get_reasoning_config(sub_intent, user_settings):
+            show_reasoning_panel = False
+        
+        # Track if gating skipped thinking
+        if sub_intent in ["debugging", "system_design", "analysis", "research", "reasoning"] and not is_thinking_pass:
+            trace.confidence_gating_skipped = True
+            trace.log("GATING", "Skipped thinking pass (query too simple)")
+        
+        trace.model_chain.append(model_to_use)
+        trace.is_thinking_pass = is_thinking_pass
+        
+        trace.log("ROUTE_DECISION", f"client={client_type}, model={model_to_use}, temp={temperature}, thinking={is_thinking_pass}, reason={route_reason}")
+        try:
+            log_routing_decision(user_id, {
+                "intent": intent,
+                "sub_intent": sub_intent,
+                "mode": mode,
+                "forced_model": model_to_use,
+                "reason": route_reason
+            })
+        except Exception as e:
+            print(f"[RoutingLog] Failed: {e}")
+        
+        # Select the appropriate client
+        if client_type == "openai":
+            client = get_openrouter_client()
+        else:
+            client = get_openrouter_client()
+        
+        # === SAFE CHAT AGENT: Streaming decision ===
+        use_streaming = True
+        if constraint_result and constraint_result.has_strict():
+            use_streaming = True
+        create_kwargs = {
+            "model": model_to_use,
+            "messages": messages,
+            "stream": use_streaming
+        }
+        max_tokens = _get_max_tokens_for_sub_intent(sub_intent)
+        if max_tokens:
+            create_kwargs["max_tokens"] = max_tokens
+        if temperature is not None:
+            create_kwargs["temperature"] = temperature
+        
+        _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
+        if is_thinking_pass:
+            # Pass 1: Thinking model plans and analyzes (NO code generation)
+            trace.log("THINKING_START", f"model={model_to_use}")
+            thinking_response = ""
+            
+            # For coding intents, use a planning-focused prompt
+            if sub_intent in LOGIC_CODING_INTENTS:
+                planning_messages = [
+                    {"role": "system", "content": (
+                        "You are an expert software architect, debugger, and technical analyst. "
+                        "Your job is to THINK, PLAN, and ANALYZE — NOT to write code.\n\n"
+                        "Depending on the request:\n"
+                        "• If BUILDING something: Break down requirements, identify tech stack, "
+                        "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
+                        "• If DEBUGGING: Analyze the error/issue, identify root causes, "
+                        "explain what's going wrong, and outline the exact fix strategy step by step.\n"
+                        "• If EXPLAINING code: Break down the code's purpose, logic flow, "
+                        "key functions, data flow, and how each part connects.\n"
+                        "• If DESIGNING a system: Identify components, architecture patterns, "
+                        "data models, APIs, and trade-offs.\n\n"
+                        "DO NOT write any code. Only provide a detailed analysis and plan "
+                        "that a developer can use to implement or fix the solution perfectly."
+                    )},
+                ]
+                if context_messages:
+                    planning_messages.extend(context_messages)
+                planning_messages.append({"role": "user", "content": user_query})
+                
+                planning_kwargs = {
+                    "model": model_to_use,
+                    "messages": planning_messages,
+                    "stream": True,
+                    "temperature": 0.7
+                }
+                planning_kwargs = self._guard_kwargs(planning_kwargs, user_query)
+                stream = await client.chat.completions.create(**planning_kwargs)
             else:
-                client = get_openrouter_client()
+                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+                stream = await client.chat.completions.create(**create_kwargs)
+            
+            # Signal start of thinking to UI
+            yield "[THINKING]"
+
+            async for chunk in stream:
+                if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                    r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                    if isinstance(chunk.usage, dict):
+                        r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                    if r_tokens:
+                        yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
+                    content_chunk = chunk.choices[0].delta.content
+                    thinking_response += content_chunk
+                    # Stream the thinking content to the UI
+                    yield self._sanitize_output_text(content_chunk)
+            
+            trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
+            
+            # Signal end of thinking
+            yield "[/THINKING]"
+
+            # Pass 2: Generate final output with appropriate model
+            if sub_intent in UI_SUB_INTENTS:
+                output_model = UI_MODEL
+            elif sub_intent in LOGIC_CODING_INTENTS:
+                output_model = CODING_MODEL
+            else:
+                output_model = FAST_MODEL
+
+            trace.model_chain.append(output_model)
+            trace.log("OUTPUT_START", f"model={output_model}")
+            
+            # Construct pass 2 messages with thinking context
+            if sub_intent in LOGIC_CODING_INTENTS:
+                # For coding: GLM gets the plan and writes production code
+                pass2_messages = [
+                    {"role": "system", "content": (
+                        f"{system_prompt}\n\n"
+                        "You are now implementing code based on a detailed technical plan. "
+                        "Write clean, complete, production-ready code following the plan exactly. "
+                        "Include all styling, interactivity, and details mentioned in the plan. "
+                        "Make the output visually stunning and modern."
+                    )},
+                    {"role": "user", "content": f"TECHNICAL PLAN:\n\n{thinking_response}\n\nORIGINAL REQUEST: {user_query}\n\nNow write the complete, production-ready code based on this plan."}
+                ]
+            else:
+                pass2_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Based on this analysis:\n\n{thinking_response}\n\nProvide a clear, well-formatted response to: {user_query}"}
+                ]
+            
+            if context_messages:
+                pass2_messages = [pass2_messages[0]] + context_messages + [pass2_messages[-1]]
+            
+            pass2_kwargs = {
+                "model": output_model,
+                "messages": pass2_messages,
+                "stream": True,
+                "temperature": 0.3  # Lower temp for synthesis
+            }
+            if max_tokens:
+                pass2_kwargs["max_tokens"] = max_tokens
+            if sub_intent in UI_SUB_INTENTS:
+                pass2_kwargs["stream"] = False
+                pass2_kwargs = self._guard_kwargs(pass2_kwargs, user_query)
+                response = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
+                response_text = (response.choices[0].message.content or "")
+                fixed = self._fix_html_css_output(response_text)
+                sanitized = self._sanitize_output_text(fixed, allow_double_hyphen=True)
+                # === Response Critic (buffered path) ===
+                try:
+                    from app.safety.response_critic import needs_critic, run_critic
+                    if needs_critic(sub_intent, sanitized):
+                        correction = await run_critic(user_query, sanitized)
+                        if correction:
+                            sanitized = self._sanitize_output_text(correction, allow_double_hyphen=True)
+                except Exception as crit_e:
+                    print(f"[Critic] Error (non-blocking): {crit_e}")
+                for i in range(0, len(sanitized), 800):
+                    yield sanitized[i:i+800]
+            else:
+                try:
+                    stream = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
+                    async for chunk in stream:
+                        if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                            r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                            if isinstance(chunk.usage, dict):
+                                r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                            if r_tokens:
+                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                        if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
+                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                except Exception as stream_err:
+                    print(f"[Processor] Stream failed in pass 2: {stream_err}")
+                    yield f"\n\n⚠️ **Stream interrupted:** {str(stream_err)}"
+            # End thinking return path
+            return
+
+        # === SAFE CHAT AGENT: Single-shot path for STRICT limits ===
+        if constraint_result and constraint_result.has_strict():
+            create_kwargs["stream"] = False
+            create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+
+            import time as _time_mod
+            _ss_start = _time_mod.time()
+            _max_latency = 30.0  # 2x typical streaming ~15s
+            _retry_budget = 2
+
+            response = await client.chat.completions.create(**create_kwargs)
+            full_text = self._sanitize_output_text(response.choices[0].message.content or "")
+
+            # Validate
+            vresult = output_validator.validate(
+                full_text, constraint_result.active_rules,
+                intent=constraint_result.intent, query=user_query
+            )
+
+            # Retry loop
+            retry_count = 0
+            while not vresult.passed and output_validator.should_retry(
+                vresult, constraint_result.impossibility_tier, retry_count, _retry_budget
+            ):
+                elapsed = _time_mod.time() - _ss_start
+                if elapsed > _max_latency:
+                    _retry_budget = min(_retry_budget, 1)  # Reduce budget on timeout
+                    if retry_count >= _retry_budget:
+                        break
+
+                retry_count += 1
+                retry_mode = output_validator.get_retry_mode(retry_count)
+
+                if DEBUG_SAFE_AGENT:
+                    print(f"[SafeAgent] Retry {retry_count}: mode={retry_mode}, violations={vresult.violations}")
+
+                retry_prompt = output_validator.build_retry_prompt(
+                    user_query, full_text, vresult.violations,
+                    constraint_result.active_rules
+                )
+                retry_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": retry_prompt}
+                ]
+
+                if retry_mode == "streaming-trim":
+                    # Retry #2: streaming fallback + trim
+                    retry_kwargs = {
+                        "model": model_to_use, "messages": retry_messages,
+                        "stream": True
+                    }
+                    if temperature is not None:
+                        retry_kwargs["temperature"] = max(0.1, (temperature or 0.5) - 0.2)
+                    retry_kwargs = self._guard_kwargs(retry_kwargs, user_query)
+                    stream_retry = await client.chat.completions.create(**retry_kwargs)
+                    streamed_text = ""
+                    async for chunk in stream_retry:
+                        if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                            r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                            if isinstance(chunk.usage, dict):
+                                r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                            if r_tokens:
+                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                        if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
+                            streamed_text += chunk.choices[0].delta.content
+                    full_text = self._sanitize_output_text(streamed_text)
+                else:
+                    # Retry #1: single-shot tightened
+                    retry_kwargs = {
+                        "model": model_to_use, "messages": retry_messages,
+                        "stream": False
+                    }
+                    if temperature is not None:
+                        retry_kwargs["temperature"] = max(0.1, (temperature or 0.5) - 0.2)
+                    retry_kwargs = self._guard_kwargs(retry_kwargs, user_query)
+                    retry_resp = await client.chat.completions.create(**retry_kwargs)
+                    full_text = self._sanitize_output_text(retry_resp.choices[0].message.content or "")
+
+                vresult = output_validator.validate(
+                    full_text, constraint_result.active_rules,
+                    intent=constraint_result.intent, query=user_query
+                )
+                vresult.retries_used = retry_count
+
+            # Use trimmed version
+            final_output = vresult.trimmed_response or full_text
+            if vresult.clarity_note:
+                final_output += vresult.clarity_note
+
+            if DEBUG_SAFE_AGENT:
+                print(f"[SafeAgent] Final: passed={vresult.passed} retries={retry_count} trimmed={vresult.was_trimmed}")
+
+            # Yield as chunks
+            for i in range(0, len(final_output), 800):
+                yield final_output[i:i+800]
+            return
+
+        # Normal streaming path (no STRICT limits or thinking pass)
+        create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+        
+        # 🔧 PROVIDER ERROR RECOVERY: Retry on 429/timeout
+        stream = None
+        for _attempt in range(2):
+            try:
+                stream = await client.chat.completions.create(**create_kwargs)
+                break
+            except Exception as api_err:
+                err_str = str(api_err).lower()
+                is_retryable = any(k in err_str for k in ["429", "rate limit", "timeout", "timed out", "502", "503", "overloaded"])
+                if is_retryable and _attempt == 0:
+                    wait_time = 2.0
+                    print(f"[RECOVERY] Provider error (attempt 1): {api_err}. Retrying in {wait_time}s...")
+                    yield "[INFO]{\"provider_retry\": true}"
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[RECOVERY] Provider error (final): {api_err}")
+                    yield f"⚠️ The AI provider is temporarily unavailable. Please try again in a moment.\n\n*Error: {type(api_err).__name__}*"
+                    return
+        
+        if stream is None:
+            yield "⚠️ Failed to connect to AI provider after retries."
+            return
+
+        print(f"[LATENCY] Internal: Stream Connection Established: {time.time() - start_time:.4f}s")
+        
+        emit_raw_reasoning = show_reasoning_panel
+        in_reasoning = False
+        allow_reasoning_tokens = show_reasoning_panel
+        
+        # Performance Tracking
+        first_token_time = None
+        tokens_yielded = 0
+        
+        async for chunk in stream:
+            if first_token_time is None:
+                first_token_time = time.time()
+                print(f"[METRICS] Normal Stream TTFT: {first_token_time - start_time:.4f}s")
+            if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                if isinstance(chunk.usage, dict):
+                    r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                if r_tokens:
+                    yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                    
+            if not hasattr(chunk, "choices") or not chunk.choices: continue
+            delta = chunk.choices[0].delta
+            
+            # Check for GLM/model built-in reasoning tokens
+            if allow_reasoning_tokens:
+                reasoning_chunks_to_emit = []
+                reasoning = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
+                if reasoning:
+                    reasoning_chunks_to_emit.append(reasoning)
+                details = getattr(delta, 'reasoning_details', None)
+                if details:
+                    for item in details:
+                        if isinstance(item, dict):
+                            text_part = item.get("text") or item.get("summary")
+                        else:
+                            text_part = getattr(item, "text", None) or getattr(item, "summary", None)
+                        if text_part:
+                            reasoning_chunks_to_emit.append(text_part)
+                if reasoning_chunks_to_emit:
+                    for reasoning in reasoning_chunks_to_emit:
+                        if emit_raw_reasoning:
+                            if not in_reasoning:
+                                in_reasoning = True
+                                trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+                                yield "[THINKING]"
+                            yield self._sanitize_output_text(reasoning)
+                        else:
+                            if not in_reasoning:
+                                in_reasoning = True
+                                trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+            
+            # Regular content
+            if delta.content:
+                if in_reasoning:
+                    in_reasoning = False
+                    trace.log("REASONING_COMPLETE", "built-in reasoning done")
+                    if emit_raw_reasoning:
+                        yield "[/THINKING]"
+                sanitized_chunk = self._sanitize_output_text(delta.content)
+                yield sanitized_chunk
+                tokens_yielded += 1
+                
+        # Close reasoning if stream ended during reasoning
+        if in_reasoning:
+            trace.log("REASONING_COMPLETE", "built-in reasoning done")
+            if emit_raw_reasoning:
+                yield "[/THINKING]"
+                
+        if first_token_time:
+            end_time = time.time()
+            duration = end_time - first_token_time
+            tps = tokens_yielded / duration if duration > 0 else 0
+            print(f"[METRICS] Normal Stream Speed: {tps:.1f} tokens/sec ({tokens_yielded} tokens in {duration:.2f}s)")
+        
+        # End of Unified Normal Mode
+        return
+
+
+    async def _process_agent_mode(
+        self,
+        user_query: str,
+        context_messages: Optional[List[Dict]] = None,
+        personality: Optional[Dict] = None,
+        user_settings: Optional[Dict] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        start_time: float = 0.0,
+        task_id: Optional[str] = None,
+        resume_graph: Optional[Any] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        Structured Action Agent mode.
+        Runs the 16-layer decision pipeline, then generates via LLM.
+        Includes tool execution interceptor, completion guard, and failure transparency.
+        """
+        import time as _time
+        import json as _json
+        from app.agent.tool_executor import (
+            parse_tool_calls, execute_tool, format_tool_result,
+            ExecutionContext,
+        )
+
+        MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
+        MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
+
+        # --- Run agent pipeline (classify → time → autonomy → orchestrate) ---
+        pipeline_start = _time.time()
+        agent_result = await run_agent_pipeline(
+            user_query,
+            context_messages=context_messages,
+            intent="",
+            sub_intent="",
+            user_id=user_id,
+            session_id=session_id,
+            session_start_time=start_time,
+        )
+        
+        # Override tool classification if we are resuming a deterministic graph node
+        if resume_graph:
+            agent_result.tool_allowed = True
+            if not agent_result.allowed_tools:
+                agent_result.allowed_tools = ["search_web", "read_file", "calculate", "get_current_time"] 
+            if agent_result.action_decision:
+                agent_result.action_decision.action_type = "ACTION"
+            
+        print(f"[Agent] Pipeline complete in {_time.time() - pipeline_start:.4f}s | "
+              f"type={agent_result.action_decision.action_type if agent_result.action_decision else 'N/A'} | "
+              f"decision={agent_result.decision} | "
+              f"delegation={agent_result.delegation_active} | "
+              f"tools={'ENABLED' if agent_result.tool_allowed else 'DISABLED'}")
+
+        # --- Register Execution Context early (needed by metadata + tool dispatch) ---
+        exec_ctx = agent_result.execution_context
+        exec_ctx.user_id = user_id or ""  # PH 4: Pass user context to tools
+        exec_ctx.session_id = session_id or ""
+
+        # --- Emit agent intel metadata ---
+        # Map action_type to IntelligenceBar-compatible mode
+
+        action_type = agent_result.action_decision.action_type if agent_result.action_decision else "QUESTION"
+        _mode_map = {
+            "TASK": "reasoning",
+            "ACTION": "system_design",
+            "QUESTION": "general",
+            "CODING": "coding",
+            "DEBUGGING": "debugging",
+            "RESEARCH": "research",
+            "ANALYSIS": "analysis",
+            "CREATIVE": "creative",
+        }
+        ui_mode = _mode_map.get(action_type, "general")
+        
+        # Derive confidence from strategy or autonomy
+        _confidence = 0.85
+        _strategy = getattr(agent_result, "strategy", None)
+        if _strategy and hasattr(_strategy, 'research_confidence'):
+            _confidence = _strategy.research_confidence
+        elif agent_result.autonomy and agent_result.autonomy.risk_tier == "high":
+            _confidence = 0.5
+        elif agent_result.autonomy and agent_result.autonomy.risk_tier == "medium":
+            _confidence = 0.7
+        
+        intel_payload = {
+            "mode": ui_mode,
+            "action_type": action_type,
+            "decision": agent_result.decision,
+            "delegation": agent_result.delegation_active,
+            "tool_allowed": agent_result.tool_allowed,
+            "risk_tier": agent_result.autonomy.risk_tier if agent_result.autonomy else "low",
+            "reversible": agent_result.autonomy.reversible if agent_result.autonomy else True,
+            "time_sensitive": agent_result.temporal.is_time_sensitive if agent_result.temporal else False,
+            # IntelligenceBar-compatible fields
+            "confidence": _confidence,
+            "debug_active": action_type == "DEBUGGING",
+            "skill_level": 0.8 if action_type in ["TASK", "CODING", "DEBUGGING"] else 0.5,
+            "proactive_help": action_type == "TASK" and bool(agent_result.action_decision and agent_result.action_decision.subtasks),
+        }
+        yield f"[INFO]INTEL:{_json.dumps(intel_payload)}"
+
+        # --- Register Execution Profile ---
+        import uuid
+        execution_id = str(uuid.uuid4())
+        active_executions[execution_id] = {"ctx": exec_ctx, "created_at": _time.time()}
+        yield f'[INFO]{_json.dumps({"execution_id": execution_id})}'
+
+        if getattr(exec_ctx, 'memory_hits', 0) > 0:
+            yield '[INFO]{"memory_used": true}'
+        
+        # State: Initializing
+        yield f"[INFO]{_json.dumps({'agent_state': 'initializing', 'topic': 'Configuring agent execution context'})}"
+
+        # State: Planning
+        if agent_result.action_decision and agent_result.action_decision.action_type in ["ACTION", "TASK"]:
+            yield f"[INFO]{_json.dumps({'agent_state': 'planning', 'topic': f'Developing strategy for {action_type.lower()} task'})}"
+            
+            # Plan Preview
+            if agent_result.action_decision.action_type == "TASK" and agent_result.action_decision.subtasks:
+                exec_ctx.internal_plan = agent_result.action_decision.subtasks
+                yield f"[INFO]{_json.dumps({'agent_state': 'plan_preview', 'plan': agent_result.action_decision.subtasks})}"
+
+        # --- Handle confirm / ask decisions (short-circuit) ---
+        if agent_result.decision == "confirm":
+            yield agent_result.message
+            return
+
+        if agent_result.decision == "ask":
+            yield agent_result.message
+            return
+
+        # --- Build system prompt with runtime context + tool mode ---
+        system_prompt = build_agent_system_prompt(agent_result)
+
+        # --- Prepare messages ---
+        optimized_context = context_messages
+        if context_messages and len(context_messages) > 4:
+            optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if optimized_context:
+            messages.extend(optimized_context)
+        messages.append({"role": "user", "content": user_query})
+
+        # --- Hybrid Strategy: Inject reasoning / emit metadata ---
+        strategy = getattr(agent_result, "strategy", None)
+        if strategy:
+            yield f'[INFO]{_json.dumps({"strategy_mode": strategy.planning_mode})}'
+
+            # PARALLEL_REASONING: inject structured reasoning context
+            if strategy.planning_mode == "PARALLEL_REASONING" and strategy.reasoning_context:
+                rc = strategy.reasoning_context
+                messages.append({"role": "system", "content": (
+                    "Planning Insight:\n"
+                    f"- Performance: {rc.get('performance', 'N/A')}\n"
+                    f"- Structure: {rc.get('structure', 'N/A')}\n"
+                    f"- Risk: {rc.get('risk', 'N/A')}\n"
+                    f"- Alternatives: {rc.get('alternatives', 'N/A')}\n"
+                    "Use this context while forming your answer."
+                )})
+
+        # --- INIT PHASE 4B MEMORY OUTCOME TRACKER ---
+        memory_outcome = {
+            "strategy_mode": strategy.planning_mode if strategy else None,
+            "confidence_drifted": False,
+            "research_used": False,
+            "research_text": "",
+            "output_text": "",
+            "repair_attempts": []
+        }
+
+        # --- NEW CONTEXT FOR TASK_STATE (PHASE 4C) ---
+        # task_id is already passed as an argument
+        
+        # Initialize task tracking for multi-step strategies
+        if session_id and task_id and strategy and strategy.planning_mode in ["ADAPTIVE_CODE_PLAN", "SEQUENTIAL_PLAN"]:
+            from app.state.task_state_engine import create_task_state
+            # Only create if it doesn't already exist (e.g. not a resume)
+            create_task_state(session_id, task_id, strategy.planning_mode)
+            
+            # --- PHASE 4D: Transaction Start ---
+            from app.state.transaction_manager import begin_transaction
+            try:
+                begin_transaction(session_id, task_id)
+            except Exception as e:
+                print(f"[Transaction] Warning: {e}")
+
+        # --- RESEARCH PHASE: Execute prior to LLM generation ---
+        # Gating: Only auto-execute if research confidence > 0.7
+        if agent_result.tool_allowed and strategy and strategy.research_needed and strategy.research_confidence > 0.7:
+            yield f'[INFO]{_json.dumps({"agent_state": "researching", "topic": strategy.research_needed.get("mode")})}'
+            
+            from app.agent.tool_executor import ToolCall, execute_tool, format_tool_result
+            from app.research.cache import get_cached, set_cache
+            from app.research.source_ranker import compute_trust_score, enforce_domain_diversity
+            from app.research.recency import compute_recency_score, final_source_score, parse_date_heuristic
+            from app.research.chunker import chunk_text
+            from app.research.conflict_detector import detect_conflicts, adjust_confidence_for_conflicts
+
+            r_tool = strategy.research_needed.get("tool", "search_web")
+            r_prefix = strategy.research_needed.get("query_prefix", "")
+            r_query = f"{r_prefix} {user_query}".strip()
+            
+            cached = get_cached(r_query)
+            if cached:
+                formatted_research = cached
+                yield f'[INFO]{_json.dumps({"agent_state": "research_cache_hit"})}'
+            else:
+                research_call = ToolCall(name=r_tool, args=r_query, raw=f'{r_tool}("{r_query}")')
+                research_result = await execute_tool(research_call, agent_result.execution_context)
+                
+                if research_result.success and isinstance(research_result.data, list):
+                    results = research_result.data
+                    
+                    # Score results
+                    for idx, r in enumerate(results):
+                        link = r.get("url", r.get("link", ""))
+                        trust = compute_trust_score(link)
+                        
+                        pub_date = parse_date_heuristic(r.get("date", ""))
+                        recency = compute_recency_score(pub_date)
+                        
+                        # Proxy for relevance (search engine implicitly sorts by relevance)
+                        similarity = max(0.2, 1.0 - (idx * 0.1))
+                        r["_score"] = final_source_score(similarity, trust, recency)
+                        
+                    # Sort internally by our trust+recency+similarity score
+                    results.sort(key=lambda x: x.get("_score", 0), reverse=True)
+                    
+                    # Diversity and Top N
+                    top_results = enforce_domain_diversity(results, max_results=3)
+                    
+                    # Chunk and aggregate
+                    synthesized_chunks = []
+                    for r in top_results:
+                        title = r.get("title", "")
+                        snippet = r.get("snippet", "")
+                        chunks = chunk_text(snippet, max_chars=1000)
+                        chunked_snippet = " ".join(chunks)
+                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})\nSnippet: {chunked_snippet}")
+                        
+                    # Conflict Check
+                    conflicts = detect_conflicts(synthesized_chunks)
+                    if conflicts:
+                        strategy.research_confidence = adjust_confidence_for_conflicts(strategy.research_confidence, conflicts)
+                        print("[Agent] Conflict detected in research chunks. Lowering research confidence.")
+                        yield f'[INFO]{_json.dumps({"agent_state": "research_conflict_detected"})}'
+                        
+                    formatted_research = "\\n\\n".join(synthesized_chunks)
+                    set_cache(r_query, formatted_research)
+                    memory_outcome["research_used"] = True
+                    memory_outcome["research_text"] = formatted_research
+                else:
+                    formatted_research = None
+                    yield f'[INFO]{_json.dumps({"agent_state": "research_failed"})}'
+
+            if formatted_research:
+                messages.append({
+                    "role": "system",
+                    "content": f"Research Data Acquired:\\n{formatted_research}\\n\\nUse this data to fulfill the user's request."
+                })
+
+        # --- LLM generation with Tool Execution Interceptor ---
+        client_type, model_to_use, temperature, _, route_reason = get_model_for_intent(
+            "normal", "general", personality, user_query
+        )
+        client = get_openrouter_client() if client_type == "openai" else get_openrouter_client()
+
+        full_response = ""
+        
+        # --- PHASE 5: Graph Scheduler Interception ---
+        # If the strategy implies a multi-step deterministic workflow, route to DAG engine
+        use_graph_engine = False
+        if agent_result.tool_allowed and (resume_graph or (strategy and strategy.planning_mode in ["ADAPTIVE_CODE_PLAN", "SEQUENTIAL_PLAN"])):
+            use_graph_engine = True
+            from app.agent.graph_builder import compile_plan_graph
+            from app.agent.graph_scheduler import run_plan_graph
+            from app.state.task_state_engine import update_task_graph
+            
+            # Map original query/plan into a graph
+            if resume_graph:
+                plan_graph = resume_graph
+            else:
+                plan_graph = compile_plan_graph(session_id, task_id, user_query)
+            
+            # Seed state with new graph snapshot
+            update_task_graph(session_id, task_id, plan_graph.serialize(), new_status="RUNNING")
             
             create_kwargs = {
                 "model": model_to_use,
                 "messages": messages,
+                "temperature": temperature,
                 "stream": True
             }
-            max_tokens = _get_max_tokens_for_sub_intent(sub_intent)
-            if max_tokens:
-                create_kwargs["max_tokens"] = max_tokens
-            if temperature is not None:
-                create_kwargs["temperature"] = temperature
             
-            # For thinking models, we need to collect the full response for 2-pass
-            if is_thinking_pass:
-                # Pass 1: Thinking model plans and analyzes (NO code generation)
-                trace.log("THINKING_START", f"model={model_to_use}")
-                thinking_response = ""
-                
-                # For coding intents, use a planning-focused prompt
-                if sub_intent in LOGIC_CODING_INTENTS:
-                    planning_messages = [
-                        {"role": "system", "content": (
-                            "You are an expert software architect, debugger, and technical analyst. "
-                            "Your job is to THINK, PLAN, and ANALYZE — NOT to write code.\n\n"
-                            "Depending on the request:\n"
-                            "• If BUILDING something: Break down requirements, identify tech stack, "
-                            "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
-                            "• If DEBUGGING: Analyze the error/issue, identify root causes, "
-                            "explain what's going wrong, and outline the exact fix strategy step by step.\n"
-                            "• If EXPLAINING code: Break down the code's purpose, logic flow, "
-                            "key functions, data flow, and how each part connects.\n"
-                            "• If DESIGNING a system: Identify components, architecture patterns, "
-                            "data models, APIs, and trade-offs.\n\n"
-                            "DO NOT write any code. Only provide a detailed analysis and plan "
-                            "that a developer can use to implement or fix the solution perfectly."
-                        )},
-                    ]
-                    if context_messages:
-                        planning_messages.extend(context_messages)
-                    planning_messages.append({"role": "user", "content": user_query})
-                    
-                    planning_kwargs = {
-                        "model": model_to_use,
-                        "messages": planning_messages,
-                        "stream": True,
-                        "temperature": 0.7
-                    }
-                    planning_kwargs = self._guard_kwargs(planning_kwargs, user_query)
-                    stream = await client.chat.completions.create(**planning_kwargs)
-                else:
-                    create_kwargs = self._guard_kwargs(create_kwargs, user_query)
-                    stream = await client.chat.completions.create(**create_kwargs)
-                
-                # Signal start of thinking to UI
-                yield "[THINKING]"
-
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        content_chunk = chunk.choices[0].delta.content
-                        thinking_response += content_chunk
-                        # Stream the thinking content to the UI
-                        yield self._sanitize_output_text(content_chunk)
-                
-                trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
-                
-                # Signal end of thinking
-                yield "[/THINKING]"
-
-                # Pass 2: Generate final output with appropriate model
-                if sub_intent in UI_SUB_INTENTS:
-                    output_model = UI_MODEL
-                elif sub_intent in LOGIC_CODING_INTENTS:
-                    output_model = CODING_MODEL
-                else:
-                    output_model = GEMINI_MODEL
-
-                trace.model_chain.append(output_model)
-                trace.log("OUTPUT_START", f"model={output_model}")
-                
-                # Construct pass 2 messages with thinking context
-                if sub_intent in LOGIC_CODING_INTENTS:
-                    # For coding: GLM gets the plan and writes production code
-                    pass2_messages = [
-                        {"role": "system", "content": (
-                            f"{system_prompt}\n\n"
-                            "You are now implementing code based on a detailed technical plan. "
-                            "Write clean, complete, production-ready code following the plan exactly. "
-                            "Include all styling, interactivity, and details mentioned in the plan. "
-                            "Make the output visually stunning and modern."
-                        )},
-                        {"role": "user", "content": f"TECHNICAL PLAN:\n\n{thinking_response}\n\nORIGINAL REQUEST: {user_query}\n\nNow write the complete, production-ready code based on this plan."}
-                    ]
-                else:
-                    pass2_messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Based on this analysis:\n\n{thinking_response}\n\nProvide a clear, well-formatted response to: {user_query}"}
-                    ]
-                
-                if context_messages:
-                    pass2_messages = [pass2_messages[0]] + context_messages + [pass2_messages[-1]]
-                
-                pass2_kwargs = {
-                    "model": output_model,
-                    "messages": pass2_messages,
-                    "stream": True,
-                    "temperature": 0.3  # Lower temp for synthesis
-                }
-                if max_tokens:
-                    pass2_kwargs["max_tokens"] = max_tokens
-                if sub_intent in UI_SUB_INTENTS:
-                    pass2_kwargs["stream"] = False
-                    pass2_kwargs = self._guard_kwargs(pass2_kwargs, user_query)
-                    response = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
-                    response_text = (response.choices[0].message.content or "")
-                    fixed = self._fix_html_css_output(response_text)
-                    sanitized = self._sanitize_output_text(fixed, allow_double_hyphen=True)
-                    for i in range(0, len(sanitized), 800):
-                        yield sanitized[i:i+800]
-                else:
-                    pass2_kwargs = self._guard_kwargs(pass2_kwargs, user_query)
-                    stream = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
-                    async for chunk in stream:
-                        if chunk.choices[0].delta.content:
-                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
-            else:
-                # Single-pass: Direct streaming (captures reasoning tokens from models like GLM)
-                if sub_intent in UI_SUB_INTENTS:
-                    create_kwargs["stream"] = False
-                    create_kwargs = self._guard_kwargs(create_kwargs, user_query)
-                    response = await client.chat.completions.create(**create_kwargs)
-                    response_text = (response.choices[0].message.content or "")
-                    fixed = self._fix_html_css_output(response_text)
-                    sanitized = self._sanitize_output_text(fixed, allow_double_hyphen=True)
-                    for i in range(0, len(sanitized), 800):
-                        yield sanitized[i:i+800]
-                    return
-                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
-                stream = await client.chat.completions.create(**create_kwargs)
-
-                print(f"[LATENCY] Internal: Stream Connection Established: {time.time() - start_time:.4f}s (Waited: {time.time() - t_stream_start:.4f}s)")
-                
-                emit_raw_reasoning = show_reasoning_panel
-                in_reasoning = False
-                allow_reasoning_tokens = show_reasoning_panel
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta
-                    
-                    # Check for GLM/model built-in reasoning tokens
-                    if allow_reasoning_tokens:
-                        reasoning_chunks_to_emit = []
-                        reasoning = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
-                        if reasoning:
-                            reasoning_chunks_to_emit.append(reasoning)
-                        details = getattr(delta, 'reasoning_details', None)
-                        if details:
-                            for item in details:
-                                if isinstance(item, dict):
-                                    text_part = item.get("text") or item.get("summary")
-                                else:
-                                    text_part = getattr(item, "text", None) or getattr(item, "summary", None)
-                                if text_part:
-                                    reasoning_chunks_to_emit.append(text_part)
-                        if reasoning_chunks_to_emit:
-                            for reasoning in reasoning_chunks_to_emit:
-                                if emit_raw_reasoning:
-                                    if not in_reasoning:
-                                        in_reasoning = True
-                                        trace.log("REASONING_START", f"model={model_to_use} (built-in)")
-                                        yield "[THINKING]"
-                                    yield self._sanitize_output_text(reasoning)
-                                else:
-                                    if not in_reasoning:
-                                        in_reasoning = True
-                                        trace.log("REASONING_START", f"model={model_to_use} (built-in)")
-                    
-                    # Regular content
-                    if delta.content:
-                        if in_reasoning:
-                            in_reasoning = False
-                            trace.log("REASONING_COMPLETE", "built-in reasoning done")
-                            if emit_raw_reasoning:
-                                yield "[/THINKING]"
-                        sanitized_chunk = self._sanitize_output_text(delta.content)
-                        yield sanitized_chunk
-                
-                # Close reasoning if stream ended during reasoning
-                if in_reasoning:
-                    trace.log("REASONING_COMPLETE", "built-in reasoning done")
-                    if emit_raw_reasoning:
-                        yield "[/THINKING]"
-        else:
-            # External Mode with Tools
-            tools_dict = get_tools_for_mode(mode)
+            print("\n\n--- GRAPH MESSAGES DUMP ---")
+            print(repr(messages))
+            print("---------------------------\n\n")
             
-            # Yield info about tools being used
-            yield f"[INFO] Searching with: {', '.join(selected_tools)}\n\n"
+            async for token in run_plan_graph(
+                graph=plan_graph,
+                strategy=strategy,
+                user_query=user_query,
+                messages=messages,
+                agent_result=agent_result,
+                client=client,
+                model_to_use=model_to_use,
+                create_kwargs=create_kwargs
+            ):
+                yield self._sanitize_output_text(token)
             
-            t2 = time.time()
-            aggregated_context = {}
-            for tool in selected_tools:
-                if tool in tools_dict:
-                    endpoint = tools_dict[tool]
-                    param_key = "url" if tool == "Webpage" else "q"
-                    result = await execute_serper_batch(endpoint, [user_query], param_key=param_key)
-                    aggregated_context[tool] = result
-            print(f"[LATENCY] Tool Execution (Serper): {time.time() - t2:.4f}s")
+            # --- Synthesis Pass: Convert tool results into readable output ---
+            # Extract tool results from messages (added by graph scheduler)
+            tool_result_messages = [
+                m for m in messages
+                if m.get("role") == "system" and "successfully completed" in m.get("content", "")
+            ]
             
-            # 🔧 PRODUCTION HARDENING: Mini validation pass for search results
-            def validate_search_results(context: dict) -> dict:
-                """
-                Lightweight validation/deduplication of search results.
-                - Remove duplicate URLs
-                - Strip ad content
-                - Rank by freshness (if date available)
-                """
-                validated = {}
-                seen_urls = set()
-                
-                for tool, results in context.items():
-                    if isinstance(results, list):
-                        cleaned = []
-                        for item in results:
-                            if isinstance(item, dict):
-                                url = item.get("link", item.get("url", ""))
-                                # Skip duplicates
-                                if url and url in seen_urls:
-                                    continue
-                                seen_urls.add(url)
-                                
-                                # Skip obvious ad/sponsored content
-                                title = item.get("title", "").lower()
-                                if any(ad in title for ad in ["sponsored", "ad:", "[ad]"]):
-                                    continue
-                                    
-                                cleaned.append(item)
-                        validated[tool] = cleaned
-                    else:
-                        validated[tool] = results
-                        
-                return validated
+            print(f"[Synthesis] Tool result messages found: {len(tool_result_messages)}")
             
-            aggregated_context = validate_search_results(aggregated_context)
-            print(f"[SEARCH] Validated {sum(len(v) if isinstance(v, list) else 1 for v in aggregated_context.values())} results")
-            
-            # Now stream the synthesis
-            context_str = json.dumps(aggregated_context, indent=2)
-            
-            # Determine system prompt
-            if personality and mode == "normal":
-                # 🎭 Personalities are now honored ONLY in Normal/Generic mode
-                # This prevents "Hello macha" leaking into Business Mode
-                from app.llm.router import get_system_prompt_for_personality
-                system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id)
-            else:
-                from app.llm.router import get_system_prompt_for_mode
-                system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id)
-            
-            messages = [{"role": "system", "content": system_prompt}]
-            
-            if context_messages:
-                messages.extend(context_messages[-6:])
-            
-            messages.append({
-                "role": "user",
-                "content": f"Search Data:\n{context_str}\n\nUser Query: {user_query}"
-            })
-            
-            print(f"[LATENCY] Ready to Stream Synthesis: {time.time() - start_time:.4f}s")
-            
-            # 🔀 HYBRID MODE: Web Search + Conditional Reasoning
-            trace_ext = RequestTrace()
-            trace_ext.intent = "EXTERNAL"
-            trace_ext.sub_intent = "web_search"
-            
-            # Check if query needs deep reasoning after web search
-            needs_reasoning = should_use_thinking_model(user_query, "web_search")
-
-            final_client_type, final_model, final_temp, _, route_reason = get_model_for_intent(
-                mode, sub_intent, personality, user_query
-            )
-            final_client = get_openai_client() if final_client_type == "openai" else get_openrouter_client()
-
-            # Preserve legacy behavior: Business mode never uses the reasoning pass
-            if final_client_type == "openai":
-                needs_reasoning = False
-
-            trace_ext.log(
-                "ROUTE_DECISION",
-                f"client={final_client_type}, model={final_model}, temp={final_temp}, reason={route_reason}"
-            )
-            try:
-                log_routing_decision(user_id, {
-                    "intent": "EXTERNAL",
-                    "sub_intent": sub_intent,
-                    "mode": mode,
-                    "forced_model": final_model,
-                    "reason": route_reason
-                })
-            except Exception as e:
-                print(f"[RoutingLog] Failed: {e}")
-            
-            if final_client_type == "openai":
-                # OpenAI direct (no reasoning step)
-                client = final_client
-                model_to_use = final_model
-                trace_ext.model_chain.append(model_to_use)
-                trace_ext.log("EXTERNAL_ROUTE", f"direct({route_reason}) -> {model_to_use}")
-                
-                create_kwargs = {
-                    "model": model_to_use,
-                    "messages": messages,
-                    "stream": True
-                }
-                create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
-                if final_temp is not None:
-                    create_kwargs["temperature"] = final_temp
-                _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
-                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
-                stream = await client.chat.completions.create(**create_kwargs)
-                
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield self._sanitize_output_text(chunk.choices[0].delta.content)
-                        
-            elif needs_reasoning:
-                # 🧠 HYBRID: Web → Ernie (thinking) → Gemini (synthesis)
-                trace_ext.is_thinking_pass = True
-                trace_ext.model_chain.append(ERNIE_THINKING_MODEL)
-                trace_ext.log("HYBRID_START", f"hybrid(reasoning, final={route_reason}) -> Ernie")
-                
-                # Pass 1: Ernie thinks about the search results
-                thinking_messages = [
-                    {"role": "system", "content": "You are an expert analyst. Analyze the search results thoroughly. Identify key facts, compare sources, resolve contradictions, and extract insights. Think step by step."},
-                    {"role": "user", "content": f"Search Results:\n{context_str}\n\nUser Query: {user_query}\n\nAnalyze these results and provide your reasoning."}
-                ]
-                
-                thinking_kwargs = {
-                    "model": ERNIE_THINKING_MODEL,
-                    "messages": thinking_messages,
-                    "stream": True,
-                    "temperature": 0.2
-                }
-
-                thinking_response = ""
-                
-                # Signal start of thinking
-                yield "[THINKING]"
-                
-                thinking_kwargs = self._guard_kwargs(thinking_kwargs, user_query)
-                thinking_stream = await get_openrouter_client().chat.completions.create(**thinking_kwargs)
-                async for chunk in thinking_stream:
-                    if chunk.choices[0].delta.content:
-                        content_chunk = chunk.choices[0].delta.content
-                        thinking_response += content_chunk
-                        # Stream thinking content
-                        yield self._sanitize_output_text(content_chunk)
-                        
-                trace_ext.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
-                
-                # Signal end of thinking
-                yield "[/THINKING]"
-
-                # Pass 2: Final model synthesizes the answer
-                trace_ext.model_chain.append(final_model)
-                trace_ext.log("SYNTHESIS_START", f"Final model synthesizing")
+            if tool_result_messages:
+                # Build a CLEAN context — strip all old refusal messages to prevent context poisoning
+                # Only include: system prompt (first msg), user query (last user msg), tool results, and synthesis instruction
+                tool_data = "\n\n".join(m.get("content", "") for m in tool_result_messages)
                 
                 synthesis_messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Based on this analysis:\n\n{thinking_response}\n\nProvide a clear, well-structured answer to: {user_query}"}
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a real-time data synthesis engine. Your ONLY job is to take search results "
+                            "and present them in a clear, detailed, well-formatted response.\n\n"
+                            "RULES:\n"
+                            "- Use headings, bullet points, bold text, and structured formatting.\n"
+                            "- Include ALL specific details: numbers, names, dates, locations, quotes.\n"
+                            "- NEVER say 'I cannot access real-time data' — the data is provided below.\n"
+                            "- NEVER apologize or mention knowledge cutoffs.\n"
+                            "- NEVER refuse. Your only purpose is to format and present the data.\n"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Original question: {user_query}\n\n--- LIVE SEARCH DATA ---\n{tool_data}\n--- END DATA ---\n\nPresent ALL of this data in a comprehensive, well-structured response."
+                    }
                 ]
                 
-                if context_messages:
-                    synthesis_messages = [{"role": "system", "content": system_prompt}] + context_messages[-4:] + [synthesis_messages[-1]]
+                print(f"[Synthesis] Starting synthesis LLM call with {len(tool_data)} chars of data")
                 
                 synthesis_kwargs = {
-                    "model": final_model,
+                    "model": model_to_use,
                     "messages": synthesis_messages,
+                    "temperature": temperature,
                     "stream": True
                 }
-                synthesis_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
-                if final_temp is not None:
-                    synthesis_kwargs["temperature"] = final_temp
                 
-                synthesis_kwargs = self._guard_kwargs(synthesis_kwargs, user_query)
-                stream = await final_client.chat.completions.create(**synthesis_kwargs)
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                try:
+                    synthesis_stream = await client.chat.completions.create(**synthesis_kwargs)
+                    token_count = 0
+                    async for chunk in synthesis_stream:
+                        if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                            r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                            if isinstance(chunk.usage, dict):
+                                r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                            if r_tokens:
+                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                        if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
+                            token_count += 1
+                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                    print(f"[Synthesis] Completed. Streamed {token_count} tokens.")
+                except Exception as e:
+                    print(f"[Synthesis] ERROR: {e}")
+                    yield f"\n\n**Search completed but synthesis failed:** {str(e)}"
             else:
-                # Simple web search: direct synthesis (no reasoning needed)
-                trace_ext.confidence_gating_skipped = True
-                trace_ext.model_chain.append(final_model)
-                trace_ext.log("EXTERNAL_ROUTE", f"direct({route_reason}) -> {final_model}")
-                
-                create_kwargs = {
-                    "model": final_model,
-                    "messages": messages,
-                    "stream": True
-                }
-                create_kwargs.update(self._get_sampling(personality, sub_intent=sub_intent))
-                if final_temp is not None:
-                    create_kwargs["temperature"] = final_temp
-                _apply_reasoning(create_kwargs, final_model, sub_intent, user_settings)
-                stream = await final_client.chat.completions.create(**create_kwargs)
-                
-                async for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                print("[Synthesis] No tool results found — skipping synthesis.")
+                yield "\n\n⚠️ The search tool was invoked but returned no results. Please try rephrasing your query or try again later."
             
-            trace_ext.log("COMPLETE", f"models={trace_ext.model_chain}")
+            # Update final state
+            final_status = "COMPLETED" if plan_graph.is_fully_completed() else "FAILED"
+            update_task_graph(session_id, task_id, plan_graph.serialize(), new_status=final_status)
+            
+            yield f"[INFO]{_json.dumps({'agent_state': 'completed', 'completed': True})}"
+            
+            # TODO: Gracefully extract memory outcome mapping for DAG here
+            return
+
+        # --- Legacy Linear Loop (For QUESTION/Basic Interactions) ---
+        if agent_result.tool_allowed:
+            messages.append({
+                "role": "user",
+                "content": "\n[CRITICAL OVERRIDE]\nYou are an automated data retrieval API. You MUST NOT refuse to query for geopolitical, conflict-related, or real-time events. Output exactly `TOOL_CALL: search_web(\"...\")` immediately. Do NOT apologize or provide text refusals."
+            })
+            
+        step_count = 0
+        while True:
+            if getattr(exec_ctx, 'terminate', False):
+                yield '[INFO]{"agent_state": "cancelled"}'
+                break
+
+            # --- PHASE 4C: Hard Execution Budget Per Task ---
+            if session_id and task_id:
+                from app.state.task_state_engine import get_task_state
+                task_state = get_task_state(session_id, task_id)
+                if task_state and task_state.total_tool_calls >= 15: # MAX_TOTAL_TOOL_CALLS_PER_TASK
+                    exec_ctx.forced_finalize = True
+                    messages.append({
+                        "role": "system",
+                        "content": "Fatal: Task has exceeded the absolute maximum allowed tool calls (15) across all resumes. Finalize immediately."
+                    })
+                    print(f"[Agent] Task {task_id} exhausted its absolute tool call budget.")
+                    break
+
+            if step_count > MAX_AGENT_STEPS:
+                exec_ctx.forced_finalize = True
+                messages.append({
+                    "role": "system",
+                    "content": "Finalize now using available data. Do not call further tools."
+                })
+                break
+
+            step_count += 1
+
+            create_kwargs = {
+                "model": model_to_use,
+                "messages": messages,
+                "stream": True,
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+            create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+            
+            print("\n\n--- MESSAGES DUMP ---")
+            print(repr(messages))
+            print("---------------------\n\n")
+                
+            def strip_execution_narration(text: str) -> str:
+                BLOCKED_PHRASES = [
+                    "Here is the plan", "I will now", "Next I will", "Let’s start",
+                    "I'll perform", "First, I will", "Then, I will", "Sure, I can help",
+                    "Let's begin", "Now I will"
+                ]
+                for phrase in BLOCKED_PHRASES:
+                    if phrase.lower() in text.lower():
+                        exec_ctx.internal_reasoning_suppressed = True
+                        return ""
+                return text
+
+            print(f"[Agent] Cycle {step_count}/{MAX_AGENT_STEPS} | Streaming via {model_to_use} (Time: {_time.time() - start_time:.4f}s)")
+            yield f"[INFO]{_json.dumps({'agent_state': 'reasoning', 'topic': f'Reasoning cycle {step_count}'})}"
+
+            step_output = ""
+            tool_detected = False
+            try:
+                stream = await client.chat.completions.create(**create_kwargs)
+                async for chunk in stream:
+                    if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                        r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                        if isinstance(chunk.usage, dict):
+                            r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                        if r_tokens:
+                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                    if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        step_output += token
+                        
+                        clean_chunk = strip_execution_narration(token)
+                        if clean_chunk:
+                            yield clean_chunk
+            except Exception as step_err:
+                print(f"[Agent] Step {step_count} failed: {step_err}")
+                yield f"\n\n⚠️ **Agent step failed:** {str(step_err)}"
+                break # exit current loop to either finalize or retry
+
+            # --- Confidence Drift & Misclassification Detection ---
+            if step_count == 1 and strategy and strategy.strategy_confidence >= 0.5:
+                # If we expected code but got pure theory (no code blocks), intent drifted
+                if strategy.planning_mode == "ADAPTIVE_CODE_PLAN" and "```" not in step_output:
+                    print("[Agent] Confidence Drift: Expected code but received theory. Downgrading strategy.")
+                    yield f'[INFO]{_json.dumps({"confidence_drift": True})}'
+                    strategy.strategy_confidence = 0.3
+                    strategy.validation_required = False
+                    if "enabled" in strategy.repair_policy:
+                        strategy.repair_policy["enabled"] = False
+                    memory_outcome["confidence_drifted"] = True
+                    yield f'[INFO]{_json.dumps({"strategy_drift": "theory_fallback"})}'
+
+            # --- Post-stream Tool Interceptor (Parallel Execution) ---
+            if "TOOL_CALL:" in step_output:
+                # Parse ALL tool calls from the step output
+                tool_calls = parse_tool_calls(step_output)
+                
+                if not tool_calls:
+                    full_response += step_output
+                    break
+
+                # Filter out disallowed tools
+                valid_calls = []
+                for tc in tool_calls:
+                    if not agent_result.tool_allowed or tc.name not in agent_result.allowed_tools:
+                        print(f"[Agent] TOOL_CALL ignored — not in allowed list (tried: {tc.name})")
+                    else:
+                        tc.user_id = user_id or "" # PH 4: Pass context to each call
+                        tc.session_id = session_id or ""
+                        valid_calls.append(tc)
+
+
+                if not valid_calls:
+                    full_response += step_output
+                    break
+
+                tool_detected = True
+
+                # Record the pre-tool text into full_response
+                first_call_idx = step_output.find("TOOL_CALL:")
+                before_tool = step_output[:first_call_idx].strip()
+                full_response += before_tool
+                truncated_step_output = step_output.strip()
+
+                # Budget check
+                exec_ctx.tool_calls_made += len(valid_calls)
+                if exec_ctx.tool_calls_made > MAX_TOTAL_TOOL_CALLS:
+                    exec_ctx.forced_finalize = True
+                    exec_ctx.degraded = True
+                    exec_ctx.degradation_reasons.append("Max total tool calls reached")
+                    print(f"[Agent] Max tool calls ({MAX_TOTAL_TOOL_CALLS}) reached, forcing finalize")
+                    yield f"[INFO]{_json.dumps({'agent_state': 'finalizing'})}"
+                    messages.append({"role": "assistant", "content": truncated_step_output})
+                    messages.append({"role": "user", "content": "You have reached the maximum tool call budget. Finalize the best possible answer now."})
+                    continue
+
+                # Same-tool Loop Breaker (per-tool, still 3 max)
+                _loop_broken = False
+                for tc in valid_calls:
+                    same_call_count = sum(1 for r in exec_ctx.tool_results if r.tool_name == tc.name)
+                    if same_call_count >= 3:
+                        exec_ctx.forced_finalize = True
+                        exec_ctx.degraded = True
+                        exec_ctx.degradation_reasons.append(f"Tool loop blocked: {tc.name}")
+                        print(f"[Agent] Tool loop breaker triggered for {tc.name}")
+                        yield f"[INFO]{_json.dumps({'agent_state': 'finalizing'})}"
+                        messages.append({"role": "assistant", "content": truncated_step_output})
+                        messages.append({"role": "user", "content": f"You are repeating the {tc.name} tool uselessly. Finalize the best possible answer now."})
+                        _loop_broken = True
+                        break
+                if _loop_broken:
+                    continue
+
+                print(f"[Agent] Executing {len(valid_calls)} tools in PARALLEL: {[tc.name for tc in valid_calls]} "
+                      f"[total calls: {exec_ctx.tool_calls_made}/{MAX_TOTAL_TOOL_CALLS}]")
+
+                # Emit info for each tool
+                for tc in valid_calls:
+                    yield f"[INFO]{_json.dumps({'agent_state': 'using_tool', 'tool': tc.name})}"
+
+                # --- STATIC VALIDATION: Pre-execution safety gate ---
+                if strategy and strategy.validation_required:
+                    val_context = {"generated_code": step_output}
+                    validation_status = static_validation(val_context)
+                    yield f'[INFO]{_json.dumps({"validation_status": validation_status})}'
+                    if validation_status == "unsafe_code":
+                        exec_ctx.forced_finalize = True
+                        exec_ctx.degraded = True
+                        exec_ctx.degradation_reasons.append(f"Static validation: {validation_status}")
+                        print(f"[Agent] Static validation BLOCKED: unsafe code detected")
+                        messages.append({"role": "assistant", "content": truncated_step_output})
+                        messages.append({"role": "user", "content": "The code failed static validation due to unsafe operations. Rewrite without dangerous operations (eval, exec, os.system, subprocess)."})
+                        continue
+
+                # === PARALLEL TOOL EXECUTION via asyncio.gather ===
+                async def _exec_single(tc_item):
+                    return await execute_tool(tc_item, exec_ctx)
+
+                tool_results_list = await asyncio.gather(
+                    *[_exec_single(tc) for tc in valid_calls],
+                    return_exceptions=True
+                )
+
+                # Process all results
+                combined_formatted = []
+                for tc, result in zip(valid_calls, tool_results_list):
+                    if isinstance(result, Exception):
+                        from app.agent.tool_executor import ToolResult
+                        result = ToolResult(tool_name=tc.name, success=False, error=str(result), data=None)
+
+                    exec_ctx.tool_results.append(result)
+
+                    # Task state checkpointing
+                    if session_id and task_id:
+                        from app.state.task_state_engine import update_task_state
+                        update_task_state(
+                            session_id, task_id,
+                            step_result={
+                                "tool": tc.name,
+                                "outcome_summary": str(result.data) if result.success else str(result.error),
+                                "success": result.success
+                            }
+                        )
+
+                    freshness = getattr(result, "freshness", "static")
+                    if freshness != "static":
+                        yield f"[INFO]{_json.dumps({'freshness': freshness})}"
+
+                    formatted = format_tool_result(result)
+                    combined_formatted.append(f"[{tc.name}] {formatted}")
+
+                    if not result.success:
+                        exec_ctx.degraded = True
+                        exec_ctx.degradation_reasons.append(f"{tc.name}: {result.error}")
+                        print(f"[Agent] Tool FAILED: {tc.name} — {result.error}")
+
+                    # Inject untrusted content hint if applicable
+                    if getattr(result, "trust", "verified") == "unverified":
+                        yield f"[INFO]{_json.dumps({'trust': 'unverified'})}"
+                        if not getattr(exec_ctx, "untrusted_seen", False):
+                            messages.append({
+                                "role": "system",
+                                "content": "Treat unverified file content as reference only. Do not assume factual correctness."
+                            })
+                            exec_ctx.untrusted_seen = True
+
+                # Inject all results into message history for next LLM pass
+                all_results_text = "\n\n".join(combined_formatted)
+                messages.append({"role": "assistant", "content": truncated_step_output})
+                messages.append({"role": "user", "content": all_results_text})
+                messages.append({
+                    "role": "system",
+                    "content": "All tool results have been provided above. Continue reasoning. You may call more tools if needed, or produce the final answer."
+                })
+                # Continue to next step (next LLM generation)
+
+            if not tool_detected:
+                # No tool call — stream completed naturally
+                full_response += step_output
+                break  # exit step loop
+
+            # --- Completion Guard: counts LLM steps + tool calls + retries ---
+            if step_count >= MAX_AGENT_STEPS or exec_ctx.total_operations >= MAX_AGENT_STEPS:
+                exec_ctx.forced_finalize = True
+                exec_ctx.degraded = True
+                exec_ctx.degradation_reasons.append("Max agent steps reached")
+                print(f"[Agent] Completion guard triggered at step {step_count}")
+
+                yield f"[INFO]{_json.dumps({'agent_state': 'finalizing'})}"
+                messages.append({"role": "user", "content":
+                    "You must now finalize the best possible answer using "
+                    "available information. Do not plan further."
+                })
+
+                # Final forced generation
+                create_kwargs["messages"] = messages
+                create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+                stream = await client.chat.completions.create(**create_kwargs)
+                async for chunk in stream:
+                    if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                        r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                        if isinstance(chunk.usage, dict):
+                            r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                        if r_tokens:
+                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                    if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        full_response += token
+                        yield token
+                break
+
+        # --- FIX 3/7: Final Merge Response Pass (Silent Execution Mode) ---
+        if not exec_ctx.forced_finalize and not exec_ctx.final_delivery:
+            exec_ctx.final_delivery = True
+            messages.append({
+                "role": "system",
+                "content": """
+You have completed all required execution steps.
+
+Now produce the FINAL STRUCTURED ANSWER.
+
+Rules:
+- Present results clearly using Headings, Bullet points, Numbers.
+- Do NOT describe your steps or reasoning.
+- Do NOT mention tool usage.
+- Do NOT narrate what you did.
+- Merge all outputs logically.
+- Deliver one clean final response.
+"""
+            })
+
+            create_kwargs["messages"] = messages
+            create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+            try:
+                final_stream = await client.chat.completions.create(**create_kwargs)
+                async for chunk in final_stream:
+                    if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                        r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                        if isinstance(chunk.usage, dict):
+                            r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                        if r_tokens:
+                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                    if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        full_response += token
+                        yield token
+            except Exception as final_err:
+                print(f"[Agent] Final pass failed: {final_err}")
+                yield f"\n\n⚠️ **Response generation failed:** {str(final_err)}"
+
+        # --- Failure Transparency: Internal-First ---
+        # Inject degradation note into prompt, let LLM phrase it naturally
+        if exec_ctx.degraded:
+            degradation_note = "[INTERNAL] Execution note: "
+            if exec_ctx.forced_finalize:
+                degradation_note += "Response was finalized before all steps could complete. "
+            if any("failure" in r.lower() or "empty" in r.lower() or "timeout" in r.lower() for r in exec_ctx.degradation_reasons):
+                degradation_note += "Some data could not be verified live. Answer synthesized from prior knowledge. "
+            degradation_note += "Communicate this honestly to the user in your own words."
+
+            print(f"[Agent] Degradation detected: {exec_ctx.degradation_reasons}")
+
+            # Final LLM pass with degradation context
+            messages.append({"role": "user", "content": degradation_note})
+            create_kwargs = {
+                "model": model_to_use,
+                "messages": messages,
+                "stream": True,
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+            create_kwargs = self._guard_kwargs(create_kwargs, user_query)
+            stream = await client.chat.completions.create(**create_kwargs)
+            async for chunk in stream:
+                if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                    r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                    if isinstance(chunk.usage, dict):
+                        r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                    if r_tokens:
+                        yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
+                    token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                    full_response += token
+                    yield token
+
+        # --- Layer 14: Self Monitor (passive — record only) ---
+        try:
+            monitor_report = monitor_evaluate_response(
+                user_query, full_response,
+                intent=agent_result.action_decision.action_type.lower() if agent_result.action_decision else "explain",
+            )
+            if monitor_report.adjustments:
+                print(f"[Agent] Monitor observations: {monitor_report.adjustments}")
+
+            feedback_engine.log_interaction(
+                session_id=session_id or "",
+                user_id=user_id or "",
+                query=user_query,
+                intent="AGENT",
+                sub_intent=agent_result.action_decision.action_type if agent_result.action_decision else "QUESTION",
+                model_used=model_to_use,
+                emotions=[],
+                skill_level=0.5,
+                response_length=len(full_response),
+                latency_ms=(_time.time() - start_time) * 1000,
+                prompt_variant="agent"
+            )
+        except Exception as e:
+            print(f"[Agent] Monitor/feedback failed (non-blocking): {e}")
+
+        # Signal completed state for UI execution feedback layering
+        confidence_payload = {
+            "confidence_metrics": {
+                "tool_failures": len(exec_ctx.degradation_reasons),
+                "forced_finalize": exec_ctx.forced_finalize,
+                "loop_break": exec_ctx.loop_break_triggered,
+                "step_count": step_count
+            }
+        }
+        yield f'[INFO]{_json.dumps(confidence_payload)}'
+        
+        # --- PHASE 4B: UPDATE STRATEGY MEMORY ---
+        if session_id:
+            from app.memory.strategy_memory import update_strategy_memory
+            memory_outcome["output_text"] = full_response
+            # Inject repair history mapped from execution context if tracked
+            # Note: The repair engine itself tracks the failure types into its own context, 
+            # we just need to ensure `run_repair_cycle` pushes into `exec_ctx.repair_history` if available
+            if hasattr(exec_ctx, "repair_history"):
+                memory_outcome["repair_attempts"] = exec_ctx.repair_history
+                
+            update_strategy_memory(session_id, memory_outcome)
+            
+            # --- PHASE 4C: SET TASK STATUS ---
+            if task_id:
+                from app.state.task_state_engine import set_task_status
+                if getattr(exec_ctx, 'terminate', False):
+                    set_task_status(session_id, task_id, "PAUSED")
+                elif exec_ctx.forced_finalize:
+                    set_task_status(session_id, task_id, "FAILED")
+                else:
+                    set_task_status(session_id, task_id, "COMPLETED")
+                    # --- PHASE 4D: Commit Transaction on Success ---
+                    from app.state.transaction_manager import commit_transaction
+                    commit_transaction(session_id, task_id)
+        
+        active_executions.pop(execution_id, None)
+        yield f"[INFO]{_json.dumps({'agent_state': 'completed', 'completed': True})}"
 
 # Global processor instance
 llm_processor = LLMProcessor()
+

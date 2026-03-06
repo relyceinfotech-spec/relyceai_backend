@@ -183,10 +183,11 @@ class PromptOptimizer:
             selected = best_name or variant_names[0]
 
         # Track selection for outcome attribution
-        if session_id:
-            self._last_selected[session_id] = selected
+        instruction = variants[selected]
+        if instruction:
+            instruction = f"<optimization_variant name=\"{selected}\">\n{instruction}\n</optimization_variant>"
 
-        return selected, variants[selected]
+        return selected, instruction
 
     def record_outcome(self, sub_intent: str, variant_name: str, success: bool):
         """Record the outcome of using a specific variant."""

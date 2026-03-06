@@ -271,9 +271,22 @@ async def get_me(user_info: dict = Depends(get_current_user)):
     db = get_firestore_db()
     user_ref = db.collection("users").document(uid)
     doc = user_ref.get()
+    
     if not doc.exists:
         raise HTTPException(status_code=404, detail="User profile not found")
-    return {"success": True, "user": doc.to_dict()}
+        
+    user_data = doc.to_dict()
+    
+    # Process membership expiry before returning the profile
+    try:
+        check_membership_expiry(user_ref, user_data, uid)
+        # Fetch fresh data if it was downgraded
+        doc = user_ref.get()
+        user_data = doc.to_dict()
+    except Exception as e:
+        print(f"[Users] Failed to check expiry during /me for {uid}: {e}")
+        
+    return {"success": True, "user": user_data}
 
 
 @router.post("/membership/downgrade")

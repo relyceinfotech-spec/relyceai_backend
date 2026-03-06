@@ -369,28 +369,28 @@ class EmotionEngine:
     # Instruction Generation
     # ==========================================
     def get_instruction(self, state: EmotionalState) -> str:
-        """Generate system prompt instruction based on state matrix."""
-        instructions = []
+        """Generate structured KV parameters based on state matrix."""
+        level = "beginner" if state.skill_level < 0.3 else "expert" if state.skill_level > 0.7 else "intermediate"
         
-        if state.skill_level < 0.3:
-            instructions.append("**User Level: BEGINNER**. Explain concepts simply. Avoid jargon. Use analogies.")
-        elif state.skill_level > 0.7:
-            instructions.append("**User Level: EXPERT**. Be concise. Skip basics. Focus on advanced details/trade-offs.")
-        else:
-            instructions.append("**User Level: INTERMEDIATE**. Balance explanation with code. Assume basic knowledge.")
+        frustration = "high" if state.frustration > 0.6 else "low"
+        confusion = "high" if state.confusion > 0.6 else "low"
+        urgency = "high" if state.urgency > 0.6 else "low"
+        excitement = "high" if state.excitement > 0.6 else "low"
+        curiosity = "high" if state.curiosity > 0.6 else "low"
         
-        if state.frustration > 0.6:
-            instructions.append("**HIGH FRUSTRATION DETECTED**. Stop apologizing. Fix the problem immediately. Be extremely direct.")
-        elif state.confusion > 0.6:
-            instructions.append("**HIGH CONFUSION DETECTED**. Slow down. Break it into step-by-step pieces. Check for understanding.")
-        elif state.urgency > 0.6:
-            instructions.append("**URGENCY DETECTED**. No pleasantries. Solution first. Code immediately.")
-        elif state.excitement > 0.6:
-            instructions.append("**HIGH EXCITEMENT**. Match energy! Use encouraging language.")
-        elif state.curiosity > 0.6:
-            instructions.append("**HIGH CURIOSITY**. Go deep. Explain the 'Why'. Teach the underlying concept.")
-            
-        return "\n".join(instructions)
+        if frustration == "low" and confusion == "low" and urgency == "low" and excitement == "low" and curiosity == "low":
+            return f"<emotion_state>\nlevel={level}\n</emotion_state>"
+
+        return (
+            "<emotion_state>\n"
+            f"level={level}\n"
+            f"frustration={frustration}\n"
+            f"confusion={confusion}\n"
+            f"urgency={urgency}\n"
+            f"excitement={excitement}\n"
+            f"curiosity={curiosity}\n"
+            "</emotion_state>"
+        )
 
     # ==========================================
     # Frustration Prediction (Priority #6)
@@ -440,24 +440,14 @@ class EmotionEngine:
 
     def get_proactive_instruction(self, frustration_prob: float) -> Optional[str]:
         """
-        Generate proactive help instruction when frustration is predicted.
+        Generate proactive help instruction parameters.
         Returns None if probability is too low.
         """
         if frustration_prob < 0.5:
             return None
 
-        if frustration_prob > 0.7:
-            return (
-                "**PROACTIVE HELP MODE (HIGH):** The user is likely approaching frustration. "
-                "Simplify your explanation significantly. Break the problem into smaller steps. "
-                "Offer alternative approaches. Be warm but action-oriented — fix the problem, "
-                "don't just sympathize."
-            )
-        return (
-            "**PROACTIVE HELP MODE:** The user may be struggling. "
-            "Keep your response clear and structured. Offer to break the problem down "
-            "if they'd like. Ask if a different approach would help."
-        )
+        severity = "high" if frustration_prob > 0.7 else "medium"
+        return f"<proactive_help>\naction=simplify\nseverity={severity}\n</proactive_help>"
 
 # Singleton instance
 emotion_engine = EmotionEngine()

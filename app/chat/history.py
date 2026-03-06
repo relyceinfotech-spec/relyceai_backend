@@ -38,7 +38,8 @@ def save_message_to_firebase(
             'role': role,
             'content': safe_content,
             'timestamp': datetime.now(),
-            'createdAt': datetime.now().isoformat()
+            'createdAt': datetime.now().isoformat(),
+            'archived': False
         }
         if personality_id:
             payload['personalityId'] = personality_id
@@ -80,18 +81,27 @@ def load_chat_history(
             .collection('chatSessions').document(session_id) \
             .collection('messages')
         
-        query = messages_ref.order_by('timestamp').limit(limit)
-        
         # Retry logic for loading history
         max_retries = 3
         messages = []
         
         for attempt in range(max_retries):
             try:
+                # We must load descending to get the newest messages, then reverse.
+                # This prevents getting bogged down fetching archived messages at the start of the chat.
+                # Adding deterministic tie-breaker just in case timestamps collide
+                query = messages_ref.order_by(
+                    'timestamp', direction=firestore.Query.DESCENDING
+                ).limit(limit)
+                
                 docs = query.stream()
                 temp_messages = []
                 for doc in docs:
                     data = doc.to_dict()
+                    # Filter out any softly archived messages
+                    if data.get('archived') == True:
+                        continue
+                        
                     temp_messages.append({
                         'id': doc.id,
                         'role': data.get('role'),
@@ -99,7 +109,8 @@ def load_chat_history(
                         'timestamp': data.get('createdAt'),
                         'personalityId': data.get('personalityId')
                     })
-                messages = temp_messages
+                # Reverse to restore chronological ascending order for the UI
+                messages = temp_messages[::-1]
                 break # Success
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -133,7 +144,22 @@ def update_session_name(user_id: str, session_id: str, name: str) -> bool:
         
     except Exception as e:
         print(f"[History] Error updating session name: {e}")
-        return False
+
+def get_chat_session(user_id: str, session_id: str) -> Optional[Dict]:
+    """Retrieve details for a single chat session."""
+    db = get_firestore_db()
+    if not db:
+        return None
+    try:
+        doc = db.collection("users").document(user_id).collection("chatSessions").document(session_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            return data
+        return None
+    except Exception as e:
+        print(f"[History] Error retrieving session {session_id}: {e}")
+        return None
 
 def create_chat_session(user_id: str, name: str = "New Chat") -> Optional[str]:
     """Create a new chat session"""
@@ -147,6 +173,8 @@ def create_chat_session(user_id: str, name: str = "New Chat") -> Optional[str]:
         
         doc_ref = sessions_ref.add({
             'name': name,
+            'summary': '',
+            'summary_tokens': 0,
             'createdAt': datetime.now(),
             'updatedAt': datetime.now()
         })
@@ -176,6 +204,8 @@ def get_user_sessions(user_id: str, limit: int = 50) -> List[Dict]:
             sessions.append({
                 'id': doc.id,
                 'name': data.get('name', 'Untitled'),
+                'summary': data.get('summary', ''),
+                'summary_tokens': data.get('summary_tokens', 0),
                 'createdAt': data.get('createdAt'),
                 'updatedAt': data.get('updatedAt')
             })

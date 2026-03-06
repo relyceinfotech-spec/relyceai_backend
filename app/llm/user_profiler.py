@@ -280,47 +280,33 @@ class UserProfiler:
     # ==========================================
     def get_personalization_instruction(self, profile: UserProfile) -> str:
         """
-        Generate system prompt personalization snippet based on learned profile.
+        Generate structured KV parameters for LLM ingestion (saving tokens).
         Only activates after enough interactions (>5) to avoid premature personalization.
         """
         if profile.total_interactions < 5:
             return ""  # Not enough data yet
 
-        instructions = []
-
-        # Skill-based instruction
-        if profile.skill_level < 0.3 and profile.skill_confidence > 0.3:
-            instructions.append("This user is a beginner. Use simple language, avoid jargon, include analogies.")
-        elif profile.skill_level > 0.7 and profile.skill_confidence > 0.3:
-            instructions.append("This user is an expert. Be concise, skip basics, focus on advanced details.")
-
-        # Style preferences
-        if profile.prefers_concise > 0.7:
-            instructions.append("This user prefers concise, to-the-point answers.")
-        elif profile.prefers_concise < 0.3:
-            instructions.append("This user prefers detailed, thorough explanations.")
-
-        if profile.prefers_code_first > 0.7:
-            instructions.append("Show code first, then explain if needed.")
-        elif profile.prefers_code_first < 0.3:
-            instructions.append("Explain the concept first, then show code.")
-
-        if profile.prefers_step_by_step > 0.7:
-            instructions.append("Break solutions into clear step-by-step instructions.")
-
-        if profile.prefers_examples > 0.7:
-            instructions.append("Include concrete examples when explaining concepts.")
-
-        # Topic expertise
+        level = "beginner" if profile.skill_level < 0.3 else "expert" if profile.skill_level > 0.7 else "intermediate"
+        detail = "concise" if profile.prefers_concise > 0.7 else "detailed" if profile.prefers_concise < 0.3 else "balanced"
+        order = "code-first" if profile.prefers_code_first > 0.7 else "explain-first" if profile.prefers_code_first < 0.3 else "mixed"
+        format_ = "step-by-step" if profile.prefers_step_by_step > 0.7 else "holistic"
+        examples = "required" if profile.prefers_examples > 0.7 else "optional"
+        
+        topics = ""
         if profile.topics_of_interest:
             top_topics = sorted(profile.topics_of_interest.items(), key=lambda x: x[1], reverse=True)[:3]
-            topic_names = [t[0].replace("_", " ") for t in top_topics]
-            instructions.append(f"User often works on: {', '.join(topic_names)}.")
-
-        if not instructions:
-            return ""
-
-        return "**Personalization (learned from past interactions):**\n" + "\n".join(f"- {i}" for i in instructions)
+            topics = ", ".join([t[0].replace("_", " ") for t in top_topics])
+        
+        return (
+            "<user_profile>\n"
+            f"level={level}\n"
+            f"detail={detail}\n"
+            f"order={order}\n"
+            f"format={format_}\n"
+            f"examples={examples}\n"
+            f"topics={topics}\n"
+            "</user_profile>"
+        )
 
     def get_recommended_style(self, profile: UserProfile) -> Dict:
         """Return optimal response style parameters based on profile."""

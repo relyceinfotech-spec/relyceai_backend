@@ -14,3 +14,18 @@ firebase-debug.log*
 # OS
 .DS_Store
 Thumb.db
+
+# Project Specific
+tests/
+__pycache__/
+.env
+*.log
+uploads/
+*.txt
+.pytest_cache/
+.python-version
+.tool-versions
+Procfile
+README.md
+!requirements.txt
+!app/

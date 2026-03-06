@@ -17,10 +17,10 @@ from app.auth import get_firestore_db
 # ============================================
 # CONFIGURATION
 # ============================================
-EMBEDDING_MODEL = "openai/text-embedding-3-small"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TIEBREAKER_MODEL = "openai/gpt-4o-mini"
-THRESHOLD_HIGH = 0.75
-THRESHOLD_MEDIUM = 0.60
+THRESHOLD_HIGH = 0.55
+THRESHOLD_MEDIUM = 0.35
 TIMEOUT_SECONDS = float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "4.0"))
 
 # ============================================
@@ -227,7 +227,7 @@ OBVIOUS_CASUAL = {
 
 OBVIOUS_WEB_KEYWORDS = [
     "latest", "today", "current", "now", "recent", "news",
-    "price of", "weather", "stock", "2024", "2025", "2026"
+    "price of", "weather", "stock", "2024", "2025", "2026", "2027"
 ]
 
 def _fast_path_check(query: str) -> Optional[Dict]:
@@ -313,18 +313,31 @@ def get_openrouter_client() -> AsyncOpenAI:
 
 
 # ============================================
+# LOCAL EMBEDDING MODEL
+# ============================================
+_local_embedding_model = None
+
+def get_embedding_model():
+    global _local_embedding_model
+    if _local_embedding_model is None:
+        print("[Embedding] Loading local SentenceTransformer model...")
+        from sentence_transformers import SentenceTransformer
+        _local_embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        print("[Embedding] Model loaded.")
+    return _local_embedding_model
+
+
+# ============================================
 # CORE FUNCTIONS
 # ============================================
 
 async def generate_embedding(text: str) -> List[float]:
-    """Generate embedding vector for text using OpenRouter."""
+    """Generate embedding vector for text using local model."""
     try:
-        client = get_openrouter_client()
-        response = await client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=text
-        )
-        return response.data[0].embedding
+        def _encode():
+            model = get_embedding_model()
+            return model.encode(text).tolist()
+        return await asyncio.to_thread(_encode)
     except Exception as e:
         print(f"[Embedding] Error generating embedding: {e}")
         return []
@@ -421,7 +434,7 @@ async def load_intent_embeddings() -> bool:
             """Synchronous Firestore fetching to run in thread"""
             cache_data = {}
             try:
-                for doc in db.collection("intent_embeddings").stream():
+                for doc in db.collection("intent_embeddings_minilm").stream():
                     data = doc.to_dict() or {}
                     examples = data.get("examples", [])
                     if examples:
@@ -476,7 +489,7 @@ async def save_intent_embeddings() -> bool:
                 await asyncio.sleep(0.1)  # Rate limit
             
             # Save to Firestore
-            db.collection('intent_embeddings').document(intent).set({
+            db.collection('intent_embeddings_minilm').document(intent).set({
                 'examples': embedded_examples,
                 'updated_at': time.time()
             })
@@ -608,6 +621,17 @@ async def classify_intent(query: str) -> Dict:
 async def classify_intent_with_timeout(query: str) -> Dict:
     """Classify intent with timeout fallback."""
     try:
+        # 1. FAST PATH: Check for obvious patterns before any async work
+        fast_result = _fast_path_check(query)
+        if fast_result:
+            return fast_result
+
+        # 2. LRU CACHE: Check if we've seen this query before
+        cached = _get_cached_result(query)
+        if cached:
+            cached["path"] = "cache_hit"
+            return cached
+
         return await asyncio.wait_for(
             classify_intent(query),
             timeout=TIMEOUT_SECONDS
@@ -621,6 +645,16 @@ async def classify_intent_with_timeout(query: str) -> Dict:
             "needs_reasoning": False,
             "model": "gemini",
             "path": "timeout_fallback"
+        }
+    except Exception as e:
+        print(f"[Embedding] Classification error: {e}")
+        return {
+            "intent": "casual",
+            "confidence": 0.0,
+            "needs_web": False,
+            "needs_reasoning": False,
+            "model": "gemini",
+            "path": "error_fallback"
         }
 
 
@@ -717,22 +751,26 @@ async def classify_emotion(query: str, existing_embedding: Optional[List[float]]
     # 2. If ambigous & long -> fast LLM check (covers 20%)
     
     if len(query) > 10:
-        # Use a very fast semantic check
+        # Use a very fast semantic check with a strict timeout
         try:
             client = get_openrouter_client()
-            response = await client.chat.completions.create(
-                model=TIEBREAKER_MODEL,
-                messages=[{
-                    "role": "user", 
-                    "content": f"Classify emotion: '{query}'\nOptions: [frustrated, confused, excited, urgent, curious, casual, professional, neutral]\nOutput ONE word."
-                }],
-                max_tokens=10,
-                temperature=0
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=TIEBREAKER_MODEL,
+                    messages=[{
+                        "role": "user", 
+                        "content": f"Classify emotion: '{query}'\nOptions: [frustrated, confused, excited, urgent, curious, casual, professional, neutral]\nOutput ONE word."
+                    }],
+                    max_tokens=10,
+                    temperature=0
+                ),
+                timeout=2.0
             ) 
             em = response.choices[0].message.content.strip().lower()
             if em in EMOTION_EXAMPLES:
-                return em
-        except:
-            return "neutral"
+                return [em]
+        except Exception as e:
+            print(f"[Emotion] LLM fallback failed or timed out: {e}")
+            return ["neutral"]
             
-    return "neutral"
+    return ["neutral"]

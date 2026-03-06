@@ -9,7 +9,7 @@ from app.llm.router import DEFAULT_PERSONA
 from app.chat.user_profile import get_user_settings
 from app.config import MAX_PERSONALITY_PROMPT_CHARS, MAX_PERSONALITY_NAME_CHARS, MAX_PERSONALITY_DESC_CHARS
 
-VALID_CONTENT_MODES = {"hybrid", "web_search", "llm_only"}
+# Content modes are now unified by default
 
 
 def _validate_personality_fields(name: str, description: str, prompt: str) -> tuple[str, str, str]:
@@ -32,18 +32,6 @@ def _validate_personality_fields(name: str, description: str, prompt: str) -> tu
     return safe_name, safe_desc, safe_prompt
 
 
-def _get_relyce_behavior_mode(user_id: str) -> Optional[str]:
-    if not user_id or user_id == "anonymous":
-        return None
-    settings = get_user_settings(user_id)
-    if not isinstance(settings, dict):
-        return None
-    personalization = settings.get("personalization", settings)
-    if not isinstance(personalization, dict):
-        return None
-    mode = personalization.get("behaviorMode")
-    if mode in VALID_CONTENT_MODES:
-        return mode
     return None
 
 # System Locked Personalities (Cannot be edited/deleted)
@@ -55,7 +43,6 @@ SYSTEM_PERSONALITIES = [
         "prompt": DEFAULT_PERSONA,
         "is_default": True,
         "is_system": True,  # Locked
-        "content_mode": "hybrid",  # Uses intent classification
         "specialty": "general"
     },
     {
@@ -99,7 +86,6 @@ OUTPUT STYLE
 """,
         "is_default": False,
         "is_system": True,
-        "content_mode": "llm_only",
         "specialty": "coding"
     }
 ]
@@ -133,7 +119,6 @@ TEMPLATE_PERSONALITIES = [
 **Goal:** Feel like a college buddy during fun chats, but a strict mentor during important work.""",
         "is_default": True,
         "is_system": False,  # Editable
-        "content_mode": "hybrid"  # Default mode
     }
 ]
 
@@ -145,13 +130,8 @@ def get_all_personalities(user_id: str) -> List[Dict]:
     # Start with System Locked ones
     personalities = [p.copy() for p in SYSTEM_PERSONALITIES]
 
-    # Apply per-user behavior mode override for Relyce AI if configured
-    behavior_mode = _get_relyce_behavior_mode(user_id)
-    if behavior_mode:
-        for p in personalities:
-            if p.get("id") == "default_relyce":
-                p["content_mode"] = behavior_mode
-                break
+    # Personalities now always use unified architecture
+    pass
     
     # Track IDs we have loaded to avoid duplicates (shadowing)
     loaded_ids = {p['id'] for p in personalities}
@@ -192,18 +172,10 @@ def get_all_personalities(user_id: str) -> List[Dict]:
     personalities.extend(user_personalities)
     
     return personalities
-
-def create_custom_personality(user_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid", specialty: str = "general") -> Optional[Dict]:
+def create_custom_personality(user_id: str, name: str, description: str, prompt: str, specialty: str = "general") -> Optional[Dict]:
     """
     Create a new custom personality for a user.
-    content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
-    specialty: Expertise area like 'coding', 'ecommerce', 'music', etc.
     """
-    # Validate content_mode
-    valid_modes = ["hybrid", "web_search", "llm_only"]
-    if content_mode not in valid_modes:
-        content_mode = "hybrid"
-
     # Validate personality fields
     name, description, prompt = _validate_personality_fields(name, description, prompt)
 
@@ -216,7 +188,6 @@ def create_custom_personality(user_id: str, name: str, description: str, prompt:
             "name": name,
             "description": description,
             "prompt": prompt,
-            "content_mode": content_mode,
             "specialty": specialty,
             "createdAt": str(uuid.uuid4())
         }
@@ -231,6 +202,7 @@ def create_custom_personality(user_id: str, name: str, description: str, prompt:
         print(f"[Personalities] Error creating: {e}")
         return None
 
+
 def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
     """
     Fetch a specific personality by ID.
@@ -239,10 +211,6 @@ def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
     for p in SYSTEM_PERSONALITIES:
         if p['id'] == personality_id:
             result = p.copy()
-            if personality_id == "default_relyce":
-                behavior_mode = _get_relyce_behavior_mode(user_id)
-                if behavior_mode:
-                    result["content_mode"] = behavior_mode
             return result
             
     # Check DB (User Custom or Shadowed Template)
@@ -264,19 +232,13 @@ def get_personality_by_id(user_id: str, personality_id: str) -> Optional[Dict]:
             
     return None
 
-def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str, content_mode: str = "hybrid", specialty: str = "general") -> bool:
+def update_custom_personality(user_id: str, personality_id: str, name: str, description: str, prompt: str, specialty: str = "general") -> bool:
     """
     Update a personality. 
     If it's a Template ID (like 'buddy') and doesn't exist in DB, create it (Shadowing).
     If it's a System ID, fail.
-    content_mode: 'hybrid' (default), 'web_search', or 'llm_only'
     specialty: Expertise area like 'coding', 'ecommerce', 'music', etc.
     """
-    # Validate content_mode
-    valid_modes = ["hybrid", "web_search", "llm_only"]
-    if content_mode not in valid_modes:
-        content_mode = "hybrid"
-
     # Validate personality fields
     name, description, prompt = _validate_personality_fields(name, description, prompt)
 
@@ -300,7 +262,6 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
                     "name": name,
                     "description": description,
                     "prompt": prompt,
-                    "content_mode": content_mode,
                     "specialty": specialty,
                     "is_shadow": True,
                     "createdAt": str(uuid.uuid4())
@@ -314,7 +275,6 @@ def update_custom_personality(user_id: str, personality_id: str, name: str, desc
                 "name": name,
                 "description": description,
                 "prompt": prompt,
-                "content_mode": content_mode,
                 "specialty": specialty
             })
             return True
