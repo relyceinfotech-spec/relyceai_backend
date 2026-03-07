@@ -1733,6 +1733,9 @@ class LLMProcessor:
         is_casual_query = bool(re.match(r"^(hi|hello|hey|yo|sup|how are you|how r u|how are u|whats up)[!.?\s]*$", _q_lower))
         if is_casual_query:
             MIN_AGENT_STEPS = 1
+        is_profile_query = bool(re.search(r"\b(my name|about me|who am i|remember me|tell about me)\b", _q_lower))
+        if is_profile_query:
+            MIN_AGENT_STEPS = 1
 
         # --- Run agent pipeline (classify ? time ? autonomy ? orchestrate) ---
         pipeline_start = _time.time()
@@ -2465,7 +2468,8 @@ You have completed all required execution steps.
 Now produce the FINAL STRUCTURED ANSWER.
 
 Rules:
-- Present results clearly using Headings, Bullet points, Numbers.
+- Default to concise structure: short heading + bullet points (3-7 bullets) when informative.
+- Use paragraphs only for explicitly narrative requests (essay/story/long-form).
 - Do NOT describe your steps or reasoning.
 - Do NOT mention tool usage.
 - Do NOT narrate what you did.
