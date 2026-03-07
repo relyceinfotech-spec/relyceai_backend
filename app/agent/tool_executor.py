@@ -1493,7 +1493,8 @@ TOOLS: Dict[str, Dict] = {
         "reversible": True,
         "risk": "low",
         "freshness": "static",
-    },`r`n    "extract_entities": {
+    },
+    "extract_entities": {
         "func": _tool_extract_entities,
         "is_async": False,
         "reversible": True,
@@ -1833,6 +1834,8 @@ def format_tool_result(result: ToolResult) -> str:
             f"CONFIDENCE: {result.confidence}\n"
             f"REASON: {result.error}"
         )
+
+
 
 
 
