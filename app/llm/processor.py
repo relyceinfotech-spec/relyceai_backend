@@ -382,7 +382,8 @@ class LLMProcessor:
         text = html.unescape(text)
         
         sanitized = text
-        sanitized = sanitized.replace("—", " - ").replace("–", " - ")
+        sanitized = sanitized.replace("\u2014", " - ").replace("\u2013", " - ")
+        sanitized = re.sub(r"^\s*TOOL\b[#:\-\s]*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
@@ -2135,6 +2136,10 @@ class LLMProcessor:
             
         step_count = 0
         forced_tool_attempted = False
+        fact_lookup_query = bool(re.search(
+            r"\b(who is|founder|ceo|owner|director|price|market cap|valuation|address|incorporated|registered|linkedin|crunchbase)\b",
+            (user_query or "").lower()
+        ))
         while True:
             if getattr(exec_ctx, 'terminate', False):
                 yield '[INFO]{"agent_state": "cancelled"}'
@@ -2380,10 +2385,19 @@ class LLMProcessor:
                     requires_live = True
                 if agent_result.action_decision and agent_result.action_decision.requires_research:
                     requires_live = True
+                if fact_lookup_query:
+                    requires_live = True
                 if requires_live and not exec_ctx.tool_results and not forced_tool_attempted:
                     forced_tool_attempted = True
                     messages.append({"role": "assistant", "content": step_output})
-                    messages.append({"role": "user", "content": "You must call the most appropriate tool now (e.g., search_web/search_news/search_scholar/web_fetch). Output ONLY TOOL_CALL."})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You must call the most appropriate tool now (search_web first for entity/founder queries; "
+                            "optionally search_legal/search_company/search_tech_docs when relevant). "
+                            "Prioritize official registries, company pages, and LinkedIn. Output ONLY TOOL_CALL."
+                        ),
+                    })
                     continue
             if not tool_detected:
                 # Enforce multi-pass verification even if an answer exists
@@ -2393,6 +2407,7 @@ class LLMProcessor:
                         "role": "user",
                         "content": (
                             "Verify the above answer for accuracy and completeness. "
+                            "If this is an external factual query and no tools were used yet, call tools now instead of rewriting. "
                             "If anything is unclear, missing, or uncertain, improve it or call tools. "
                             "Do not finalize yet."
                         )
