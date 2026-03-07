@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -232,6 +232,36 @@ def _user_wants_sources(user_query: str) -> bool:
     q = (user_query or "").lower()
     keywords = ["source", "sources", "citation", "cite", "references", "reference", "links", "link"]
     return any(k in q for k in keywords)
+
+
+def _is_casual_query(user_query: str) -> bool:
+    q = (user_query or "").strip().lower()
+    return bool(
+        re.match(
+            r"^(hi|hello|hey|yo|sup|how are you|how r u|how are u|whats up)[!.?\s]*$",
+            q,
+        )
+    )
+
+
+def _is_profile_query(user_query: str) -> bool:
+    q = (user_query or "").strip().lower()
+    return bool(re.search(r"\b(my name|about me|who am i|remember me|tell about me)\b", q))
+
+
+def _resolve_runtime_intent(mode: str, routed_intent: str) -> str:
+    """
+    Execution intent policy by mode:
+    - agent/business: always structured agent path
+    - normal: prefer fast direct LLM path, keep deep-search for external lookups
+    """
+    if mode in {"agent", "business"}:
+        return "AGENT"
+    if mode == "normal":
+        if routed_intent in {"DEEP_SEARCH", "EXTERNAL"}:
+            return routed_intent
+        return "INTERNAL"
+    return routed_intent or "INTERNAL"
 
 def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict] = None, query: str = "") -> Tuple[str, str, Optional[float], bool, str]:
     """
@@ -666,7 +696,7 @@ class LLMProcessor:
         routed_intent = analysis.get("intent", "DEEP_SEARCH")
         sub_intent = analysis.get("sub_intent", "general")
         emotions = analysis.get("emotions", [])
-        intent = "AGENT"
+        intent = _resolve_runtime_intent(mode, routed_intent)
         
         import time as _time
         _start = _time.time()
@@ -837,7 +867,7 @@ class LLMProcessor:
         routed_intent = analysis.get("intent", "DEEP_SEARCH")
         selected_tools = analysis.get("tools", [])
         sub_intent = analysis.get("sub_intent", "general")
-        intent = "AGENT"
+        intent = _resolve_runtime_intent(mode, routed_intent)
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
@@ -1260,6 +1290,8 @@ class LLMProcessor:
             post_chars = sum(len(m.get('content', '')) for m in optimized_context)
             if pre_chars != post_chars:
                 print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} ? {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
+        if _is_casual_query(user_query):
+            optimized_context = []
 
         # Construct messages with Context
         messages = [{"role": "system", "content": system_prompt}]
@@ -1729,11 +1761,10 @@ class LLMProcessor:
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
         MIN_AGENT_STEPS = 3   # Ensure multi-pass verification before final answer
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
-        _q_lower = (user_query or "").strip().lower()
-        is_casual_query = bool(re.match(r"^(hi|hello|hey|yo|sup|how are you|how r u|how are u|whats up)[!.?\s]*$", _q_lower))
+        is_casual_query = _is_casual_query(user_query)
         if is_casual_query:
             MIN_AGENT_STEPS = 1
-        is_profile_query = bool(re.search(r"\b(my name|about me|who am i|remember me|tell about me)\b", _q_lower))
+        is_profile_query = _is_profile_query(user_query)
         if is_profile_query:
             MIN_AGENT_STEPS = 1
 
@@ -1893,6 +1924,8 @@ class LLMProcessor:
         optimized_context = context_messages
         if context_messages and len(context_messages) > 4:
             optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
+        if is_casual_query:
+            optimized_context = []
 
         messages = [{"role": "system", "content": system_prompt}]
         if optimized_context:
@@ -2600,6 +2633,12 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
+
+
+
 
 
 

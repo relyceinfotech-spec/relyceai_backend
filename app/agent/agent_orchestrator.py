@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - Agent Orchestrator
 Layers 7+16: Conditional Delegation + Multi-Agent Coordination.
 
@@ -8,7 +8,7 @@ ONLY activates when:
   - AND NOT time_sensitive
 
 Delegation = prompt section composition (Planner/Researcher/Executor/Critic).
-No extra LLM calls — zero added latency for simple queries.
+No extra LLM calls â€” zero added latency for simple queries.
 
 Also contains the agent's base system prompt and the run_agent_pipeline() function
 that orchestrates the full 16-layer decision pipeline.
@@ -75,21 +75,21 @@ COMPLEXITY_THRESHOLD = 0.5
 # SYSTEM PROMPT
 # ============================================
 
-AGENT_SYSTEM_PROMPT = """You are **Relyce AI — Structured Agent Mode**.
+AGENT_SYSTEM_PROMPT = """You are **Relyce AI â€” Structured Agent Mode**.
 
-You are a reliable, adaptive action agent. You don't just respond — you plan, evaluate, and act.
+You are a reliable, adaptive action agent. You don't just respond â€” you plan, evaluate, and act.
 
 **CORE BEHAVIOR:**
 1. **Classify first:** Determine if the user needs an answer (QUESTION), a planned outcome (TASK), or an immediate action (ACTION).
 2. **Assess clarity:** If the request is ambiguous, ask ONE targeted clarifying question.
 3. **Evaluate risk:** Before acting, assess if the action is reversible and safe.
 4. **Plan before acting:** For complex tasks, break them into steps and explain your approach.
-5. **Collaborate on outcomes:** For goal-oriented requests, prepare solutions collaboratively — don't execute blindly.
+5. **Collaborate on outcomes:** For goal-oriented requests, prepare solutions collaboratively â€” don't execute blindly.
 
 **SAFETY RULES:**
 - Never execute irreversible actions without explicit user confirmation.
 - High-risk actions (delete, send, deploy) always require confirmation.
-- When uncertain, ask — don't assume.
+- When uncertain, ask â€” don't assume.
 
 **RESPONSE STYLE:**
 - Be direct and action-oriented.
@@ -110,7 +110,7 @@ You are a reliable, adaptive action agent. You don't just respond — you plan, 
 
 # Delegation prompt sections (composed when delegation is active)
 _PLANNER_SECTION = """
-**[PLANNER — Step 1]**
+**[PLANNER â€” Step 1]**
 Break this task into clear, sequential steps. Consider:
 - What is the end goal?
 - What are the dependencies between steps?
@@ -118,7 +118,7 @@ Break this task into clear, sequential steps. Consider:
 """
 
 _RESEARCHER_SECTION = """
-**[RESEARCHER — Step 2]**
+**[RESEARCHER â€” Step 2]**
 For each step, identify:
 - What facts or data are needed?
 - Are there multiple valid approaches? If so, compare them with trade-offs.
@@ -126,7 +126,7 @@ For each step, identify:
 """
 
 _EXECUTOR_SECTION = """
-**[EXECUTOR — Step 3]**
+**[EXECUTOR â€” Step 3]**
 Execute the plan:
 - Implement each step clearly and completely.
 - Show your work (code, reasoning, calculations).
@@ -134,7 +134,7 @@ Execute the plan:
 """
 
 _CRITIC_SECTION = """
-**[CRITIC — Step 4]**
+**[CRITIC â€” Step 4]**
 Review the output:
 - Does it fully address the user's goal?
 - Are there edge cases or risks not covered?
@@ -145,19 +145,19 @@ Review the output:
 _COMPARISON_SECTION = """
 **[MULTI-PERSPECTIVE ANALYSIS]**
 The user is requesting a comparison or evaluation. Structure your response as:
-1. **Overview** — Brief context for each option
-2. **Comparison Matrix** — Side-by-side on key dimensions
-3. **Trade-offs** — When to choose each option
-4. **Recommendation** — Your pick with reasoning
+1. **Overview** â€” Brief context for each option
+2. **Comparison Matrix** â€” Side-by-side on key dimensions
+3. **Trade-offs** â€” When to choose each option
+4. **Recommendation** â€” Your pick with reasoning
 """
 
 _RESEARCH_SECTION = """
 **[DEEP ANALYSIS]**
 The user needs thorough research. Structure your response as:
-1. **Context** — Background and scope
-2. **Key Findings** — Organized by theme
-3. **Analysis** — Implications and connections
-4. **Actionable Takeaways** — What to do with this information
+1. **Context** â€” Background and scope
+2. **Key Findings** â€” Organized by theme
+3. **Analysis** â€” Implications and connections
+4. **Actionable Takeaways** â€” What to do with this information
 """
 
 
@@ -180,7 +180,7 @@ class AgentOrchestrator:
           - TASK type AND (complex OR comparison OR research)
           - AND NOT time-sensitive (freshness > depth)
         """
-        # Time-sensitive queries skip delegation — freshness > depth
+        # Time-sensitive queries skip delegation â€” freshness > depth
         if temporal.is_time_sensitive:
             return False
 
@@ -197,7 +197,7 @@ class AgentOrchestrator:
     def build_delegation_prompt(self, action: ActionDecision) -> str:
         """
         Compose delegation prompt sections based on action characteristics.
-        These are injected into the system prompt — no extra LLM calls.
+        These are injected into the system prompt â€” no extra LLM calls.
         """
         sections = []
 
@@ -249,7 +249,7 @@ async def run_agent_pipeline(
       - prompt_sections: extra system prompt for LLM generation
       - delegation_active: whether multi-role prompts are in use
 
-    Does NOT call the LLM — processor handles that.
+    Does NOT call the LLM â€” processor handles that.
     """
     result = OrchestratorResult()
 
@@ -337,6 +337,7 @@ async def run_agent_pipeline(
         result.allowed_tools.append("document_compare")
         result.allowed_tools.append("data_cleaner")
         result.allowed_tools.append("unit_cost_calc")
+        result.allowed_tools.append("pdf_maker")
         result.allowed_tools.append("extract_entities")
         result.allowed_tools.append("validate_code")
         result.allowed_tools.append("generate_tests")
@@ -395,6 +396,7 @@ async def run_agent_pipeline(
             "document_compare": ["compare documents", "diff", "difference", "changes"],
             "data_cleaner": ["clean data", "dedupe", "normalize", "cleanup"],
             "unit_cost_calc": ["unit cost", "cost breakdown", "pricing model"],
+            "pdf_maker": ["make pdf", "create pdf", "export pdf", "download pdf", "convert to pdf", "save as pdf"],
             "execute_code": ["run code", "execute code", "python", "script", "evaluate"],
         }
         for tool_name, keywords in tool_hints.items():
@@ -402,7 +404,7 @@ async def run_agent_pipeline(
                 _add_tool(tool_name)
 
 
-    # --- Hybrid Strategy Advisory (THINK only — no execution) ---
+    # --- Hybrid Strategy Advisory (THINK only â€” no execution) ---
     strategy_advice = generate_strategy_advice(user_query, context={"intent": intent, "sub_intent": sub_intent})
     result.strategy = strategy_advice
 
@@ -428,7 +430,7 @@ def build_agent_system_prompt(
 EXECUTION MODE:
 
 You are an execution agent, not a conversational assistant.
-You are a **Pro-Level Multi-Domain Expert** — an elite authority across ALL fields including Medicine, Law, Engineering, Finance, Science, Technology, and more.
+You are a **Pro-Level Multi-Domain Expert** â€” an elite authority across ALL fields including Medicine, Law, Engineering, Finance, Science, Technology, and more.
 When answering domain-specific questions, provide professional-grade responses and actively use tools (search_web) to verify facts and ensure accuracy.
 
 Follow this behavior:
@@ -526,7 +528,7 @@ Only Deliver ONE final structured response.
             prompt += "\n[CRITICAL: DOCUMENT USAGE]\n"
             prompt += "When providing answers based on results from `search_documents`:\n"
             prompt += "- Provide a detailed answer based strictly on the document content.\n"
-            prompt += '- After your answer, add a section: "--- 💡 Related Insights from Document ---" and include 2-3 other relevant or interesting points from the file.\n'
+            prompt += '- After your answer, add a section: "--- ðŸ’¡ Related Insights from Document ---" and include 2-3 other relevant or interesting points from the file.\n'
             prompt += "- If the specific answer does not use document data, do NOT include the insights section.\n"
             prompt += "Always cite the source as [Document].\n"
     else:
@@ -550,7 +552,7 @@ def _build_confirm_message(action: ActionDecision, autonomy: AutonomyDecision) -
     """Build a confirmation request message for the user."""
     goal = action.goal.goal if action.goal else action.subtasks[0] if action.subtasks else "this action"
 
-    msg = f"⚠️ **Confirmation Required**\n\n"
+    msg = f"âš ï¸ **Confirmation Required**\n\n"
     msg += f"This action is classified as **{autonomy.risk_tier} risk**"
     if not autonomy.reversible:
         msg += " and **irreversible**"
@@ -582,6 +584,8 @@ def _build_ask_message(action: ActionDecision) -> str:
         msg += "- Could you be more specific about what you'd like me to do?\n"
 
     return msg
+
+
 
 
 

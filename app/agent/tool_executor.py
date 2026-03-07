@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - Tool Executor (Production Hardened)
 Tool Execution Layer: Real backend tool execution with standardized contract.
 
@@ -10,8 +10,8 @@ Architecture:
   - Contract-based validation (deterministic)
 
 Tools:
-  - get_current_time()  → real datetime
-  - search_web(query)   → serper API search (organic results)
+  - get_current_time()  â†’ real datetime
+  - search_web(query)   â†’ serper API search (organic results)
 """
 from __future__ import annotations
 
@@ -783,6 +783,42 @@ def _tool_unit_cost_calc(args: str = "") -> Dict:
             "confidence": "low",
         }
 
+def _tool_pdf_maker(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        title = str(payload.get("title", "Document Export")) if isinstance(payload, dict) else "Document Export"
+        target = str(payload.get("target", "text")) if isinstance(payload, dict) else "text"
+        content = str(payload.get("content", "")).strip() if isinstance(payload, dict) else str(args or "").strip()
+
+        if not content and target != "chat":
+            return {
+                "status": "failure",
+                "data": "Provide content to convert into PDF.",
+                "source": "pdf_maker",
+                "confidence": "low",
+            }
+
+        return {
+            "status": "success",
+            "data": {
+                "title": title,
+                "target": target,
+                "content": content,
+                "message": "PDF payload ready for client download",
+            },
+            "source": "pdf_maker",
+            "confidence": "high",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "pdf_maker",
+            "confidence": "low",
+        }
+
 def _tool_extract_entities(args: str = "") -> Dict:
     try:
         payload = None
@@ -1451,7 +1487,13 @@ TOOLS: Dict[str, Dict] = {
         "risk": "low",
         "freshness": "static",
     },
-    "extract_entities": {
+    "pdf_maker": {
+        "func": _tool_pdf_maker,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },`r`n    "extract_entities": {
         "func": _tool_extract_entities,
         "is_async": False,
         "reversible": True,
@@ -1527,7 +1569,7 @@ def determine_tool_permission(
     autonomy_action: str,
 ) -> bool:
     """
-    The APP decides if tools are allowed — not the LLM.
+    The APP decides if tools are allowed â€” not the LLM.
 
     Tools are ENABLED when:
       - action_type == "ACTION" (immediate execution)
@@ -1699,7 +1741,7 @@ async def execute_tool(tool_call: ToolCall, exec_ctx: Optional[ExecutionContext]
     # --- PHASE 6: Sandbox Isolation Routing ---
     from app.config import SANDBOX_ENABLED
     # Tools that are safe to sandbox (have no in-process side effects needed by orchestrator)
-    _SANDBOX_ELIGIBLE = {"read_file", "calculate", "retrieve_knowledge", "execute_code", "extract_entities", "validate_code", "generate_tests", "sentiment_scan", "document_compare", "data_cleaner", "unit_cost_calc"}
+    _SANDBOX_ELIGIBLE = {"read_file", "calculate", "retrieve_knowledge", "execute_code", "extract_entities", "validate_code", "generate_tests", "sentiment_scan", "document_compare", "data_cleaner", "unit_cost_calc", "pdf_maker"}
     
     if SANDBOX_ENABLED and tool_call.name in _SANDBOX_ELIGIBLE:
         from app.sandbox.sandbox_manager import get_sandbox_manager
@@ -1791,6 +1833,10 @@ def format_tool_result(result: ToolResult) -> str:
             f"CONFIDENCE: {result.confidence}\n"
             f"REASON: {result.error}"
         )
+
+
+
+
 
 
 
