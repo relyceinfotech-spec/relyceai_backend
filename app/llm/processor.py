@@ -403,7 +403,8 @@ class LLMProcessor:
             indent = match.group(1)
             name = match.group(2)
             return f'{indent}--{name}:'
-        content = re.sub(r'(\n\s*)-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
+        content = re.sub(r'(
+\s*)-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
         content = re.sub(r'(\s{2,})-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
         
         content = re.sub(r'var\s*\(\s*-\s+', 'var(--', content)
@@ -416,7 +417,8 @@ class LLMProcessor:
         content = content.replace("group: ;", "")
         
         if "line-clamp:" not in content and "-webkit-line-clamp:" in content:
-            content = re.sub(r'(\s*)-webkit-line-clamp:\s*([0-9]+);', r'\1line-clamp: \2;\n\1-webkit-line-clamp: \2;', content)
+            content = re.sub(r'(\s*)-webkit-line-clamp:\s*([0-9]+);', r'\1line-clamp: \2;
+\1-webkit-line-clamp: \2;', content)
         
         return content
 
@@ -428,26 +430,43 @@ class LLMProcessor:
         """
         if not messages and not existing_summary: return ""
         
-        conversation_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+        conversation_text = "
+".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
         
         # improved prompt for cumulative memory
         prompt_content = ""
         if existing_summary:
-            prompt_content += f"EXISTING SUMMARY:\n{existing_summary}\n\n"
+            prompt_content += f"EXISTING SUMMARY:
+{existing_summary}
+
+"
         
-        prompt_content += f"NEW MESSAGES TO INTEGRATE:\n{conversation_text}\n\n"
+        prompt_content += f"NEW MESSAGES TO INTEGRATE:
+{conversation_text}
+
+"
         
         prompt_content += (
-            "INSTRUCTIONS:\n"
-            "Update the structured memory using the new messages.\n"
-            "Output must use EXACTLY these sections in this order:\n"
-            "### User Constraints\n"
-            "### Code Entities\n"
-            "### Decisions Made\n"
-            "### Open Tasks\n"
-            "### Important Assumptions\n"
-            "Under each heading, use bullet points. If no items, write 'None'.\n"
-            "Keep items short. Preserve names of functions/classes/files/APIs exactly as seen.\n"
+            "INSTRUCTIONS:
+"
+            "Update the structured memory using the new messages.
+"
+            "Output must use EXACTLY these sections in this order:
+"
+            "### User Constraints
+"
+            "### Code Entities
+"
+            "### Decisions Made
+"
+            "### Open Tasks
+"
+            "### Important Assumptions
+"
+            "Under each heading, use bullet points. If no items, write 'None'.
+"
+            "Keep items short. Preserve names of functions/classes/files/APIs exactly as seen.
+"
             "Do NOT add new info. Do NOT include any other text."
         )
         
@@ -485,21 +504,29 @@ class LLMProcessor:
             system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
             if mode == "normal":
                 from app.llm.router import NORMAL_MARKDOWN_POLISH
-                system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
+                system_prompt = f"{system_prompt}
+{NORMAL_MARKDOWN_POLISH}"
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
-            system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
+            system_prompt = f"{system_prompt}
+
+**MODE SWITCH: {sub_intent.upper()}**
+{INTERNAL_MODE_PROMPTS[sub_intent]}"
             
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
-            system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+            system_prompt = f"{system_prompt}
+
+{emotional_instruction}"
         else:
             # Fallback to multi-label static map
             for emotion in emotions:
                 if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+                    system_prompt = f"{system_prompt}
+
+{TONE_MAP[emotion]}"
              
         # Check for Coding Buddy override
         model_to_use = self.model
@@ -591,15 +618,22 @@ class LLMProcessor:
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
-            system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
+            system_prompt = f"{system_prompt}
+
+**MODE SWITCH: {sub_intent.upper()}**
+{INTERNAL_MODE_PROMPTS[sub_intent]}"
 
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
-            system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+            system_prompt = f"{system_prompt}
+
+{emotional_instruction}"
         else:
             for emotion in emotions:
                 if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+                    system_prompt = f"{system_prompt}
+
+{TONE_MAP[emotion]}"
 
         
         messages = [{"role": "system", "content": system_prompt}]
@@ -609,7 +643,10 @@ class LLMProcessor:
         
         messages.append({
             "role": "user", 
-            "content": f"Search Data:\n{context_str}\n\nUser Query: {user_query}"
+            "content": f"Search Data:
+{context_str}
+
+User Query: {user_query}"
         })
         
         # Resolve final model using unified routing (shared with streaming)
@@ -862,7 +899,8 @@ class LLMProcessor:
                 system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
                 if mode == "normal":
                     from app.llm.router import NORMAL_MARKDOWN_POLISH
-                    system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
+                    system_prompt = f"{system_prompt}
+{NORMAL_MARKDOWN_POLISH}"
         else:
             if personality and mode == "normal":
                 from app.llm.router import get_system_prompt_for_personality
@@ -873,7 +911,10 @@ class LLMProcessor:
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
-            system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
+            system_prompt = f"{system_prompt}
+
+**MODE SWITCH: {sub_intent.upper()}**
+{specialized_prompt}"
         # Wait for all memory/profile tasks securely
         await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
 
@@ -893,7 +934,9 @@ class LLMProcessor:
         emotions = analysis.get("emotions", [])
         for emotion in emotions:
             if emotion in TONE_MAP:
-                system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
+                system_prompt = f"{system_prompt}
+
+{TONE_MAP[emotion]}"
         
         # === Intelligence Layer (Streaming) ===
         # Strategy Memory
@@ -922,38 +965,52 @@ class LLMProcessor:
             emotional_instruction = emotion_engine.get_instruction(state)
             if emotional_instruction:
                 print(f"[EmotionEngine] Injecting instruction")
-                system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+                system_prompt = f"{system_prompt}
+
+{emotional_instruction}"
 
             # === Frustration Prediction (Priority #6) ===
             frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
             proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
             if proactive_instruction:
-                system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
+                system_prompt = f"{system_prompt}
+
+{proactive_instruction}"
 
             # === Autonomous Debug Mode (Priority #5) ===
             if debug_agent.should_activate(emotions, state, sub_intent):
                 is_debug_mode = True
                 debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
-                system_prompt = f"{system_prompt}\n\n{debug_prompt}"
+                system_prompt = f"{system_prompt}
+
+{debug_prompt}"
                 yield debug_agent.get_info_message()
 
         # === User Profiler (Priority #2) ===
         if user_id and user_profile:
             personalization = user_profiler.get_personalization_instruction(user_profile)
             if personalization:
-                system_prompt = f"{system_prompt}\n\n{personalization}"
+                system_prompt = f"{system_prompt}
+
+{personalization}"
 
         # Inject strategy instruction
         if strategy_instruction:
-            system_prompt = f"{system_prompt}\n\n{strategy_instruction}"
+            system_prompt = f"{system_prompt}
+
+{strategy_instruction}"
 
         # Inject prompt variant
         if prompt_variant_instruction:
-            system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
+            system_prompt = f"{system_prompt}
+
+{prompt_variant_instruction}"
 
         # === SAFE CHAT AGENT: Constraint Analysis (Steps 1-11) ===
         if constraint_result and constraint_result.constraint_prompt:
-            system_prompt = f"{system_prompt}\n\n{constraint_result.constraint_prompt}"
+            system_prompt = f"{system_prompt}
+
+{constraint_result.constraint_prompt}"
             if DEBUG_SAFE_AGENT:
                 print(f"[SafeAgent] Pipeline complete: {constraint_result.log_summary()}")
 
@@ -1081,8 +1138,13 @@ class LLMProcessor:
                         # result is context string from retrieve_rag_context
                         if result and str(result).strip():
                             citation_tracker.add_rag_results(result)
-                            system_prompt += f"\n\n**LOCALLY UPLOADED DOCUMENTS:**\n{result}"
-                            system_prompt += f"\n\n{RAG_INSTRUCTION}"
+                            system_prompt += f"
+
+**LOCALLY UPLOADED DOCUMENTS:**
+{result}"
+                            system_prompt += f"
+
+{RAG_INSTRUCTION}"
                     elif key == "web_search":
                         # Process Serper results via CitationTracker
                         citation_tracker.add_serper_results(result)
@@ -1100,11 +1162,15 @@ class LLMProcessor:
                             
                         # Inject top results into system prompt
                         if organic_results:
-                            search_context = "\n".join([
+                            search_context = "
+".join([
                                 f"- {r.get('title')}: {r.get('snippet')} ({r.get('link')})" 
                                 for r in organic_results[:4] if isinstance(r, dict)
                             ])
-                            system_prompt += f"\n\n**FRESH WEB CONTEXT (March 2026):**\n{search_context}"
+                            system_prompt += f"
+
+**FRESH WEB CONTEXT (March 2026):**
+{search_context}"
 
             # === Retrieval Intelligence: deduplicate + filter ===
             if _packed_graph or _packed_memories:
@@ -1151,7 +1217,8 @@ class LLMProcessor:
                     vector_memories=_compacted_memory if _compacted_memory is not None else _packed_memories,
                 )
                 if packed_block:
-                    system_prompt = f"{system_prompt}\n{packed_block}"
+                    system_prompt = f"{system_prompt}
+{packed_block}"
                     g_count = len(_packed_graph) if _packed_graph else 0
                     m_count = len(_packed_memories) if _packed_memories else 0
                     print(f"[ContextPacker] Injected: {g_count} triples + {m_count} memories (layers: {active_layers})")
@@ -1223,11 +1290,19 @@ class LLMProcessor:
 
         # === Structured Reasoning Scaffold (Item #10: polished) ===
         _scaffold = (
-            "\n\nBefore answering, think through these steps internally:\n"
-            "1. Identify the task type.\n"
-            "2. Determine which context sources are relevant.\n"
-            "3. Extract key facts from the context.\n"
-            "4. Reason carefully before producing the final answer.\n\n"
+            "
+
+Before answering, think through these steps internally:
+"
+            "1. Identify the task type.
+"
+            "2. Determine which context sources are relevant.
+"
+            "3. Extract key facts from the context.
+"
+            "4. Reason carefully before producing the final answer.
+
+"
             "Only output the final answer to the user. "
             "Do not expose your reasoning steps."
         )
@@ -1364,16 +1439,24 @@ class LLMProcessor:
                 planning_messages = [
                     {"role": "system", "content": (
                         "You are an expert software architect, debugger, and technical analyst. "
-                        "Your job is to THINK, PLAN, and ANALYZE - NOT to write code.\n\n"
-                        "Depending on the request:\n"
+                        "Your job is to THINK, PLAN, and ANALYZE - NOT to write code.
+
+"
+                        "Depending on the request:
+"
                         "• If BUILDING something: Break down requirements, identify tech stack, "
-                        "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
+                        "structure, layout, design decisions, colors, fonts, interactions, and best practices.
+"
                         "• If DEBUGGING: Analyze the error/issue, identify root causes, "
-                        "explain what's going wrong, and outline the exact fix strategy step by step.\n"
+                        "explain what's going wrong, and outline the exact fix strategy step by step.
+"
                         "• If EXPLAINING code: Break down the code's purpose, logic flow, "
-                        "key functions, data flow, and how each part connects.\n"
+                        "key functions, data flow, and how each part connects.
+"
                         "• If DESIGNING a system: Identify components, architecture patterns, "
-                        "data models, APIs, and trade-offs.\n\n"
+                        "data models, APIs, and trade-offs.
+
+"
                         "DO NOT write any code. Only provide a detailed analysis and plan "
                         "that a developer can use to implement or fix the solution perfectly."
                     )},
@@ -1403,7 +1486,7 @@ class LLMProcessor:
                     if isinstance(chunk.usage, dict):
                         r_tokens = chunk.usage.get("reasoning_tokens", 0)
                     if r_tokens:
-                        yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                        yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                 if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
                     content_chunk = chunk.choices[0].delta.content
                     thinking_response += content_chunk
@@ -1431,18 +1514,30 @@ class LLMProcessor:
                 # For coding: GLM gets the plan and writes production code
                 pass2_messages = [
                     {"role": "system", "content": (
-                        f"{system_prompt}\n\n"
+                        f"{system_prompt}
+
+"
                         "You are now implementing code based on a detailed technical plan. "
                         "Write clean, complete, production-ready code following the plan exactly. "
                         "Include all styling, interactivity, and details mentioned in the plan. "
                         "Make the output visually stunning and modern."
                     )},
-                    {"role": "user", "content": f"TECHNICAL PLAN:\n\n{thinking_response}\n\nORIGINAL REQUEST: {user_query}\n\nNow write the complete, production-ready code based on this plan."}
+                    {"role": "user", "content": f"TECHNICAL PLAN:
+
+{thinking_response}
+
+ORIGINAL REQUEST: {user_query}
+
+Now write the complete, production-ready code based on this plan."}
                 ]
             else:
                 pass2_messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Based on this analysis:\n\n{thinking_response}\n\nProvide a clear, well-formatted response to: {user_query}"}
+                    {"role": "user", "content": f"Based on this analysis:
+
+{thinking_response}
+
+Provide a clear, well-formatted response to: {user_query}"}
                 ]
             
             if context_messages:
@@ -1483,12 +1578,14 @@ class LLMProcessor:
                             if isinstance(chunk.usage, dict):
                                 r_tokens = chunk.usage.get("reasoning_tokens", 0)
                             if r_tokens:
-                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                                yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
                             yield self._sanitize_output_text(chunk.choices[0].delta.content)
                 except Exception as stream_err:
                     print(f"[Processor] Stream failed in pass 2: {stream_err}")
-                    yield f"\n\n?? **Stream interrupted:** {str(stream_err)}"
+                    yield f"
+
+?? **Stream interrupted:** {str(stream_err)}"
             # End thinking return path
             return
 
@@ -1554,7 +1651,7 @@ class LLMProcessor:
                             if isinstance(chunk.usage, dict):
                                 r_tokens = chunk.usage.get("reasoning_tokens", 0)
                             if r_tokens:
-                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                                yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
                             streamed_text += chunk.choices[0].delta.content
                     full_text = self._sanitize_output_text(streamed_text)
@@ -1604,12 +1701,14 @@ class LLMProcessor:
                 if is_retryable and _attempt == 0:
                     wait_time = 2.0
                     print(f"[RECOVERY] Provider error (attempt 1): {api_err}. Retrying in {wait_time}s...")
-                    yield "[INFO]{\"provider_retry\": true}"
+                    yield "[INFO]{"provider_retry": true}"
                     await asyncio.sleep(wait_time)
                     continue
                 else:
                     print(f"[RECOVERY] Provider error (final): {api_err}")
-                    yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.\n\n*Error: {type(api_err).__name__}*"
+                    yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.
+
+*Error: {type(api_err).__name__}*"
                     return
         
         if stream is None:
@@ -1635,7 +1734,7 @@ class LLMProcessor:
                 if isinstance(chunk.usage, dict):
                     r_tokens = chunk.usage.get("reasoning_tokens", 0)
                 if r_tokens:
-                    yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                    yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                     
             if not hasattr(chunk, "choices") or not chunk.choices: continue
             delta = chunk.choices[0].delta
@@ -1723,6 +1822,7 @@ class LLMProcessor:
         )
 
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
+        MIN_AGENT_STEPS = 3   # Ensure multi-pass verification before final answer
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
 
         # --- Run agent pipeline (classify ? time ? autonomy ? orchestrate) ---
@@ -1881,11 +1981,16 @@ class LLMProcessor:
             if strategy.planning_mode == "PARALLEL_REASONING" and strategy.reasoning_context:
                 rc = strategy.reasoning_context
                 messages.append({"role": "system", "content": (
-                    "Planning Insight:\n"
-                    f"- Performance: {rc.get('performance', 'N/A')}\n"
-                    f"- Structure: {rc.get('structure', 'N/A')}\n"
-                    f"- Risk: {rc.get('risk', 'N/A')}\n"
-                    f"- Alternatives: {rc.get('alternatives', 'N/A')}\n"
+                    "Planning Insight:
+"
+                    f"- Performance: {rc.get('performance', 'N/A')}
+"
+                    f"- Structure: {rc.get('structure', 'N/A')}
+"
+                    f"- Risk: {rc.get('risk', 'N/A')}
+"
+                    f"- Alternatives: {rc.get('alternatives', 'N/A')}
+"
                     "Use this context while forming your answer."
                 )})
 
@@ -1967,7 +2072,8 @@ class LLMProcessor:
                         snippet = r.get("snippet", "")
                         chunks = chunk_text(snippet, max_chars=1000)
                         chunked_snippet = " ".join(chunks)
-                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})\nSnippet: {chunked_snippet}")
+                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})
+Snippet: {chunked_snippet}")
                         
                     # Conflict Check
                     conflicts = detect_conflicts(synthesized_chunks)
@@ -1976,7 +2082,9 @@ class LLMProcessor:
                         print("[Agent] Conflict detected in research chunks. Lowering research confidence.")
                         yield f'[INFO]{_json.dumps({"agent_state": "research_conflict_detected"})}'
                         
-                    formatted_research = "\\n\\n".join(synthesized_chunks)
+                    formatted_research = "\
+\
+".join(synthesized_chunks)
                     set_cache(r_query, formatted_research)
                     memory_outcome["research_used"] = True
                     memory_outcome["research_text"] = formatted_research
@@ -1987,7 +2095,10 @@ class LLMProcessor:
             if formatted_research:
                 messages.append({
                     "role": "system",
-                    "content": f"Research Data Acquired:\\n{formatted_research}\\n\\nUse this data to fulfill the user's request."
+                    "content": f"Research Data Acquired:\
+{formatted_research}\
+\
+Use this data to fulfill the user's request."
                 })
 
         # --- LLM generation with Tool Execution Interceptor ---
@@ -2023,9 +2134,13 @@ class LLMProcessor:
                 "stream": True
             }
             
-            print("\n\n--- GRAPH MESSAGES DUMP ---")
+            print("
+
+--- GRAPH MESSAGES DUMP ---")
             print(repr(messages))
-            print("---------------------------\n\n")
+            print("---------------------------
+
+")
             
             async for token in run_plan_graph(
                 graph=plan_graph,
@@ -2051,20 +2166,39 @@ class LLMProcessor:
             if tool_result_messages:
                 # Build a CLEAN context - strip all old refusal messages to prevent context poisoning
                 # Only include: system prompt (first msg), user query (last user msg), tool results, and synthesis instruction
-                tool_data = "\n\n".join(m.get("content", "") for m in tool_result_messages)
+                tool_data = "
+
+".join(m.get("content", "") for m in tool_result_messages)
                 
                 synthesis_messages = [
                     {
                         "role": "system",
                         "content": (
                             "You are a real-time data synthesis engine. Your ONLY job is to take search results "
-                            "and present them in a clear, detailed, well-formatted response.\n\n"
-                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' - the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
+                            "and present them in a clear, detailed, well-formatted response.
+
+"
+                            "RULES:
+- Answer the user\'s question directly first, then add short supporting bullets if needed.
+- Include specific details (numbers, names, dates, locations) only when relevant.
+- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.
+- Do NOT dump raw search result lists or metadata unless the user explicitly asks.
+- Only include sources when the user requests them; otherwise focus on the answer.
+- NEVER say \'I cannot access real-time data\' - the data is provided below.
+- NEVER apologize or mention knowledge cutoffs.
+- NEVER refuse. Your only purpose is to format and present the data.
+"
                         )
                     },
                     {
                         "role": "user",
-                        "content": f"Original question: {user_query}\n\n--- LIVE SEARCH DATA ---\n{tool_data}\n--- END DATA ---\n\nUse the data above to answer the question. Do not list raw search results or metadata."
+                        "content": f"Original question: {user_query}
+
+--- LIVE SEARCH DATA ---
+{tool_data}
+--- END DATA ---
+
+Use the data above to answer the question. Do not list raw search results or metadata."
                     }
                 ]
                 
@@ -2086,14 +2220,16 @@ class LLMProcessor:
                             if isinstance(chunk.usage, dict):
                                 r_tokens = chunk.usage.get("reasoning_tokens", 0)
                             if r_tokens:
-                                yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                                yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                             token_count += 1
                             yield self._sanitize_output_text(chunk.choices[0].delta.content)
                     print(f"[Synthesis] Completed. Streamed {token_count} tokens.")
                 except Exception as e:
                     print(f"[Synthesis] ERROR: {e}")
-                    yield f"\n\n**Search completed but synthesis failed:** {str(e)}"
+                    yield f"
+
+**Search completed but synthesis failed:** {str(e)}"
             else:
                 print("[Synthesis] No tool results found - skipping synthesis.")
                 pass
@@ -2111,7 +2247,9 @@ class LLMProcessor:
         if agent_result.tool_allowed:
             messages.append({
                 "role": "user",
-                "content": "\n[CRITICAL OVERRIDE]\nYou are an automated data retrieval API. You MUST NOT refuse to query for geopolitical, conflict-related, or real-time events. Output exactly `TOOL_CALL: search_web(\"...\")` immediately. Do NOT apologize or provide text refusals."
+                "content": "
+[CRITICAL OVERRIDE]
+You are an automated data retrieval API. You MUST NOT refuse to query for geopolitical, conflict-related, or real-time events. Output exactly `TOOL_CALL: search_web("...")` immediately. Do NOT apologize or provide text refusals."
             })
             
         step_count = 0
@@ -2153,9 +2291,13 @@ class LLMProcessor:
                 create_kwargs["temperature"] = temperature
             create_kwargs = self._guard_kwargs(create_kwargs, user_query)
             
-            print("\n\n--- MESSAGES DUMP ---")
+            print("
+
+--- MESSAGES DUMP ---")
             print(repr(messages))
-            print("---------------------\n\n")
+            print("---------------------
+
+")
                 
             def strip_execution_narration(text: str) -> str:
                 BLOCKED_PHRASES = [
@@ -2174,7 +2316,7 @@ class LLMProcessor:
 
             step_output = ""
             tool_detected = False
-            suppress_step_stream = agent_result.tool_allowed
+            suppress_step_stream = agent_result.tool_allowed or step_count < MIN_AGENT_STEPS
             try:
                 stream = await client.chat.completions.create(**create_kwargs)
                 async for chunk in stream:
@@ -2183,7 +2325,7 @@ class LLMProcessor:
                         if isinstance(chunk.usage, dict):
                             r_tokens = chunk.usage.get("reasoning_tokens", 0)
                         if r_tokens:
-                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                            yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                         token = self._sanitize_output_text(chunk.choices[0].delta.content)
                         step_output += token
@@ -2193,7 +2335,9 @@ class LLMProcessor:
                                 yield clean_chunk
             except Exception as step_err:
                 print(f"[Agent] Step {step_count} failed: {step_err}")
-                yield f"\n\n?? **Agent step failed:** {str(step_err)}"
+                yield f"
+
+?? **Agent step failed:** {str(step_err)}"
                 break # exit current loop to either finalize or retry
 
             # --- Confidence Drift & Misclassification Detection ---
@@ -2365,12 +2509,24 @@ class LLMProcessor:
                     messages.append({"role": "user", "content": "You must call the most appropriate tool now (e.g., search_web/search_news/search_scholar/web_fetch). Output ONLY TOOL_CALL."})
                     continue
             if not tool_detected:
+                # Enforce multi-pass verification even if an answer exists
+                if step_count < MIN_AGENT_STEPS:
+                    messages.append({"role": "assistant", "content": step_output})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Verify the above answer for accuracy and completeness. "
+                            "If anything is unclear, missing, or uncertain, improve it or call tools. "
+                            "Do not finalize yet."
+                        )
+                    })
+                    continue
+
                 # No tool call ? stream completed naturally
                 full_response += step_output
                 if suppress_step_stream and step_output.strip():
                     yield step_output
                 break  # exit step loop
-
             # --- Completion Guard: counts LLM steps + tool calls + retries ---
             if step_count >= MAX_AGENT_STEPS or exec_ctx.total_operations >= MAX_AGENT_STEPS:
                 exec_ctx.forced_finalize = True
@@ -2394,7 +2550,7 @@ class LLMProcessor:
                         if isinstance(chunk.usage, dict):
                             r_tokens = chunk.usage.get("reasoning_tokens", 0)
                         if r_tokens:
-                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                            yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                         token = self._sanitize_output_text(chunk.choices[0].delta.content)
                         full_response += token
@@ -2433,14 +2589,16 @@ Rules:
                         if isinstance(chunk.usage, dict):
                             r_tokens = chunk.usage.get("reasoning_tokens", 0)
                         if r_tokens:
-                            yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                            yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                         token = self._sanitize_output_text(chunk.choices[0].delta.content)
                         full_response += token
                         yield token
             except Exception as final_err:
                 print(f"[Agent] Final pass failed: {final_err}")
-                yield f"\n\n?? **Response generation failed:** {str(final_err)}"
+                yield f"
+
+?? **Response generation failed:** {str(final_err)}"
 
         # --- Failure Transparency: Internal-First ---
         # Inject degradation note into prompt, let LLM phrase it naturally
@@ -2471,7 +2629,7 @@ Rules:
                     if isinstance(chunk.usage, dict):
                         r_tokens = chunk.usage.get("reasoning_tokens", 0)
                     if r_tokens:
-                        yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+                        yield f"[INFO]INTEL:{{"reasoning_tokens": {r_tokens}}}"
                 if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                     token = self._sanitize_output_text(chunk.choices[0].delta.content)
                     full_response += token
@@ -2543,6 +2701,8 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
 
 
 
