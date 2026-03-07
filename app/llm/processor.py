@@ -1,4 +1,4 @@
-"""
+ï»¿"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -381,8 +381,8 @@ class LLMProcessor:
             
         text = html.unescape(text)
         
-        sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
-        sanitized = sanitized.replace("—", " - ").replace("–", " - ")
+        sanitized = text.replace("Ã¢â‚¬â€", " - ").replace("Ã¢â‚¬â€œ", " - ")
+        sanitized = sanitized.replace("â€”", " - ").replace("â€“", " - ")
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
@@ -1159,7 +1159,7 @@ class LLMProcessor:
         except Exception as e:
             print(f"[ContextRouter] Failed (non-blocking): {e}")
 
-        # === URL Auto-Fetch (AFTER Router — conditional on planner) ===
+        # === URL Auto-Fetch (AFTER Router - conditional on planner) ===
         if needs_retrieval and _query_plan.get("needs_web", True):
             try:
                 from app.input_processing.web_fetch import detect_urls, fetch_and_extract
@@ -1364,15 +1364,15 @@ class LLMProcessor:
                 planning_messages = [
                     {"role": "system", "content": (
                         "You are an expert software architect, debugger, and technical analyst. "
-                        "Your job is to THINK, PLAN, and ANALYZE — NOT to write code.\n\n"
+                        "Your job is to THINK, PLAN, and ANALYZE - NOT to write code.\n\n"
                         "Depending on the request:\n"
-                        "• If BUILDING something: Break down requirements, identify tech stack, "
+                        "â€¢ If BUILDING something: Break down requirements, identify tech stack, "
                         "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
-                        "• If DEBUGGING: Analyze the error/issue, identify root causes, "
+                        "â€¢ If DEBUGGING: Analyze the error/issue, identify root causes, "
                         "explain what's going wrong, and outline the exact fix strategy step by step.\n"
-                        "• If EXPLAINING code: Break down the code's purpose, logic flow, "
+                        "â€¢ If EXPLAINING code: Break down the code's purpose, logic flow, "
                         "key functions, data flow, and how each part connects.\n"
-                        "• If DESIGNING a system: Identify components, architecture patterns, "
+                        "â€¢ If DESIGNING a system: Identify components, architecture patterns, "
                         "data models, APIs, and trade-offs.\n\n"
                         "DO NOT write any code. Only provide a detailed analysis and plan "
                         "that a developer can use to implement or fix the solution perfectly."
@@ -1736,6 +1736,28 @@ class LLMProcessor:
             session_id=session_id,
             session_start_time=start_time,
         )
+
+        # Tool access policy by mode
+        # - Agent mode: full tool access (as decided by pipeline)
+        # - Normal/Business: limit to essential tools only
+        if mode in ("normal", "business") and agent_result.tool_allowed:
+            essential_tools = {
+                "get_current_time",
+                "search_web",
+                "search_news",
+                "search_weather",
+                "search_finance",
+                "search_currency",
+                "search_company",
+                "search_documents",
+                "web_fetch",
+                "calculate",
+            }
+            agent_result.allowed_tools = [
+                t for t in agent_result.allowed_tools if t in essential_tools
+            ]
+            if not agent_result.allowed_tools:
+                agent_result.tool_allowed = False
         
         # Override tool classification if we are resuming a deterministic graph node
         if resume_graph:
@@ -2027,7 +2049,7 @@ class LLMProcessor:
             print(f"[Synthesis] Tool result messages found: {len(tool_result_messages)}")
             
             if tool_result_messages:
-                # Build a CLEAN context — strip all old refusal messages to prevent context poisoning
+                # Build a CLEAN context - strip all old refusal messages to prevent context poisoning
                 # Only include: system prompt (first msg), user query (last user msg), tool results, and synthesis instruction
                 tool_data = "\n\n".join(m.get("content", "") for m in tool_result_messages)
                 
@@ -2037,7 +2059,7 @@ class LLMProcessor:
                         "content": (
                             "You are a real-time data synthesis engine. Your ONLY job is to take search results "
                             "and present them in a clear, detailed, well-formatted response.\n\n"
-                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' — the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
+                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' - the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
                         )
                     },
                     {
@@ -2073,7 +2095,7 @@ class LLMProcessor:
                     print(f"[Synthesis] ERROR: {e}")
                     yield f"\n\n**Search completed but synthesis failed:** {str(e)}"
             else:
-                print("[Synthesis] No tool results found — skipping synthesis.")
+                print("[Synthesis] No tool results found - skipping synthesis.")
                 pass
             
             # Update final state
@@ -2137,7 +2159,7 @@ class LLMProcessor:
                 
             def strip_execution_narration(text: str) -> str:
                 BLOCKED_PHRASES = [
-                    "Here is the plan", "I will now", "Next I will", "Let’s start",
+                    "Here is the plan", "I will now", "Next I will", "Letâ€™s start",
                     "I'll perform", "First, I will", "Then, I will", "Sure, I can help",
                     "Let's begin", "Now I will"
                 ]
@@ -2200,7 +2222,7 @@ class LLMProcessor:
                 valid_calls = []
                 for tc in tool_calls:
                     if not agent_result.tool_allowed or tc.name not in agent_result.allowed_tools:
-                        print(f"[Agent] TOOL_CALL ignored — not in allowed list (tried: {tc.name})")
+                        print(f"[Agent] TOOL_CALL ignored - not in allowed list (tried: {tc.name})")
                     else:
                         tc.user_id = user_id or "" # PH 4: Pass context to each call
                         tc.session_id = session_id or ""
@@ -2309,7 +2331,7 @@ class LLMProcessor:
                     if not result.success:
                         exec_ctx.degraded = True
                         exec_ctx.degradation_reasons.append(f"{tc.name}: {result.error}")
-                        print(f"[Agent] Tool FAILED: {tc.name} — {result.error}")
+                        print(f"[Agent] Tool FAILED: {tc.name} - {result.error}")
 
                     # Inject untrusted content hint if applicable
                     if getattr(result, "trust", "verified") == "unverified":
@@ -2455,7 +2477,7 @@ Rules:
                     full_response += token
                     yield token
 
-        # --- Layer 14: Self Monitor (passive — record only) ---
+        # --- Layer 14: Self Monitor (passive - record only) ---
         try:
             monitor_report = monitor_evaluate_response(
                 user_query, full_response,
@@ -2521,6 +2543,9 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
 
 
 
