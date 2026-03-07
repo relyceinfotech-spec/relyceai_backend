@@ -40,6 +40,8 @@ from app.state.phase_guard import get_phase_guard
 _event_seq_counters: Dict[Tuple, int] = {}
 _agent_rate_limits: Dict[str, list] = {}  # user_id -> [timestamp, ...] for agent mode rate limiting
 _agent_active_requests: set = set()  # user_ids with agent requests currently in-flight
+_AGENT_PREMIUM_PLANS = {"plus", "pro", "business"}
+_AGENT_FREE_MAX_MESSAGES_PER_CHAT = 2
 
 # Cancel flags for interrupt safety
 _cancel_flags: Dict[Tuple, bool] = {}
@@ -425,6 +427,23 @@ async def handle_websocket_message(
                 print(f"[AgentRateLimit] Plan lookup failed: {_e}")
                 _plan = "free"
             conn_info["_cached_plan"] = _plan
+        # Free users can access Agent tab, but only 2 messages per chat and no continuation payloads
+        if _plan not in _AGENT_PREMIUM_PLANS:
+            if any(marker in content for marker in ("CONTINUE_AVAILABLE", "Continue generating UI code", "<PREVIOUS_OUTPUT>")):
+                await manager.send_personal_message(
+                    json.dumps({"type": "error", "content": "Agent continuation is available only on Plus, Pro, or Business plans."}),
+                    websocket
+                )
+                return
+
+            _raw_count = get_raw_message_count(user_id, chat_id)
+            _used_agent_messages = _raw_count // 2
+            if _used_agent_messages >= _AGENT_FREE_MAX_MESSAGES_PER_CHAT:
+                await manager.send_personal_message(
+                    json.dumps({"type": "error", "content": "Free Agent limit reached for this chat (2 messages). Upgrade to Plus, Pro, or Business for unlimited Agent usage."}),
+                    websocket
+                )
+                return
 
         # --- Tiered limits ---
         _AGENT_LIMITS = {"free": 4, "plus": 6, "pro": 8, "business": 10}

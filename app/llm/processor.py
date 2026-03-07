@@ -1,4 +1,4 @@
-﻿"""
+"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -381,14 +381,17 @@ class LLMProcessor:
             
         text = html.unescape(text)
         
-        sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
+        sanitized = text
         sanitized = sanitized.replace("—", " - ").replace("–", " - ")
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        # Strip raw tool dump artifacts so users only see the final answer.
+        sanitized = re.sub(r"^\s*(Title|Snippet Details|Link|Source Link|Copy text|Export)\s*[:\-]?.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
 
-        return sanitized
-    
+        return sanitized.strip()
+
     def _fix_html_css_output(self, text: str) -> str:
         if not text:
             return text
@@ -1366,13 +1369,13 @@ class LLMProcessor:
                         "You are an expert software architect, debugger, and technical analyst. "
                         "Your job is to THINK, PLAN, and ANALYZE - NOT to write code.\n\n"
                         "Depending on the request:\n"
-                        "• If BUILDING something: Break down requirements, identify tech stack, "
+                        "- If BUILDING something: Break down requirements, identify tech stack, "
                         "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
-                        "• If DEBUGGING: Analyze the error/issue, identify root causes, "
+                        "- If DEBUGGING: Analyze the error/issue, identify root causes, "
                         "explain what's going wrong, and outline the exact fix strategy step by step.\n"
-                        "• If EXPLAINING code: Break down the code's purpose, logic flow, "
+                        "- If EXPLAINING code: Break down the code's purpose, logic flow, "
                         "key functions, data flow, and how each part connects.\n"
-                        "• If DESIGNING a system: Identify components, architecture patterns, "
+                        "- If DESIGNING a system: Identify components, architecture patterns, "
                         "data models, APIs, and trade-offs.\n\n"
                         "DO NOT write any code. Only provide a detailed analysis and plan "
                         "that a developer can use to implement or fix the solution perfectly."
@@ -1741,8 +1744,20 @@ class LLMProcessor:
         # Tool access policy by mode
         # - Agent mode: full tool access (as decided by pipeline)
         # - Normal/Business: limit to essential tools only
-        if mode in ("normal", "business") and agent_result.tool_allowed:
-            essential_tools = {
+        if mode == "normal" and agent_result.tool_allowed:
+            normal_tools = {
+                "get_current_time",
+                "search_web",
+                "calculate",
+            }
+            agent_result.allowed_tools = [
+                t for t in agent_result.allowed_tools if t in normal_tools
+            ]
+            if not agent_result.allowed_tools:
+                agent_result.tool_allowed = False
+
+        if mode == "business" and agent_result.tool_allowed:
+            business_tools = {
                 "get_current_time",
                 "search_web",
                 "search_news",
@@ -1753,13 +1768,16 @@ class LLMProcessor:
                 "search_documents",
                 "web_fetch",
                 "calculate",
+                "extract_tables",
+                "summarize_url",
+                "document_compare",
+                "faq_builder",
             }
             agent_result.allowed_tools = [
-                t for t in agent_result.allowed_tools if t in essential_tools
+                t for t in agent_result.allowed_tools if t in business_tools
             ]
             if not agent_result.allowed_tools:
                 agent_result.tool_allowed = False
-        
         # Override tool classification if we are resuming a deterministic graph node
         if resume_graph:
             agent_result.tool_allowed = True
@@ -2160,7 +2178,7 @@ class LLMProcessor:
                 
             def strip_execution_narration(text: str) -> str:
                 BLOCKED_PHRASES = [
-                    "Here is the plan", "I will now", "Next I will", "Let’s start",
+                    "Here is the plan", "I will now", "Next I will", "Let's start",
                     "I'll perform", "First, I will", "Then, I will", "Sure, I can help",
                     "Let's begin", "Now I will"
                 ]
@@ -2235,6 +2253,8 @@ class LLMProcessor:
                     break
 
                 tool_detected = True
+                if mode == "normal" and len(valid_calls) > 1:
+                    valid_calls = [valid_calls[0]]
 
                 # Record the pre-tool text into full_response
                 first_call_idx = step_output.find("TOOL_CALL:")
