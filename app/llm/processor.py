@@ -1768,6 +1768,14 @@ class LLMProcessor:
         if is_profile_query:
             MIN_AGENT_STEPS = 1
 
+        if is_casual_query:
+            q = (user_query or "").strip().lower()
+            if "how are" in q or "how r u" in q:
+                yield "Hey macha! I'm good. Sollu, what do you need?"
+            else:
+                yield "Hey macha! Sollu, what do you need?"
+            return
+
         # --- Run agent pipeline (classify ? time ? autonomy ? orchestrate) ---
         pipeline_start = _time.time()
         agent_result = await run_agent_pipeline(
@@ -2633,6 +2641,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 
