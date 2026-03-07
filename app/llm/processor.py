@@ -294,6 +294,31 @@ def _build_recall_response(context_messages: Optional[List[Dict]], user_query: s
     lines = [f"{idx + 1}. {msg}" for idx, msg in enumerate(recent)]
     return "Here are your recent messages in this chat:\n" + "\n".join(lines)
 
+
+def _wants_single_file_html(user_query: str) -> bool:
+    q = (user_query or "").lower()
+    triggers = [
+        "single html",
+        "single file",
+        "one html",
+        "one file",
+        "in one file",
+        "full code in one html",
+        "send as single code",
+        "all in one html",
+    ]
+    return any(t in q for t in triggers)
+
+
+def _single_file_html_instruction() -> str:
+    return (
+        "\n\nSTRICT OUTPUT RULES FOR THIS REQUEST:\n"
+        "- Return exactly ONE file: index.html\n"
+        "- Include CSS inside a <style> tag and JS inside a <script> tag in the same file\n"
+        "- Do NOT output style.css or script.js\n"
+        "- Output one fenced code block only, language html\n"
+        "- Ensure valid tags: <title> and <link rel=\"stylesheet\" ...> must be complete\n"
+    )
 def _resolve_runtime_intent(mode: str, routed_intent: str) -> str:
     """
     Execution intent policy by mode:
@@ -455,6 +480,10 @@ class LLMProcessor:
             return text
             
         text = html.unescape(text)
+        is_html_document = bool(re.search(r"<!doctype\s+html|<html[\s>]|<head>|<body>", text, flags=re.IGNORECASE))
+        if is_html_document:
+            # Preserve HTML docs exactly; tool-artifact stripping can corrupt valid tags like <title>/<link>.
+            return text
         
         sanitized = text
         sanitized = sanitized.replace("\u2014", " - ").replace("\u2013", " - ")
@@ -571,6 +600,8 @@ class LLMProcessor:
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
             
+        if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
+            system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
             system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
@@ -954,6 +985,8 @@ class LLMProcessor:
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
         # Wait for all memory/profile tasks securely
+        if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
+            system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
         await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
 
         # Extract intelligence results
@@ -2692,6 +2725,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 
