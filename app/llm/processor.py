@@ -185,8 +185,7 @@ def _get_reasoning_config(sub_intent: str, user_settings: Optional[Dict]) -> Opt
     if sub_intent not in REASONING_SUB_INTENTS:
         return None
     visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
-    exclude = visibility == "off"
-    effort = (REASONING_EFFORT or "low").lower()
+    exclude = visibility == "off"\\neffort = (REASONING_EFFORT or "low").lower()"
     allowed = {"xhigh", "high", "medium", "low", "minimal", "none"}
     if effort not in allowed:
         effort = "low"
@@ -222,9 +221,7 @@ def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Opti
     visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
     if visibility == "on":
         return True
-    if visibility == "off":
-        return False
-    if sub_intent == "casual_chat":
+    if visibility == "off":\\nreturn False\\nif sub_intent == "casual_chat":"
         return False
     return sub_intent in REASONING_VISIBLE_SUB_INTENTS
 
@@ -393,33 +390,35 @@ class LLMProcessor:
         if not text:
             return text
         content = text
-        
+
         content = re.sub(r'<!\s*-\s*-', '<!--', content)
         content = re.sub(r'-\s*-\s*>', '-->', content)
         content = re.sub(r'<!\s*-\s*-\s*\[', '<!--[', content)
         content = re.sub(r'\]\s*-\s*-\s*>', ']-->', content)
-        
+
         def fix_css_property(match):
             indent = match.group(1)
             name = match.group(2)
             return f'{indent}--{name}:'
-        content = re.sub(r'(
-\s*)-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
+        content = re.sub(r'(\s*)-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
         content = re.sub(r'(\s{2,})-\s+([a-zA-Z][a-zA-Z0-9-]*)\s*:', fix_css_property, content)
-        
+
         content = re.sub(r'var\s*\(\s*-\s+', 'var(--', content)
         content = re.sub(r'var\s*\(\s*-\s*-\s*', 'var(--', content)
-        
+
         content = re.sub(r'--\s+([a-zA-Z])', r'--\1', content)
         content = re.sub(r'--([a-zA-Z][a-zA-Z0-9-]*)\s+([a-zA-Z])', r'--\1\2', content)
-        
+
         content = content.replace("group: card;", "")
         content = content.replace("group: ;", "")
-        
+
         if "line-clamp:" not in content and "-webkit-line-clamp:" in content:
-            content = re.sub(r'(\s*)-webkit-line-clamp:\s*([0-9]+);', r'\1line-clamp: \2;
-\1-webkit-line-clamp: \2;', content)
-        
+            content = re.sub(
+                r'(\s*)-webkit-line-clamp:\s*([0-9]+);',
+                r'\1line-clamp: \2;\n\1-webkit-line-clamp: \2;',
+                content
+            )
+
         return content
 
     async def summarize_context(self, messages: List[Dict], existing_summary: str = "") -> str:
@@ -428,48 +427,32 @@ class LLMProcessor:
         Used for Option-2 Context Strategy.
         Refines existing summary if provided.
         """
-        if not messages and not existing_summary: return ""
-        
-        conversation_text = "
-".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
-        
+        if not messages and not existing_summary:
+            return ""
+
+        conversation_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+
         # improved prompt for cumulative memory
         prompt_content = ""
         if existing_summary:
-            prompt_content += f"EXISTING SUMMARY:
-{existing_summary}
+            prompt_content += f"EXISTING SUMMARY:\n{existing_summary}\n\n"
 
-"
-        
-        prompt_content += f"NEW MESSAGES TO INTEGRATE:
-{conversation_text}
+        prompt_content += f"NEW MESSAGES TO INTEGRATE:\n{conversation_text}\n\n"
 
-"
-        
         prompt_content += (
-            "INSTRUCTIONS:
-"
-            "Update the structured memory using the new messages.
-"
-            "Output must use EXACTLY these sections in this order:
-"
-            "### User Constraints
-"
-            "### Code Entities
-"
-            "### Decisions Made
-"
-            "### Open Tasks
-"
-            "### Important Assumptions
-"
-            "Under each heading, use bullet points. If no items, write 'None'.
-"
-            "Keep items short. Preserve names of functions/classes/files/APIs exactly as seen.
-"
+            "INSTRUCTIONS:\n"
+            "Update the structured memory using the new messages.\n"
+            "Output must use EXACTLY these sections in this order:\n"
+            "### User Constraints\n"
+            "### Code Entities\n"
+            "### Decisions Made\n"
+            "### Open Tasks\n"
+            "### Important Assumptions\n"
+            "Under each heading, use bullet points. If no items, write 'None'.\n"
+            "Keep items short. Preserve names of functions/classes/files/APIs exactly as seen.\n"
             "Do NOT add new info. Do NOT include any other text."
         )
-        
+
         try:
             response = await get_openrouter_client().chat.completions.create(
                 model=LLM_MODEL,
@@ -478,9 +461,7 @@ class LLMProcessor:
             )
             return response.choices[0].message.content
         except Exception:
-            return existing_summary # Return old summary if update fails
-
-    
+            return existing_summary  # Return old summary if update fails
     async def process_agent_query(
         self,
         user_query: str,
@@ -504,29 +485,21 @@ class LLMProcessor:
             system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
             if mode == "normal":
                 from app.llm.router import NORMAL_MARKDOWN_POLISH
-                system_prompt = f"{system_prompt}
-{NORMAL_MARKDOWN_POLISH}"
+                system_prompt = f"{system_prompt}\\n{NORMAL_MARKDOWN_POLISH}"
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
-            system_prompt = f"{system_prompt}
-
-**MODE SWITCH: {sub_intent.upper()}**
-{INTERNAL_MODE_PROMPTS[sub_intent]}"
+            system_prompt = f"{system_prompt}\\n\\n**MODE SWITCH: {sub_intent.upper()}**\\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
             
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
-            system_prompt = f"{system_prompt}
-
-{emotional_instruction}"
+            system_prompt = f"{system_prompt}\\n\\n{emotional_instruction}"
         else:
             # Fallback to multi-label static map
             for emotion in emotions:
                 if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}
-
-{TONE_MAP[emotion]}"
+                    system_prompt = f"{system_prompt}\\n\\n{TONE_MAP[emotion]}"
              
         # Check for Coding Buddy override
         model_to_use = self.model
@@ -618,22 +591,15 @@ class LLMProcessor:
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
-            system_prompt = f"{system_prompt}
-
-**MODE SWITCH: {sub_intent.upper()}**
-{INTERNAL_MODE_PROMPTS[sub_intent]}"
+            system_prompt = f"{system_prompt}\\n\\n**MODE SWITCH: {sub_intent.upper()}**\\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
 
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
-            system_prompt = f"{system_prompt}
-
-{emotional_instruction}"
+            system_prompt = f"{system_prompt}\\n\\n{emotional_instruction}"
         else:
             for emotion in emotions:
                 if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}
-
-{TONE_MAP[emotion]}"
+                    system_prompt = f"{system_prompt}\\n\\n{TONE_MAP[emotion]}"
 
         
         messages = [{"role": "system", "content": system_prompt}]
@@ -643,10 +609,7 @@ class LLMProcessor:
         
         messages.append({
             "role": "user", 
-            "content": f"Search Data:
-{context_str}
-
-User Query: {user_query}"
+            "content": f"Search Data:\\n{context_str}\\n\\nUser Query: {user_query}"
         })
         
         # Resolve final model using unified routing (shared with streaming)
@@ -899,8 +862,7 @@ User Query: {user_query}"
                 system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
                 if mode == "normal":
                     from app.llm.router import NORMAL_MARKDOWN_POLISH
-                    system_prompt = f"{system_prompt}
-{NORMAL_MARKDOWN_POLISH}"
+                    system_prompt = f"{system_prompt}\\n{NORMAL_MARKDOWN_POLISH}"
         else:
             if personality and mode == "normal":
                 from app.llm.router import get_system_prompt_for_personality
@@ -911,10 +873,7 @@ User Query: {user_query}"
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
-            system_prompt = f"{system_prompt}
-
-**MODE SWITCH: {sub_intent.upper()}**
-{specialized_prompt}"
+            system_prompt = f"{system_prompt}\\n\\n**MODE SWITCH: {sub_intent.upper()}**\\n{specialized_prompt}"
         # Wait for all memory/profile tasks securely
         await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
 
@@ -934,9 +893,7 @@ User Query: {user_query}"
         emotions = analysis.get("emotions", [])
         for emotion in emotions:
             if emotion in TONE_MAP:
-                system_prompt = f"{system_prompt}
-
-{TONE_MAP[emotion]}"
+                system_prompt = f"{system_prompt}\\n\\n{TONE_MAP[emotion]}"
         
         # === Intelligence Layer (Streaming) ===
         # Strategy Memory
@@ -965,52 +922,38 @@ User Query: {user_query}"
             emotional_instruction = emotion_engine.get_instruction(state)
             if emotional_instruction:
                 print(f"[EmotionEngine] Injecting instruction")
-                system_prompt = f"{system_prompt}
-
-{emotional_instruction}"
+                system_prompt = f"{system_prompt}\\n\\n{emotional_instruction}"
 
             # === Frustration Prediction (Priority #6) ===
             frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
             proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
             if proactive_instruction:
-                system_prompt = f"{system_prompt}
-
-{proactive_instruction}"
+                system_prompt = f"{system_prompt}\\n\\n{proactive_instruction}"
 
             # === Autonomous Debug Mode (Priority #5) ===
             if debug_agent.should_activate(emotions, state, sub_intent):
                 is_debug_mode = True
                 debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
-                system_prompt = f"{system_prompt}
-
-{debug_prompt}"
+                system_prompt = f"{system_prompt}\\n\\n{debug_prompt}"
                 yield debug_agent.get_info_message()
 
         # === User Profiler (Priority #2) ===
         if user_id and user_profile:
             personalization = user_profiler.get_personalization_instruction(user_profile)
             if personalization:
-                system_prompt = f"{system_prompt}
-
-{personalization}"
+                system_prompt = f"{system_prompt}\\n\\n{personalization}"
 
         # Inject strategy instruction
         if strategy_instruction:
-            system_prompt = f"{system_prompt}
-
-{strategy_instruction}"
+            system_prompt = f"{system_prompt}\\n\\n{strategy_instruction}"
 
         # Inject prompt variant
         if prompt_variant_instruction:
-            system_prompt = f"{system_prompt}
-
-{prompt_variant_instruction}"
+            system_prompt = f"{system_prompt}\\n\\n{prompt_variant_instruction}"
 
         # === SAFE CHAT AGENT: Constraint Analysis (Steps 1-11) ===
         if constraint_result and constraint_result.constraint_prompt:
-            system_prompt = f"{system_prompt}
-
-{constraint_result.constraint_prompt}"
+            system_prompt = f"{system_prompt}\\n\\n{constraint_result.constraint_prompt}"
             if DEBUG_SAFE_AGENT:
                 print(f"[SafeAgent] Pipeline complete: {constraint_result.log_summary()}")
 
@@ -1138,13 +1081,8 @@ User Query: {user_query}"
                         # result is context string from retrieve_rag_context
                         if result and str(result).strip():
                             citation_tracker.add_rag_results(result)
-                            system_prompt += f"
-
-**LOCALLY UPLOADED DOCUMENTS:**
-{result}"
-                            system_prompt += f"
-
-{RAG_INSTRUCTION}"
+                            system_prompt += f"\\n\\n**LOCALLY UPLOADED DOCUMENTS:**\\n{result}"
+                            system_prompt += f"\\n\\n{RAG_INSTRUCTION}"
                     elif key == "web_search":
                         # Process Serper results via CitationTracker
                         citation_tracker.add_serper_results(result)
@@ -1167,10 +1105,7 @@ User Query: {user_query}"
                                 f"- {r.get('title')}: {r.get('snippet')} ({r.get('link')})" 
                                 for r in organic_results[:4] if isinstance(r, dict)
                             ])
-                            system_prompt += f"
-
-**FRESH WEB CONTEXT (March 2026):**
-{search_context}"
+                            system_prompt += f"\\n\\n**FRESH WEB CONTEXT (March 2026):**\\n{search_context}"
 
             # === Retrieval Intelligence: deduplicate + filter ===
             if _packed_graph or _packed_memories:
@@ -1217,8 +1152,7 @@ User Query: {user_query}"
                     vector_memories=_compacted_memory if _compacted_memory is not None else _packed_memories,
                 )
                 if packed_block:
-                    system_prompt = f"{system_prompt}
-{packed_block}"
+                    system_prompt = f"{system_prompt}\\n{packed_block}"
                     g_count = len(_packed_graph) if _packed_graph else 0
                     m_count = len(_packed_memories) if _packed_memories else 0
                     print(f"[ContextPacker] Injected: {g_count} triples + {m_count} memories (layers: {active_layers})")
@@ -1514,30 +1448,18 @@ Before answering, think through these steps internally:
                 # For coding: GLM gets the plan and writes production code
                 pass2_messages = [
                     {"role": "system", "content": (
-                        f"{system_prompt}
-
-"
+                        f"{system_prompt}\\n\\n"
                         "You are now implementing code based on a detailed technical plan. "
                         "Write clean, complete, production-ready code following the plan exactly. "
                         "Include all styling, interactivity, and details mentioned in the plan. "
                         "Make the output visually stunning and modern."
                     )},
-                    {"role": "user", "content": f"TECHNICAL PLAN:
-
-{thinking_response}
-
-ORIGINAL REQUEST: {user_query}
-
-Now write the complete, production-ready code based on this plan."}
+                    {"role": "user", "content": f"TECHNICAL PLAN:\\n\\n{thinking_response}\\n\\nORIGINAL REQUEST: {user_query}\\n\\nNow write the complete, production-ready code based on this plan."}"
                 ]
             else:
                 pass2_messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Based on this analysis:
-
-{thinking_response}
-
-Provide a clear, well-formatted response to: {user_query}"}
+                    {"role": "user", "content": f"Based on this analysis:\\n\\n{thinking_response}\\n\\nProvide a clear, well-formatted response to: {user_query}"}"
                 ]
             
             if context_messages:
@@ -1583,9 +1505,7 @@ Provide a clear, well-formatted response to: {user_query}"}
                             yield self._sanitize_output_text(chunk.choices[0].delta.content)
                 except Exception as stream_err:
                     print(f"[Processor] Stream failed in pass 2: {stream_err}")
-                    yield f"
-
-?? **Stream interrupted:** {str(stream_err)}"
+                    yield f"\\n\\n?? **Stream interrupted:** {str(stream_err)}"
             # End thinking return path
             return
 
@@ -1706,9 +1626,7 @@ Provide a clear, well-formatted response to: {user_query}"}
                     continue
                 else:
                     print(f"[RECOVERY] Provider error (final): {api_err}")
-                    yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.
-
-*Error: {type(api_err).__name__}*"
+                    yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.\\n\\n*Error: {type(api_err).__name__}*"
                     return
         
         if stream is None:
@@ -1983,14 +1901,10 @@ Provide a clear, well-formatted response to: {user_query}"}
                 messages.append({"role": "system", "content": (
                     "Planning Insight:
 "
-                    f"- Performance: {rc.get('performance', 'N/A')}
-"
-                    f"- Structure: {rc.get('structure', 'N/A')}
-"
-                    f"- Risk: {rc.get('risk', 'N/A')}
-"
-                    f"- Alternatives: {rc.get('alternatives', 'N/A')}
-"
+                    f"- Performance: {rc.get('performance', 'N/A')}\\n"
+                    f"- Structure: {rc.get('structure', 'N/A')}\\n"
+                    f"- Risk: {rc.get('risk', 'N/A')}\\n"
+                    f"- Alternatives: {rc.get('alternatives', 'N/A')}\\n"
                     "Use this context while forming your answer."
                 )})
 
@@ -2072,8 +1986,7 @@ Provide a clear, well-formatted response to: {user_query}"}
                         snippet = r.get("snippet", "")
                         chunks = chunk_text(snippet, max_chars=1000)
                         chunked_snippet = " ".join(chunks)
-                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})
-Snippet: {chunked_snippet}")
+                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})\\nSnippet: {chunked_snippet}")"
                         
                     # Conflict Check
                     conflicts = detect_conflicts(synthesized_chunks)
@@ -2095,10 +2008,7 @@ Snippet: {chunked_snippet}")
             if formatted_research:
                 messages.append({
                     "role": "system",
-                    "content": f"Research Data Acquired:\
-{formatted_research}\
-\
-Use this data to fulfill the user's request."
+                    "content": f"Research Data Acquired:\\\n{formatted_research}\\\n\\\nUse this data to fulfill the user's request."
                 })
 
         # --- LLM generation with Tool Execution Interceptor ---
@@ -2192,13 +2102,7 @@ Use this data to fulfill the user's request."
                     },
                     {
                         "role": "user",
-                        "content": f"Original question: {user_query}
-
---- LIVE SEARCH DATA ---
-{tool_data}
---- END DATA ---
-
-Use the data above to answer the question. Do not list raw search results or metadata."
+                        "content": f"Original question: {user_query}\\n\\n--- LIVE SEARCH DATA ---\\n{tool_data}\\n--- END DATA ---\\n\\nUse the data above to answer the question. Do not list raw search results or metadata."
                     }
                 ]
                 
@@ -2227,9 +2131,7 @@ Use the data above to answer the question. Do not list raw search results or met
                     print(f"[Synthesis] Completed. Streamed {token_count} tokens.")
                 except Exception as e:
                     print(f"[Synthesis] ERROR: {e}")
-                    yield f"
-
-**Search completed but synthesis failed:** {str(e)}"
+                    yield f"\\n\\n**Search completed but synthesis failed:** {str(e)}"
             else:
                 print("[Synthesis] No tool results found - skipping synthesis.")
                 pass
@@ -2335,9 +2237,7 @@ You are an automated data retrieval API. You MUST NOT refuse to query for geopol
                                 yield clean_chunk
             except Exception as step_err:
                 print(f"[Agent] Step {step_count} failed: {step_err}")
-                yield f"
-
-?? **Agent step failed:** {str(step_err)}"
+                yield f"\\n\\n?? **Agent step failed:** {str(step_err)}"
                 break # exit current loop to either finalize or retry
 
             # --- Confidence Drift & Misclassification Detection ---
@@ -2596,9 +2496,7 @@ Rules:
                         yield token
             except Exception as final_err:
                 print(f"[Agent] Final pass failed: {final_err}")
-                yield f"
-
-?? **Response generation failed:** {str(final_err)}"
+                yield f"\\n\\n?? **Response generation failed:** {str(final_err)}"
 
         # --- Failure Transparency: Internal-First ---
         # Inject degradation note into prompt, let LLM phrase it naturally
@@ -2701,6 +2599,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 
