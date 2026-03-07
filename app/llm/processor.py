@@ -249,6 +249,51 @@ def _is_profile_query(user_query: str) -> bool:
     return bool(re.search(r"\b(my name|about me|who am i|remember me|tell about me)\b", q))
 
 
+
+def _is_recall_query(user_query: str) -> bool:
+    q = (user_query or "").strip().lower()
+    patterns = [
+        r"\bwhat (?:did|do) i (?:ask|say)\b",
+        r"\bmy first (?:question|message|ask)\b",
+        r"\bfirst thing i asked\b",
+        r"\bwhat was my first\b",
+        r"\bearlier (?:question|message|ask)\b",
+        r"\bprevious (?:question|message|ask)\b",
+    ]
+    return any(re.search(p, q) for p in patterns)
+
+
+def _build_recall_response(context_messages: Optional[List[Dict]], user_query: str) -> Optional[str]:
+    if not context_messages:
+        return "I cannot find earlier messages in this chat yet."
+
+    user_msgs = []
+    for m in context_messages:
+        if str(m.get("role", "")).lower() != "user":
+            continue
+        content = str(m.get("content", "")).strip()
+        if content:
+            user_msgs.append(content)
+
+    if not user_msgs:
+        return "I cannot find earlier user messages in this chat yet."
+
+    q = (user_query or "").strip().lower()
+    is_first = bool(re.search(r"\b(first|starting|initial)\b", q))
+    is_last = bool(re.search(r"\b(last|latest|previous)\b", q))
+
+    if is_first:
+        first_msg = user_msgs[0]
+        return f"Your first message in this chat was: \"{first_msg}\""
+
+    if is_last:
+        last_msg = user_msgs[-1]
+        return f"Your last message before this was: \"{last_msg}\""
+
+    recent = user_msgs[-5:]
+    lines = [f"{idx + 1}. {msg}" for idx, msg in enumerate(recent)]
+    return "Here are your recent messages in this chat:\n" + "\n".join(lines)
+
 def _resolve_runtime_intent(mode: str, routed_intent: str) -> str:
     """
     Execution intent policy by mode:
@@ -1768,6 +1813,12 @@ class LLMProcessor:
         if is_profile_query:
             MIN_AGENT_STEPS = 1
 
+        if _is_recall_query(user_query):
+            recall = _build_recall_response(context_messages, user_query)
+            if recall:
+                yield recall
+                return
+
         if is_casual_query:
             q = (user_query or "").strip().lower()
             if "how are" in q or "how r u" in q:
@@ -2641,6 +2692,8 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
 
 
 
