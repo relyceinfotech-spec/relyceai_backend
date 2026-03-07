@@ -177,6 +177,7 @@ def _get_max_tokens_for_sub_intent(sub_intent: str) -> Optional[int]:
 
 
 
+
 def _get_reasoning_config(sub_intent: str, user_settings: Optional[Dict]) -> Optional[Dict[str, Any]]:
     """
     Build OpenRouter reasoning config for coding/UI-heavy generation.
@@ -185,14 +186,14 @@ def _get_reasoning_config(sub_intent: str, user_settings: Optional[Dict]) -> Opt
     if sub_intent not in REASONING_SUB_INTENTS:
         return None
     visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
-    exclude = visibility == "off"\\neffort = (REASONING_EFFORT or "low").lower()"
+    exclude = visibility == "off"
+    effort = (REASONING_EFFORT or "low").lower()
     allowed = {"xhigh", "high", "medium", "low", "minimal", "none"}
     if effort not in allowed:
         effort = "low"
     if effort == "none":
         return {"exclude": True}
     return {"effort": effort, "exclude": exclude, "enabled": True}
-
 
 def _apply_reasoning(create_kwargs: Dict[str, Any], model_to_use: str, sub_intent: str, user_settings: Optional[Dict]) -> None:
     """Attach OpenRouter reasoning & throughput config when applicable."""
@@ -215,13 +216,16 @@ def _apply_reasoning(create_kwargs: Dict[str, Any], model_to_use: str, sub_inten
 
 REASONING_VISIBLE_SUB_INTENTS = REASONING_SUB_INTENTS
 
+
 def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Optional[Dict] = None) -> bool:
     if mode != "normal":
         return False
     visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
     if visibility == "on":
         return True
-    if visibility == "off":\\nreturn False\\nif sub_intent == "casual_chat":"
+    if visibility == "off":
+        return False
+    if sub_intent == "casual_chat":
         return False
     return sub_intent in REASONING_VISIBLE_SUB_INTENTS
 
@@ -1986,18 +1990,18 @@ Before answering, think through these steps internally:
                         snippet = r.get("snippet", "")
                         chunks = chunk_text(snippet, max_chars=1000)
                         chunked_snippet = " ".join(chunks)
-                        synthesized_chunks.append(f"Source: {title} ({r.get('link', '')})\\nSnippet: {chunked_snippet}")"
-                        
+                        synthesized_chunks.append(
+                            f"Source: {title} ({r.get('link', '')})\nSnippet: {chunked_snippet}"
+                        )
+
                     # Conflict Check
                     conflicts = detect_conflicts(synthesized_chunks)
                     if conflicts:
                         strategy.research_confidence = adjust_confidence_for_conflicts(strategy.research_confidence, conflicts)
                         print("[Agent] Conflict detected in research chunks. Lowering research confidence.")
                         yield f'[INFO]{_json.dumps({"agent_state": "research_conflict_detected"})}'
-                        
-                    formatted_research = "\
-\
-".join(synthesized_chunks)
+
+                    formatted_research = "\n\n".join(synthesized_chunks)
                     set_cache(r_query, formatted_research)
                     memory_outcome["research_used"] = True
                     memory_outcome["research_text"] = formatted_research
@@ -2005,6 +2009,15 @@ Before answering, think through these steps internally:
                     formatted_research = None
                     yield f'[INFO]{_json.dumps({"agent_state": "research_failed"})}'
 
+            if formatted_research:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Research Data Acquired:\n"
+                        f"{formatted_research}\n\n"
+                        "Use this data to fulfill the user's request."
+                    )
+                })
             if formatted_research:
                 messages.append({
                     "role": "system",
@@ -2599,6 +2612,10 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
+
 
 
 
