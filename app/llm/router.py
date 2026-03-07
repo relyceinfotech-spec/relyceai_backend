@@ -74,21 +74,29 @@ def get_openrouter_client() -> AsyncOpenAI:
 # Normal mode tools
 NORMAL_TOOLS = {
     "Search": SERPER_TOOLS["Search"],
+    "Images": SERPER_TOOLS["Images"],
+    "Videos": SERPER_TOOLS["Videos"],
     "Places": SERPER_TOOLS["Places"],
     "Maps": SERPER_TOOLS["Maps"],
     "Reviews": SERPER_TOOLS["Reviews"],
     "News": SERPER_TOOLS["News"],
     "Shopping": SERPER_TOOLS["Shopping"],
-    "Scholar": SERPER_TOOLS["Scholar"]
+    "Scholar": SERPER_TOOLS["Scholar"],
+    "Patents": SERPER_TOOLS["Patents"]
 }
 
 # Business mode tools
 BUSINESS_TOOLS = {
     "Search": SERPER_TOOLS["Search"],
+    "News": SERPER_TOOLS["News"],
+    "Reviews": SERPER_TOOLS["Reviews"],
     "Places": SERPER_TOOLS["Places"],
     "Maps": SERPER_TOOLS["Maps"],
-    "Reviews": SERPER_TOOLS["Reviews"],
-    "News": SERPER_TOOLS["News"]
+    "Shopping": SERPER_TOOLS["Shopping"],
+    "Scholar": SERPER_TOOLS["Scholar"],
+    "Patents": SERPER_TOOLS["Patents"],
+    "Videos": SERPER_TOOLS["Videos"],
+    "Images": SERPER_TOOLS["Images"]
 }
 
 # DeepSearch mode tools (all tools)
@@ -131,7 +139,7 @@ BASE_FORMATTING_RULES = """
 - **File Names**: **MUST** use the format `**File: [Name]**` immediately before the block.
 - **No Comments**: Do NOT explain code inside the block.
 - **HTML/CSS**: Use valid comments `<!-- -->`, valid CSS variables `--name`.
-- **Sources**: If using web tools, list sources at the very bottom: `Source: [Link]`
+- **Sources**: Only include sources if the user explicitly asks. Otherwise, do NOT list sources or raw link dumps.
 
 **5. PARAGRAPHS AND SPACING (STRICT)**
 - DO NOT use empty lines or double newlines between paragraphs or lists.
@@ -216,7 +224,7 @@ You must strictly follow this visual structure. Do NOT use numbered lists (1, 2,
 - Second line: A blank line (`\n\n`).
 - Third section: The **Answer** (The detailed response, heavily using bullet points and short paragraphs).
 - Fourth section: A blank line (`\n\n`).
-- Final section: List **all Sources** used. 
+- Final section (ONLY if the user explicitly asks for sources): List **Sources** used.
   * Format strictly as: `Source: [Link or Filename]`
 """
 
@@ -763,9 +771,9 @@ async def analyze_and_route_query(
         # Everything else in Business Mode defaults to EXTERNAL + Search (Deep Research)
         # This matches "Pure LLM" -> Search override user observed.
         # FIX: Matches Legacy Business.py behavior by selecting tools dynamically (Maps, Places, etc.) instead of hardcoded Search.
-        print(f"[Router] 💼 Business Mode: Defaulting to EXTERNAL search for '{q}'")
+        print(f"[Router] 💼 Business Mode: Defaulting to AGENT research for '{q}'")
         selected_tools = await select_tools_for_mode(user_query, mode)
-        return {"intent": "EXTERNAL", "sub_intent": "research", "tools": selected_tools, "emotions": detected_emotions}
+        return {"intent": "AGENT", "sub_intent": "research", "tools": selected_tools, "emotions": detected_emotions}
 
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
     # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"

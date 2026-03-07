@@ -97,6 +97,12 @@ You are a reliable, adaptive action agent. You don't just respond — you plan, 
 - Match the user's language and tone.
 - Use formatting (headers, bullets, code blocks) when helpful.
 
+**CODE OUTPUT (MANDATORY):**
+- Always wrap code in fenced triple backticks with a language label (e.g., ```python).
+- If outputting multiple files, add a line `**File: filename.ext**` immediately before each code block.
+- Never place code outside code blocks.
+
+
 **LANGUAGE ADAPTATION:**
 - Match the user's language EXACTLY. If they use English, reply in English. If they use Tamil or Tanglish, reply accordingly.
 - Never mix languages unless the user does.
@@ -308,15 +314,38 @@ async def run_agent_pipeline(
         result.allowed_tools.append("get_current_time")
         result.allowed_tools.append("search_web")
         result.allowed_tools.append("search_documents") # Always allow searching own docs if tools are on
+        result.allowed_tools.append("search_weather")
+        result.allowed_tools.append("search_finance")
+        result.allowed_tools.append("search_currency")
+        result.allowed_tools.append("search_company")
+        result.allowed_tools.append("search_legal")
+        result.allowed_tools.append("search_jobs")
+        result.allowed_tools.append("search_academic")
+        result.allowed_tools.append("search_tech_docs")
+        result.allowed_tools.append("compare_products")
+        result.allowed_tools.append("summarize_url")
+        result.allowed_tools.append("extract_tables")
+        result.allowed_tools.append("search_products")
+        result.allowed_tools.append("search_competitors")
+        result.allowed_tools.append("search_trends")
+        result.allowed_tools.append("sentiment_scan")
+        result.allowed_tools.append("faq_builder")
+        result.allowed_tools.append("document_compare")
+        result.allowed_tools.append("data_cleaner")
+        result.allowed_tools.append("unit_cost_calc")
+        result.allowed_tools.append("extract_entities")
+        result.allowed_tools.append("validate_code")
+        result.allowed_tools.append("generate_tests")
+        result.allowed_tools.append("execute_code")
 
         if any(word in user_query.lower() for word in ["read", "file", "path", ".txt", ".md", ".csv", "json"]):
             result.allowed_tools.append("read_file")
         if any(word in user_query.lower() for word in ["knowledge", "topic", "retrieve"]):
             result.allowed_tools.append("retrieve_knowledge")
 
-        # URL detection → enable web_fetch
+        # URL detection ? enable web_fetch
         import re as _re
-        if _re.search(r'https?://\S+', user_query):
+        if _re.search(r"https?://\S+", user_query):
             result.allowed_tools.append("web_fetch")
 
         MATH_PATTERN = r'[\d\.\s\+\-\*\/\(\)]+'
@@ -324,6 +353,50 @@ async def run_agent_pipeline(
         long_math = [m for m in math_matches if len(m.strip()) > 2 and any(c.isdigit() for c in m) and any(op in m for op in ['+', '-', '*', '/'])]
         if long_math:
             result.allowed_tools.append("calculate")
+
+        def _add_tool(tool_name: str):
+            if tool_name not in result.allowed_tools:
+                result.allowed_tools.append(tool_name)
+
+        q = user_query.lower()
+        tool_hints = {
+            "search_news": ["news", "latest", "headline", "breaking", "today", "current", "update"],
+            "search_images": ["image", "images", "photo", "picture", "logo", "diagram", "screenshot"],
+            "search_videos": ["video", "videos", "youtube", "watch", "clip", "tutorial"],
+            "search_places": ["place", "places", "near me", "nearby", "restaurant", "hotel", "location", "address"],
+            "search_maps": ["map", "maps", "direction", "directions", "route", "distance"],
+            "search_reviews": ["review", "reviews", "rating", "ratings", "testimonial"],
+            "search_shopping": ["buy", "price", "pricing", "cost", "deal", "discount", "shop", "shopping", "product", "amazon", "flipkart"],
+            "search_scholar": ["paper", "papers", "study", "studies", "journal", "academic", "scholar", "research"],
+            "search_patents": ["patent", "patents", "ip", "intellectual property"],
+            "search_weather": ["weather", "forecast", "temperature", "rain", "humidity"],
+            "search_finance": ["stock", "price", "share", "market", "ticker", "nasdaq", "nyse", "finance"],
+            "search_currency": ["currency", "exchange", "fx", "rate", "rates", "usd", "eur", "inr"],
+            "search_company": ["company", "profile", "about", "ceo", "headquarters", "revenue", "funding", "employees"],
+            "search_legal": ["legal", "policy", "compliance", "regulation", "law", "terms", "privacy"],
+            "search_jobs": ["job", "jobs", "career", "hiring", "role", "opening"],
+            "search_academic": ["paper", "papers", "study", "studies", "journal", "academic", "scholar", "research"],
+            "search_tech_docs": ["docs", "documentation", "api", "reference", "sdk", "guide", "manual"],
+            "compare_products": ["compare", "comparison", "vs", "versus", "alternatives", "review"],
+            "extract_entities": ["extract", "entities", "emails", "urls", "phones", "names"],
+            "validate_code": ["validate", "lint", "security", "risky", "scan"],
+            "generate_tests": ["generate tests", "tests", "unit test", "pytest", "jest"],
+            "summarize_url": ["summarize", "summary", "tl;dr", "tldr", "overview"],
+            "extract_tables": ["table", "tables", "csv", "spreadsheet"],
+            "search_products": ["product", "products", "buy", "price", "pricing", "review"],
+            "search_competitors": ["competitor", "competition", "rivals", "alternatives"],
+            "search_trends": ["trend", "trends", "market", "growth", "forecast"],
+            "sentiment_scan": ["sentiment", "polarity", "tone", "positive", "negative"],
+            "faq_builder": ["faq", "questions", "q&a"],
+            "document_compare": ["compare documents", "diff", "difference", "changes"],
+            "data_cleaner": ["clean data", "dedupe", "normalize", "cleanup"],
+            "unit_cost_calc": ["unit cost", "cost breakdown", "pricing model"],
+            "execute_code": ["run code", "execute code", "python", "script", "evaluate"],
+        }
+        for tool_name, keywords in tool_hints.items():
+            if any(kw in q for kw in keywords):
+                _add_tool(tool_name)
+
 
     # --- Hybrid Strategy Advisory (THINK only — no execution) ---
     strategy_advice = generate_strategy_advice(user_query, context={"intent": intent, "sub_intent": sub_intent})
@@ -361,6 +434,8 @@ Follow this behavior:
    - "Let's start with"
    - "Here is the plan"
 4. Execute tools silently. You may call MULTIPLE tools in a single step by outputting multiple TOOL_CALL lines.
+4a. Never fabricate facts. If tools are allowed, you MUST call the most relevant tool before answering any factual or time-sensitive query.
+4b. If tools are NOT allowed, ask the user for permission to use tools or request missing info instead of guessing.
 5. Merge all results internally.
 6. Deliver ONE final structured response.
 
@@ -475,3 +550,6 @@ def _build_ask_message(action: ActionDecision) -> str:
         msg += "- Could you be more specific about what you'd like me to do?\n"
 
     return msg
+
+
+

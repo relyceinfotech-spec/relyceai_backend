@@ -34,7 +34,7 @@ def _validate_upload_meta(file: UploadFile, content_length: Optional[str]) -> st
     if UPLOAD_ALLOWED_EXTENSIONS and ext not in UPLOAD_ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="File type not allowed")
 
-    content_type = (file.content_type or "").lower()
+    content_type = (file.content_type or "").lower().split(";")[0].strip()
     if UPLOAD_ALLOWED_MIME_TYPES and content_type not in UPLOAD_ALLOWED_MIME_TYPES:
         raise HTTPException(status_code=400, detail="MIME type not allowed")
 
@@ -147,6 +147,8 @@ async def upload_file(
         return {
             "success": True,
             "filename": file.filename,
+            "original_name": original_name,
+            "file_id": safe_filename,
             "file_path": file_path,
             "size_mb": file_size_mb,
             "message": "File uploaded and usage updated",

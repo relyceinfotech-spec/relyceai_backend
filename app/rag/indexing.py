@@ -5,6 +5,8 @@ Handles document extraction, chunking, and vector indexing into Weaviate.
 import os
 import asyncio
 import fitz  # PyMuPDF
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import List
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -34,6 +36,22 @@ def extract_text_from_pdf(file_path: str) -> str:
         print(f"[RAG] PDF extraction failed: {e}")
     return "\n\n".join(text_parts)
 
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from a DOCX file using zip + XML parsing."""
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            with zf.open('word/document.xml') as doc_xml:
+                xml_bytes = doc_xml.read()
+        root = ET.fromstring(xml_bytes)
+        texts = []
+        for node in root.iter():
+            if node.tag.endswith('}t') and node.text:
+                texts.append(node.text)
+        return "\n".join(texts)
+    except Exception as e:
+        print(f"[RAG] DOCX extraction failed: {e}")
+        return ""
 def extract_text_from_file(file_path: str) -> str:
     """Extract text from a non-PDF file."""
     try:
@@ -53,6 +71,8 @@ async def process_document_for_rag(user_id: str, file_path: str, original_name: 
     # 1. Extract Text
     if ext == ".pdf":
         text = await asyncio.to_thread(extract_text_from_pdf, file_path)
+    elif ext == ".docx":
+        text = await asyncio.to_thread(extract_text_from_docx, file_path)
     else:
         text = await asyncio.to_thread(extract_text_from_file, file_path)
         

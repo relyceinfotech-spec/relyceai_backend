@@ -228,6 +228,11 @@ def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Opti
         return False
     return sub_intent in REASONING_VISIBLE_SUB_INTENTS
 
+def _user_wants_sources(user_query: str) -> bool:
+    q = (user_query or "").lower()
+    keywords = ["source", "sources", "citation", "cite", "references", "reference", "links", "link"]
+    return any(k in q for k in keywords)
+
 def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict] = None, query: str = "") -> Tuple[str, str, Optional[float], bool, str]:
     """
     Determine which client/model to use based on mode, sub_intent, and personality.
@@ -378,6 +383,9 @@ class LLMProcessor:
         
         sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
         sanitized = sanitized.replace("—", " - ").replace("–", " - ")
+        sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
 
         return sanitized
     
@@ -654,6 +662,7 @@ class LLMProcessor:
         intent = analysis.get("intent", "DEEP_SEARCH")
         sub_intent = analysis.get("sub_intent", "general")
         emotions = analysis.get("emotions", [])
+        intent = "AGENT"
         
         import time as _time
         _start = _time.time()
@@ -682,7 +691,8 @@ class LLMProcessor:
         # Prompt Optimizer: Select variant
         prompt_variant_name, prompt_variant_instruction = prompt_optimizer.select_variant(sub_intent, session_id or "")
 
-        if intent == "AGENT":
+        tools = []
+        if intent == "INTERNAL":
             response_text = await self.process_agent_query(
                 user_query,
                 personality,
@@ -693,6 +703,24 @@ class LLMProcessor:
                 emotions=emotions,
                 emotional_instruction=emotional_instruction
             )
+            result_response = self._sanitize_output_text(response_text)
+        elif intent == "AGENT":
+            # Run structured agent pipeline even for non-stream requests
+            import time as _time
+            _agent_tokens: List[str] = []
+            async for token in self._process_agent_mode(
+                user_query,
+                context_messages,
+                personality,
+                user_settings,
+                user_id,
+                session_id,
+                start_time=_time.time(),
+            ):
+                if token.startswith("[INFO]"):
+                    continue
+                _agent_tokens.append(token)
+            response_text = "".join(_agent_tokens)
             result_response = self._sanitize_output_text(response_text)
         else:
             response_text, tools = await self.process_deep_search_query(
@@ -734,8 +762,8 @@ class LLMProcessor:
         return {
             "success": True,
             "response": result_response,
-            "mode_used": "agent" if intent == "AGENT" else "deep_search",
-            "tools_activated": tools if intent == "DEEP_SEARCH" else []
+            "mode_used": "agent" if intent == "AGENT" else "deep_search" if intent in ("DEEP_SEARCH", "EXTERNAL") else "internal",
+            "tools_activated": tools if intent in ("DEEP_SEARCH", "EXTERNAL") else []
         }
     
 
@@ -761,9 +789,9 @@ class LLMProcessor:
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
 
         # ==========================================
-        # AGENT MODE: Structured Action Agent
+        # AGENT MODE: Default for all modes
         # ==========================================
-        if mode == "agent":
+        if mode in ("agent", "normal", "business", "deepsearch"):
             async for token in self._process_agent_mode(
                 user_query, context_messages, personality, user_settings,
                 user_id, session_id, start_time,
@@ -817,22 +845,39 @@ class LLMProcessor:
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
-        # Simplified Normal Mode: Always use unified architecture
-        # (intent and selected_tools are used to customize retrieval below)
-        # Stream internal response
-        if personality:
-            base_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
+        if intent == "AGENT":
+            for _task in intel_tasks.values():
+                _task.cancel()
+            await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
+            async for token in self._process_agent_mode(
+                user_query, context_messages, personality, user_settings,
+                user_id, session_id, start_time,
+                task_id=task_id, resume_graph=resume_graph
+            ):
+                yield token
+            return
+
+        # System prompt selection
+        if intent == "INTERNAL":
+            if personality:
+                system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
+            else:
+                from app.llm.router import _build_user_context_string
+                system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
+                if mode == "normal":
+                    from app.llm.router import NORMAL_MARKDOWN_POLISH
+                    system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
         else:
-            from app.llm.router import _build_user_context_string
-            base_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
+            if personality and mode == "normal":
+                from app.llm.router import get_system_prompt_for_personality
+                system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query)
+            else:
+                system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query)
 
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
-            system_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
-        else:
-            system_prompt = base_prompt
-
+            system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
         # Wait for all memory/profile tasks securely
         await asyncio.gather(*intel_tasks.values(), return_exceptions=True)
 
@@ -921,6 +966,7 @@ class LLMProcessor:
         # Setup citation tracker
         from app.context.citation_engine import CitationTracker, CITATION_INSTRUCTION
         citation_tracker = CitationTracker()
+        include_sources = _user_wants_sources(user_query)
 
         # === Semantic Query Planner (zero-cost) ===
         _query_plan = {}
@@ -935,8 +981,16 @@ class LLMProcessor:
             print(f"[QueryPlanner] Failed (non-blocking): {e}")
             _query_plan = {"needs_web": True, "needs_memory": True, "needs_chunking": True}
 
+                if intent == "INTERNAL":
+            _query_plan = {"needs_web": False, "needs_memory": False, "needs_chunking": False, "task_type": "general_chat"}
+
+        needs_retrieval = intent in ("DEEP_SEARCH", "EXTERNAL")
+        if needs_retrieval:
+            _query_plan["needs_web"] = True
+
         # Phase 2: Researching
-        yield f'[INFO]{{"agent_state": "researching", "topic": "Fetching relevant context"}}'
+        if needs_retrieval:
+            yield f'[INFO]{{"agent_state": "researching", "topic": "Fetching relevant context"}}'
 
         # === Dynamic Context Router + PARALLEL Retrieval + Packer ===
         _has_web_content = False
@@ -977,7 +1031,7 @@ class LLMProcessor:
                 _retrieval_keys.append("vector")
 
             # Unified Web Search (Serper)
-            if intent == "DEEP_SEARCH" or _query_plan.get("needs_web", False):
+            if needs_retrieval and (intent == "DEEP_SEARCH" or _query_plan.get("needs_web", False)):
                 async def _fetch_web_search():
                     from app.llm.router import execute_serper_batch
                     # Use the correct Search endpoint from SERPER_TOOLS
@@ -987,7 +1041,7 @@ class LLMProcessor:
                 _retrieval_keys.append("web_search")
 
             # RAG Document Retrieval (uploaded files for this session)
-            if session_id and user_id:
+            if needs_retrieval and session_id and user_id:
                 async def _fetch_rag():
                     from app.rag.retrieval import retrieve_rag_context
                     return await retrieve_rag_context(user_id=user_id, query=user_query, session_id=session_id, top_k=5)
@@ -1111,7 +1165,7 @@ class LLMProcessor:
             print(f"[ContextRouter] Failed (non-blocking): {e}")
 
         # === URL Auto-Fetch (AFTER Router — conditional on planner) ===
-        if _query_plan.get("needs_web", True):
+        if needs_retrieval and _query_plan.get("needs_web", True):
             try:
                 from app.input_processing.web_fetch import detect_urls, fetch_and_extract
                 from app.safety.safety_filter import wrap_web_content
@@ -1161,7 +1215,7 @@ class LLMProcessor:
             print("[QueryPlanner] Web fetch skipped (not needed)")
 
         # Append Citation Instructions & Context Footnotes to system prompt
-        if citation_tracker.citations:
+        if include_sources and citation_tracker.citations:
             system_prompt += CITATION_INSTRUCTION
             system_prompt += citation_tracker.get_footnotes()
             print(f"[CitationEngine] Added {len(citation_tracker.citations)} source citations")
@@ -1977,17 +2031,12 @@ class LLMProcessor:
                         "content": (
                             "You are a real-time data synthesis engine. Your ONLY job is to take search results "
                             "and present them in a clear, detailed, well-formatted response.\n\n"
-                            "RULES:\n"
-                            "- Use headings, bullet points, bold text, and structured formatting.\n"
-                            "- Include ALL specific details: numbers, names, dates, locations, quotes.\n"
-                            "- NEVER say 'I cannot access real-time data' — the data is provided below.\n"
-                            "- NEVER apologize or mention knowledge cutoffs.\n"
-                            "- NEVER refuse. Your only purpose is to format and present the data.\n"
+                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' — the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
                         )
                     },
                     {
                         "role": "user",
-                        "content": f"Original question: {user_query}\n\n--- LIVE SEARCH DATA ---\n{tool_data}\n--- END DATA ---\n\nPresent ALL of this data in a comprehensive, well-structured response."
+                        "content": f"Original question: {user_query}\n\n--- LIVE SEARCH DATA ---\n{tool_data}\n--- END DATA ---\n\nUse the data above to answer the question. Do not list raw search results or metadata."
                     }
                 ]
                 
@@ -2038,6 +2087,7 @@ class LLMProcessor:
             })
             
         step_count = 0
+        forced_tool_attempted = False
         while True:
             if getattr(exec_ctx, 'terminate', False):
                 yield '[INFO]{"agent_state": "cancelled"}'
@@ -2096,6 +2146,7 @@ class LLMProcessor:
 
             step_output = ""
             tool_detected = False
+            suppress_step_stream = agent_result.tool_allowed
             try:
                 stream = await client.chat.completions.create(**create_kwargs)
                 async for chunk in stream:
@@ -2108,10 +2159,10 @@ class LLMProcessor:
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                         token = self._sanitize_output_text(chunk.choices[0].delta.content)
                         step_output += token
-                        
-                        clean_chunk = strip_execution_narration(token)
-                        if clean_chunk:
-                            yield clean_chunk
+                        if not suppress_step_stream:
+                            clean_chunk = strip_execution_narration(token)
+                            if clean_chunk:
+                                yield clean_chunk
             except Exception as step_err:
                 print(f"[Agent] Step {step_count} failed: {step_err}")
                 yield f"\n\n⚠️ **Agent step failed:** {str(step_err)}"
@@ -2274,9 +2325,22 @@ class LLMProcessor:
                 })
                 # Continue to next step (next LLM generation)
 
+            if not tool_detected and agent_result.tool_allowed:
+                requires_live = False
+                if agent_result.temporal and agent_result.temporal.is_time_sensitive:
+                    requires_live = True
+                if agent_result.action_decision and agent_result.action_decision.requires_research:
+                    requires_live = True
+                if requires_live and not exec_ctx.tool_results and not forced_tool_attempted:
+                    forced_tool_attempted = True
+                    messages.append({"role": "assistant", "content": step_output})
+                    messages.append({"role": "user", "content": "You must call the most appropriate tool now (e.g., search_web/search_news/search_scholar/web_fetch). Output ONLY TOOL_CALL."})
+                    continue
             if not tool_detected:
-                # No tool call — stream completed naturally
+                # No tool call � stream completed naturally
                 full_response += step_output
+                if suppress_step_stream and step_output.strip():
+                    yield step_output
                 break  # exit step loop
 
             # --- Completion Guard: counts LLM steps + tool calls + retries ---
@@ -2325,6 +2389,8 @@ Rules:
 - Do NOT mention tool usage.
 - Do NOT narrate what you did.
 - Merge all outputs logically.
+- Do NOT include raw tool output or JSON; synthesize only.
+- Only include sources if the user explicitly asked for them.
 - Deliver one clean final response.
 """
             })
@@ -2449,4 +2515,12 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
+
+
+
+
+
 

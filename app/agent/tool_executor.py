@@ -35,6 +35,15 @@ MAX_TOOL_CALLS = 2        # max tool invocations per request
 MAX_RETRIES = 2           # retry failed tools up to N times
 TOOL_TIMEOUT = 3          # seconds before tool execution is aborted
 MAX_TOOL_PAYLOAD = 4000   # max characters returned by a tool
+TOOL_COOLDOWN_SECONDS = 2.0
+_RATE_LIMITED_TOOLS = {
+    "search_web", "search_news", "search_images", "search_videos", "search_places", "search_maps",
+    "search_reviews", "search_shopping", "search_scholar", "search_patents", "search_weather",
+    "search_finance", "search_currency", "search_company", "search_legal", "search_jobs",
+    "search_academic", "search_tech_docs", "compare_products", "search_products", "search_competitors",
+    "search_trends", "summarize_url", "extract_tables", "faq_builder", "web_fetch"
+}
+_TOOL_LAST_CALL = {}
 
 def truncate_payload(data: Any) -> Any:
     """Truncates massive string payloads to prevent token explosion."""
@@ -238,6 +247,837 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
         }
 
 
+SERPER_LIST_KEYS = ["organic", "news", "images", "videos", "places", "maps", "reviews", "shopping", "scholar", "patents"]
+
+def _extract_serper_items(raw_result: Any) -> List[Dict[str, Any]]:
+    """Normalize Serper responses into a compact list of items."""
+    def _find_list(obj: Any) -> List[Dict[str, Any]]:
+        if isinstance(obj, dict):
+            for key in SERPER_LIST_KEYS:
+                val = obj.get(key)
+                if isinstance(val, list) and val:
+                    return val
+        return []
+
+    results: List[Dict[str, Any]] = []
+    payloads = raw_result if isinstance(raw_result, list) else [raw_result]
+    for payload in payloads:
+        for item in _find_list(payload):
+            if not isinstance(item, dict):
+                continue
+            out: Dict[str, Any] = {}
+            for k in ("title", "snippet", "link", "source", "date", "imageUrl", "thumbnail", "price", "rating", "address"):
+                v = item.get(k)
+                if v:
+                    out[k] = v
+            if "link" not in out and item.get("url"):
+                out["link"] = item.get("url")
+            if out:
+                results.append(out)
+            if len(results) >= 5:
+                return results
+    return results
+
+
+async def _tool_serper_generic(args: str = "", session_id: str = "", tool_key: str = "Search") -> Dict:
+    """
+    Executes a Serper tool endpoint and returns a compact list of results.
+    """
+    if not can_call_search(session_id):
+        return {
+            "status": "failure",
+            "data": "Search cooldown active. Please wait a moment before searching again.",
+            "source": "search_cooldown",
+            "confidence": "low",
+        }
+
+    try:
+        from app.llm.router import execute_serper_batch
+        from app.config import SERPER_TOOLS
+
+        endpoint = SERPER_TOOLS.get(tool_key) or SERPER_TOOLS.get(tool_key.title())
+        if not endpoint:
+            return {
+                "status": "failure",
+                "data": None,
+                "source": "serper",
+                "confidence": "low",
+            }
+
+        param_key = "url" if tool_key.lower() == "webpage" else "q"
+        raw_result = await execute_serper_batch(endpoint, [args], param_key=param_key)
+        cleaned = _extract_serper_items(raw_result)
+
+        if cleaned:
+            return {
+                "status": "success",
+                "data": cleaned,
+                "source": f"serper_{tool_key.lower()}",
+                "confidence": "high",
+            }
+        return {
+            "status": "failure",
+            "data": None,
+            "source": "serper_no_results",
+            "confidence": "low",
+        }
+    except Exception:
+        return {
+            "status": "failure",
+            "data": None,
+            "source": "serper",
+            "confidence": "low",
+        }
+
+
+async def _tool_search_news(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="News")
+
+async def _tool_search_images(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Images")
+
+async def _tool_search_videos(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Videos")
+
+async def _tool_search_places(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Places")
+
+async def _tool_search_maps(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Maps")
+
+async def _tool_search_reviews(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Reviews")
+
+async def _tool_search_shopping(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Shopping")
+
+async def _tool_search_scholar(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Scholar")
+
+
+def _decorate_query(args: str, required_tokens: List[str], prefix: str) -> str:
+    q = (args or "").strip()
+    if not q:
+        return ""
+    ql = q.lower()
+    if any(tok in ql for tok in required_tokens):
+        return q
+    return f"{prefix} {q}"
+
+async def _tool_search_weather(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["weather", "forecast", "temperature", "rain", "humidity"], "weather")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_finance(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["stock", "price", "share", "market", "ticker", "nasdaq", "nyse"], "stock price")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_currency(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["exchange", "fx", "currency", "rate", "rates", "usd", "eur", "inr"], "exchange rate")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_company(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["company", "profile", "about", "headquarters", "revenue", "funding", "ceo", "employees", "overview"], "company profile")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_legal(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["legal", "policy", "compliance", "regulation", "law", "terms", "privacy"], "legal policy")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_jobs(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["job", "jobs", "career", "hiring", "role", "opening", "vacancy"], "jobs hiring")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_academic(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["paper", "study", "journal", "doi", "preprint", "arxiv"], "research paper")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Scholar")
+
+async def _tool_search_tech_docs(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["docs", "documentation", "api", "reference", "sdk", "guide", "manual"], "official documentation")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_compare_products(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["compare", "comparison", "vs", "versus", "alternatives", "review"], "compare")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+
+async def _tool_summarize_url(args: str = "", session_id: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        url = str(payload.get("url", "")) if isinstance(payload, dict) else str(args or "")
+        if not url.strip():
+            return {
+                "status": "failure",
+                "data": "Missing url",
+                "source": "summarize_url",
+                "confidence": "low",
+            }
+        from app.input_processing.web_fetch import fetch_and_extract
+        fetched = await fetch_and_extract(url)
+        if not fetched or fetched.get("status") != "success":
+            return fetched or {
+                "status": "failure",
+                "data": "Fetch failed",
+                "source": "summarize_url",
+                "confidence": "low",
+            }
+        data = fetched.get("data", {})
+        content = str(data.get("content", ""))
+        sentences = re.split(r"(?<=[.!?])\s+", content)
+        summary = " ".join([s.strip() for s in sentences if s.strip()][:3]).strip()
+        if len(summary) > 800:
+            summary = summary[:800].rsplit(" ", 1)[0] + "..."
+        key_points = [line for line in content.splitlines() if line.strip()][:6]
+        return {
+            "status": "success",
+            "data": {
+                "url": data.get("url", url),
+                "title": data.get("title", ""),
+                "summary": summary,
+                "key_points": key_points,
+            },
+            "source": "summarize_url",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "summarize_url",
+            "confidence": "low",
+        }
+
+async def _tool_extract_tables(args: str = "", session_id: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        text = ""
+        url = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("text", ""))
+            url = str(payload.get("url", ""))
+        else:
+            text = str(args or "")
+        if not text.strip() and url:
+            from app.input_processing.web_fetch import fetch_and_extract
+            fetched = await fetch_and_extract(url)
+            if not fetched or fetched.get("status") != "success":
+                return fetched or {
+                    "status": "failure",
+                    "data": "Fetch failed",
+                    "source": "extract_tables",
+                    "confidence": "low",
+                }
+            text = str((fetched.get("data") or {}).get("content", ""))
+
+        if not text.strip():
+            return {
+                "status": "failure",
+                "data": "No text provided",
+                "source": "extract_tables",
+                "confidence": "low",
+            }
+
+        tables = []
+        lines = [ln for ln in text.splitlines()]
+        i = 0
+        while i < len(lines) - 1:
+            if "|" in lines[i] and "|" in lines[i + 1] and re.search(r"\|\s*-+", lines[i + 1]):
+                headers = [h.strip() for h in lines[i].split("|") if h.strip()]
+                i += 2
+                rows = []
+                while i < len(lines) and "|" in lines[i]:
+                    row = [c.strip() for c in lines[i].split("|") if c.strip()]
+                    if row:
+                        rows.append(row)
+                    i += 1
+                if headers and rows:
+                    tables.append({"headers": headers, "rows": rows})
+                continue
+            i += 1
+
+        csv_preview = ""
+        if tables:
+            headers = tables[0]["headers"]
+            rows = tables[0]["rows"]
+            csv_lines = [",".join(headers)]
+            for row in rows:
+                csv_lines.append(",".join(row))
+            csv_preview = "\n".join(csv_lines)
+
+        return {
+            "status": "success",
+            "data": {"tables": tables, "csv_preview": csv_preview},
+            "source": "extract_tables",
+            "confidence": "medium" if tables else "low",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "extract_tables",
+            "confidence": "low",
+        }
+
+async def _tool_search_products(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["product", "products", "buy", "price", "pricing", "review", "compare"], "product")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_competitors(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["competitor", "competition", "alternatives", "rivals", "similar"], "competitors")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+async def _tool_search_trends(args: str = "", session_id: str = "") -> Dict:
+    query = _decorate_query(args, ["trend", "trends", "market", "growth", "forecast", "industry"], "market trends")
+    return await _tool_serper_generic(query, session_id=session_id, tool_key="Search")
+
+
+def _tool_sentiment_scan(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        text = str(payload.get("text", "")) if isinstance(payload, dict) else str(args or "")
+        if not text.strip():
+            return {
+                "status": "failure",
+                "data": "Empty text payload",
+                "source": "sentiment_scan",
+                "confidence": "low",
+            }
+        pos_words = {"good", "great", "excellent", "positive", "love", "amazing", "awesome", "happy", "success", "win", "improve"}
+        neg_words = {"bad", "poor", "terrible", "negative", "hate", "awful", "sad", "fail", "loss", "bug", "issue"}
+        tokens = re.findall(r"[a-zA-Z']+", text.lower())
+        pos = sum(1 for t in tokens if t in pos_words)
+        neg = sum(1 for t in tokens if t in neg_words)
+        score = (pos - neg) / max(1, (pos + neg))
+        label = "neutral"
+        if score > 0.2:
+            label = "positive"
+        elif score < -0.2:
+            label = "negative"
+        return {
+            "status": "success",
+            "data": {"score": score, "label": label, "positive": pos, "negative": neg},
+            "source": "sentiment_scan",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "sentiment_scan",
+            "confidence": "low",
+        }
+
+async def _tool_faq_builder(args: str = "", session_id: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        text = ""
+        url = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("text", ""))
+            url = str(payload.get("url", ""))
+        else:
+            text = str(args or "")
+        if not text.strip() and url:
+            from app.input_processing.web_fetch import fetch_and_extract
+            fetched = await fetch_and_extract(url)
+            if not fetched or fetched.get("status") != "success":
+                return fetched or {
+                    "status": "failure",
+                    "data": "Fetch failed",
+                    "source": "faq_builder",
+                    "confidence": "low",
+                }
+            text = str((fetched.get("data") or {}).get("content", ""))
+
+        if not text.strip():
+            return {
+                "status": "failure",
+                "data": "No text provided",
+                "source": "faq_builder",
+                "confidence": "low",
+            }
+
+        questions = [ln.strip() for ln in re.split(r"\n+", text) if ln.strip().endswith("?")]
+        faqs = []
+        if questions:
+            for q in questions[:6]:
+                faqs.append({"q": q, "a": "Answer based on the document content."})
+        else:
+            words = re.findall(r"\b[a-zA-Z]{4,}\b", text.lower())
+            stop = {"this", "that", "with", "from", "your", "have", "will", "about", "there", "their", "which", "what"}
+            freq = {}
+            for w in words:
+                if w in stop:
+                    continue
+                freq[w] = freq.get(w, 0) + 1
+            keywords = sorted(freq, key=freq.get, reverse=True)[:5]
+            for kw in keywords:
+                faqs.append({"q": f"What is {kw}?", "a": f"The document discusses {kw}."})
+
+        return {
+            "status": "success",
+            "data": {"faqs": faqs},
+            "source": "faq_builder",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "faq_builder",
+            "confidence": "low",
+        }
+
+
+def _tool_document_compare(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        a = str(payload.get("doc_a", "")) if isinstance(payload, dict) else ""
+        b = str(payload.get("doc_b", "")) if isinstance(payload, dict) else ""
+        if not a or not b:
+            return {
+                "status": "failure",
+                "data": "Provide doc_a and doc_b",
+                "source": "document_compare",
+                "confidence": "low",
+            }
+        a_lines = a.splitlines()
+        b_lines = b.splitlines()
+        import difflib
+        diff = list(difflib.unified_diff(a_lines, b_lines, lineterm="", n=2))
+        diff_preview = "\n".join(diff[:200])
+        sm = difflib.SequenceMatcher(None, a_lines, b_lines)
+        added = removed = changed = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "insert":
+                added += (j2 - j1)
+            elif tag == "delete":
+                removed += (i2 - i1)
+            elif tag == "replace":
+                changed += max(i2 - i1, j2 - j1)
+        return {
+            "status": "success",
+            "data": {
+                "summary": {"added": added, "removed": removed, "changed": changed},
+                "diff": diff_preview,
+            },
+            "source": "document_compare",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "document_compare",
+            "confidence": "low",
+        }
+
+
+def _tool_data_cleaner(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        raw = str(payload.get("data", "")) if isinstance(payload, dict) else str(args or "")
+        if not raw.strip():
+            return {
+                "status": "failure",
+                "data": "No data provided",
+                "source": "data_cleaner",
+                "confidence": "low",
+            }
+        cleaned = []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                for row in data:
+                    if isinstance(row, dict):
+                        new_row = {}
+                        for k, v in row.items():
+                            nk = re.sub(r"\s+", "_", str(k).strip().lower())
+                            nv = v.strip() if isinstance(v, str) else v
+                            new_row[nk] = nv
+                        cleaned.append(new_row)
+            elif isinstance(data, dict):
+                cleaned.append(data)
+        except Exception:
+            import csv
+            from io import StringIO
+            reader = csv.DictReader(StringIO(raw))
+            for row in reader:
+                new_row = {}
+                for k, v in row.items():
+                    nk = re.sub(r"\s+", "_", str(k).strip().lower())
+                    nv = v.strip() if isinstance(v, str) else v
+                    new_row[nk] = nv
+                cleaned.append(new_row)
+
+        deduped = []
+        seen = set()
+        for row in cleaned:
+            key = json.dumps(row, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+
+        return {
+            "status": "success",
+            "data": {"rows": deduped, "count": len(deduped)},
+            "source": "data_cleaner",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "data_cleaner",
+            "confidence": "low",
+        }
+
+
+def _tool_unit_cost_calc(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        currency = payload.get("currency", "") if isinstance(payload, dict) else ""
+        if not items:
+            return {
+                "status": "failure",
+                "data": "Provide items with unit_cost and quantity",
+                "source": "unit_cost_calc",
+                "confidence": "low",
+            }
+        breakdown = []
+        total = 0.0
+        for item in items:
+            name = str(item.get("name", "item"))
+            unit = float(item.get("unit_cost", 0))
+            qty = float(item.get("quantity", 0))
+            item_total = unit * qty
+            total += item_total
+            breakdown.append({"name": name, "unit_cost": unit, "quantity": qty, "total": item_total})
+        return {
+            "status": "success",
+            "data": {"currency": currency, "total": total, "items": breakdown},
+            "source": "unit_cost_calc",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "unit_cost_calc",
+            "confidence": "low",
+        }
+
+def _tool_extract_entities(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        text = str(payload.get("text", "")) if isinstance(payload, dict) else str(args or "")
+        if not text.strip():
+            return {
+                "status": "failure",
+                "data": "Empty text payload",
+                "source": "extract_entities",
+                "confidence": "low",
+            }
+
+        emails = sorted(set(re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I)))
+        urls = sorted(set(re.findall(r"https?://[^\s)\]]+", text, flags=re.I)))
+        phones = sorted(set(re.findall(r"(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)|\d{2,4})[\s.-]?\d{3,4}[\s.-]?\d{4}", text)))
+        money = sorted(set(re.findall(r"\$\s?\d+(?:[.,]\d+)?|\b\d+(?:[.,]\d+)?\s?(?:USD|EUR|INR|GBP|AUD|CAD)\b", text, flags=re.I)))
+
+        candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b", text)
+        common = {"The", "This", "That", "These", "Those", "For", "And", "With", "From", "Into", "About"}
+        people_orgs = sorted(set(c for c in candidates if c.split()[0] not in common))
+
+        data = {
+            "emails": emails,
+            "urls": urls,
+            "phones": phones,
+            "money": money,
+            "people_orgs": people_orgs,
+            "counts": {
+                "emails": len(emails),
+                "urls": len(urls),
+                "phones": len(phones),
+                "money": len(money),
+                "people_orgs": len(people_orgs),
+            },
+        }
+        return {
+            "status": "success",
+            "data": data,
+            "source": "extract_entities",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "extract_entities",
+            "confidence": "low",
+        }
+
+
+def _tool_validate_code(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        code = str(payload.get("code", "")) if isinstance(payload, dict) else str(args or "")
+        language = str(payload.get("language", "")).lower().strip() if isinstance(payload, dict) else ""
+        if not code.strip():
+            return {
+                "status": "failure",
+                "data": "Empty code payload",
+                "source": "validate_code",
+                "confidence": "low",
+            }
+
+        findings = []
+        lines = code.splitlines()
+        secret_patterns = [
+            (r"api[_-]?key\s*[:=]", "Potential API key in code"),
+            (r"secret\s*[:=]", "Potential secret in code"),
+            (r"password\s*[:=]", "Potential password in code"),
+            (r"-----BEGIN [A-Z ]+PRIVATE KEY-----", "Private key material in code"),
+        ]
+        risky_patterns = [
+            (r"\beval\s*\(", "Use of eval"),
+            (r"\bexec\s*\(", "Use of exec"),
+            (r"\bsubprocess\.", "Subprocess usage"),
+            (r"\bos\.system\s*\(", "Use of os.system"),
+        ]
+        sql_concat = [r"SELECT\s+.+\+.+", r"INSERT\s+.+\+.+", r"UPDATE\s+.+\+.+", r"DELETE\s+.+\+.+", r"WHERE\s+.+\+.+"] if language in ("python", "javascript", "typescript", "js", "ts") else []
+
+        for idx, line in enumerate(lines, start=1):
+            for pattern, message in secret_patterns:
+                if re.search(pattern, line, flags=re.I):
+                    findings.append({"line": idx, "severity": "high", "rule": "hardcoded_secret", "message": message})
+            for pattern, message in risky_patterns:
+                if re.search(pattern, line, flags=re.I):
+                    findings.append({"line": idx, "severity": "medium", "rule": "risky_exec", "message": message})
+            if re.search(r"TODO|FIXME", line, flags=re.I):
+                findings.append({"line": idx, "severity": "low", "rule": "todo", "message": "TODO/FIXME marker found"})
+            for pattern in sql_concat:
+                if re.search(pattern, line, flags=re.I):
+                    findings.append({"line": idx, "severity": "medium", "rule": "sql_concat", "message": "Possible SQL string concatenation"})
+
+        summary = {
+            "total": len(findings),
+            "high": sum(1 for f in findings if f["severity"] == "high"),
+            "medium": sum(1 for f in findings if f["severity"] == "medium"),
+            "low": sum(1 for f in findings if f["severity"] == "low"),
+        }
+        return {
+            "status": "success",
+            "data": {"summary": summary, "findings": findings},
+            "source": "validate_code",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "validate_code",
+            "confidence": "low",
+        }
+
+
+def _tool_generate_tests(args: str = "") -> Dict:
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        code = str(payload.get("code", "")) if isinstance(payload, dict) else str(args or "")
+        filename = str(payload.get("filename", "")).strip() if isinstance(payload, dict) else ""
+        language = str(payload.get("language", "")).lower().strip() if isinstance(payload, dict) else ""
+
+        if not language and filename:
+            if filename.endswith((".py",)):
+                language = "python"
+            elif filename.endswith((".js", ".jsx")):
+                language = "javascript"
+            elif filename.endswith((".ts", ".tsx")):
+                language = "typescript"
+
+        if not language:
+            language = "generic"
+
+        if language in ("python", "py"):
+            test_path = "tests/test_module.py"
+            template = (
+                "import pytest\n\n"
+                "def test_basic_behavior():\n"
+                "    # TODO: arrange\n"
+                "    # TODO: act\n"
+                "    # TODO: assert\n"
+                "    assert True\n"
+            )
+            framework = "pytest"
+        elif language in ("javascript", "typescript", "js", "ts"):
+            test_path = "tests/module.test.js"
+            template = (
+                "describe('module', () => {\n"
+                "  it('works as expected', () => {\n"
+                "    // TODO: arrange\n"
+                "    // TODO: act\n"
+                "    // TODO: assert\n"
+                "    expect(true).toBe(true);\n"
+                "  });\n"
+                "});\n"
+            )
+            framework = "jest"
+        else:
+            test_path = "tests/test_module.txt"
+            template = "Add tests for the provided code."
+            framework = "generic"
+
+        data = {
+            "framework": framework,
+            "files": [{"path": test_path, "content": template}],
+            "notes": "Template generated from code context; refine assertions and setup.",
+        }
+        return {
+            "status": "success",
+            "data": data,
+            "source": "generate_tests",
+            "confidence": "medium",
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": str(e),
+            "source": "generate_tests",
+            "confidence": "low",
+        }
+
+def _tool_execute_code(args: str = "") -> Dict:
+    """Executes small Python snippets in a restricted sandbox context."""
+    try:
+        payload = None
+        if args and args.strip().startswith("{"):
+            payload = json.loads(args)
+        if payload and isinstance(payload, dict):
+            language = str(payload.get("language", "python")).lower().strip()
+            code = str(payload.get("code", ""))
+            expression = str(payload.get("expression", "")).strip()
+        else:
+            language = "python"
+            code = str(args or "")
+            expression = ""
+
+        if language not in ("python", "py"):
+            return {
+                "status": "failure",
+                "data": {"stdout": "", "stderr": f"Unsupported language: {language}", "result": None, "locals": {}},
+                "source": "execute_code",
+                "confidence": "low",
+            }
+        if not code.strip() and not expression:
+            return {
+                "status": "failure",
+                "data": {"stdout": "", "stderr": "Empty code payload", "result": None, "locals": {}},
+                "source": "execute_code",
+                "confidence": "low",
+            }
+
+        import io
+        import contextlib
+        import math
+        import statistics
+
+        safe_builtins = {
+            "print": print,
+            "range": range,
+            "len": len,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "abs": abs,
+            "round": round,
+            "sorted": sorted,
+            "enumerate": enumerate,
+            "zip": zip,
+            "list": list,
+            "dict": dict,
+            "set": set,
+            "tuple": tuple,
+        }
+
+        sandbox_globals = {"__builtins__": safe_builtins, "math": math, "statistics": statistics}
+        sandbox_locals: Dict[str, Any] = {}
+
+        stdout = io.StringIO()
+        stderr = ""
+        result_value = None
+
+        try:
+            with contextlib.redirect_stdout(stdout):
+                if expression:
+                    result_value = eval(expression, sandbox_globals, sandbox_locals)
+                if code.strip():
+                    exec(compile(code, "<sandbox>", "exec"), sandbox_globals, sandbox_locals)
+        except Exception as e:
+            stderr = str(e)
+
+        output = stdout.getvalue().strip()
+        locals_preview = {}
+        for k, v in list(sandbox_locals.items())[:12]:
+            if k.startswith("_"):
+                continue
+            try:
+                locals_preview[k] = repr(v)
+            except Exception:
+                locals_preview[k] = "<unrepr>"
+
+        if result_value is None and "result" in sandbox_locals:
+            try:
+                result_value = sandbox_locals.get("result")
+            except Exception:
+                result_value = None
+
+        status = "success" if not stderr else "failure"
+        confidence = "high" if status == "success" else "low"
+
+        return {
+            "status": status,
+            "data": {
+                "stdout": output,
+                "stderr": stderr,
+                "result": result_value,
+                "locals": locals_preview,
+            },
+            "source": "execute_code",
+            "confidence": confidence,
+        }
+    except Exception as e:
+        return {
+            "status": "failure",
+            "data": {"stdout": "", "stderr": str(e), "result": None, "locals": {}},
+            "source": "execute_code",
+            "confidence": "low",
+        }
+
+async def _tool_search_patents(args: str = "", session_id: str = "") -> Dict:
+    return await _tool_serper_generic(args, session_id=session_id, tool_key="Patents")
+
 SAFE_ROOT = "data/"
 
 async def _tool_read_file(args: str = "") -> Dict:
@@ -415,6 +1255,230 @@ TOOLS: Dict[str, Dict] = {
         "risk": "low",
         "freshness": "live",
     },
+    "search_news": {
+        "func": _tool_search_news,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_images": {
+        "func": _tool_search_images,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_videos": {
+        "func": _tool_search_videos,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_places": {
+        "func": _tool_search_places,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_maps": {
+        "func": _tool_search_maps,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_reviews": {
+        "func": _tool_search_reviews,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_shopping": {
+        "func": _tool_search_shopping,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_scholar": {
+        "func": _tool_search_scholar,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_patents": {
+        "func": _tool_search_patents,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_weather": {
+        "func": _tool_search_weather,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_finance": {
+        "func": _tool_search_finance,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_currency": {
+        "func": _tool_search_currency,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_company": {
+        "func": _tool_search_company,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_legal": {
+        "func": _tool_search_legal,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_jobs": {
+        "func": _tool_search_jobs,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_academic": {
+        "func": _tool_search_academic,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_tech_docs": {
+        "func": _tool_search_tech_docs,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "compare_products": {
+        "func": _tool_compare_products,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "summarize_url": {
+        "func": _tool_summarize_url,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "extract_tables": {
+        "func": _tool_extract_tables,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_products": {
+        "func": _tool_search_products,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_competitors": {
+        "func": _tool_search_competitors,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "search_trends": {
+        "func": _tool_search_trends,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "sentiment_scan": {
+        "func": _tool_sentiment_scan,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "faq_builder": {
+        "func": _tool_faq_builder,
+        "is_async": True,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "live",
+    },
+    "document_compare": {
+        "func": _tool_document_compare,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "data_cleaner": {
+        "func": _tool_data_cleaner,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "unit_cost_calc": {
+        "func": _tool_unit_cost_calc,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "extract_entities": {
+        "func": _tool_extract_entities,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "validate_code": {
+        "func": _tool_validate_code,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "generate_tests": {
+        "func": _tool_generate_tests,
+        "is_async": False,
+        "reversible": True,
+        "risk": "low",
+        "freshness": "static",
+    },
+    "execute_code": {
+        "func": _tool_execute_code,
+        "is_async": False,
+        "reversible": True,
+        "risk": "medium",
+        "freshness": "static",
+    },
     "read_file": {
         "func": _tool_read_file,
         "is_async": True,
@@ -451,8 +1515,6 @@ TOOLS: Dict[str, Dict] = {
         "freshness": "static",
     },
 }
-
-
 # ============================================
 # TOOL PERMISSION GATE
 # ============================================
@@ -617,6 +1679,17 @@ async def execute_tool(tool_call: ToolCall, exec_ctx: Optional[ExecutionContext]
     handler = tool_meta["func"]
     is_async = tool_meta["is_async"]
 
+    # Rate limit heavy tools (per session)
+    if tool_call.name in _RATE_LIMITED_TOOLS:
+        key = ((tool_call.session_id or "anon"), tool_call.name)
+        now = time.time()
+        last = _TOOL_LAST_CALL.get(key)
+        if last and (now - last) < TOOL_COOLDOWN_SECONDS:
+            result.error = f"Rate limited: wait {TOOL_COOLDOWN_SECONDS:.1f}s before calling {tool_call.name} again."
+            result.source = tool_call.name
+            result.confidence = "low"
+            return result
+        _TOOL_LAST_CALL[key] = now
     # Lazy-load web_fetch handler
     if tool_call.name == "web_fetch" and handler is None:
         from app.input_processing.web_fetch import _tool_web_fetch
@@ -626,7 +1699,7 @@ async def execute_tool(tool_call: ToolCall, exec_ctx: Optional[ExecutionContext]
     # --- PHASE 6: Sandbox Isolation Routing ---
     from app.config import SANDBOX_ENABLED
     # Tools that are safe to sandbox (have no in-process side effects needed by orchestrator)
-    _SANDBOX_ELIGIBLE = {"read_file", "calculate", "retrieve_knowledge"}
+    _SANDBOX_ELIGIBLE = {"read_file", "calculate", "retrieve_knowledge", "execute_code", "extract_entities", "validate_code", "generate_tests", "sentiment_scan", "document_compare", "data_cleaner", "unit_cost_calc"}
     
     if SANDBOX_ENABLED and tool_call.name in _SANDBOX_ELIGIBLE:
         from app.sandbox.sandbox_manager import get_sandbox_manager
@@ -718,3 +1791,6 @@ def format_tool_result(result: ToolResult) -> str:
             f"CONFIDENCE: {result.confidence}\n"
             f"REASON: {result.error}"
         )
+
+
+
