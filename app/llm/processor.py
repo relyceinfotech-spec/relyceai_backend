@@ -391,7 +391,7 @@ class LLMProcessor:
         sanitized = re.sub(r"^\s*(Title|Snippet Details|Link|Source Link|Copy text|Export)\s*[:\-]?.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
 
-        return sanitized.strip()
+        return sanitized
 
     def _fix_html_css_output(self, text: str) -> str:
         if not text:
@@ -1729,6 +1729,10 @@ class LLMProcessor:
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
         MIN_AGENT_STEPS = 3   # Ensure multi-pass verification before final answer
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
+        _q_lower = (user_query or "").strip().lower()
+        is_casual_query = bool(re.match(r"^(hi|hello|hey|yo|sup|how are you|how r u|how are u|whats up)[!.?\s]*$", _q_lower))
+        if is_casual_query:
+            MIN_AGENT_STEPS = 1
 
         # --- Run agent pipeline (classify ? time ? autonomy ? orchestrate) ---
         pipeline_start = _time.time()
