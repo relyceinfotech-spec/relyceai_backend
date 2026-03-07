@@ -110,7 +110,7 @@ RAG_INSTRUCTION = """
 [CRITICAL: DOCUMENT USAGE]
 You have access to locally uploaded documents for this session. 
 - If the user asks a question related to these documents, provide a detailed answer based strictly on the document content.
-- After your main answer, add a section: "--- 💡 Related Insights from Document ---" and include 2-3 other relevant or interesting points from the uploaded file that the user might find useful.
+- After your main answer, add a section: "--- ?? Related Insights from Document ---" and include 2-3 other relevant or interesting points from the uploaded file that the user might find useful.
 - If the user's question is NOT related to the documents, answer normally using your general knowledge and DO NOT include the insights section.
 - Always cite the document using [Document].
 """
@@ -270,7 +270,7 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     # Reasoning model for heavy tasks, flash for everything else
     REASONING_MODEL = "deepseek/deepseek-chat"
     
-    # System-design override → reasoning model
+    # System-design override ? reasoning model
     if sub_intent == "system_design":
         return ("openrouter", REASONING_MODEL, None, False, "system_design_reasoning")
 
@@ -278,7 +278,7 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     if sub_intent in UI_SUB_INTENTS:
         return ("openrouter", UI_MODEL, 0.2, False, "ui_override")
 
-    # Debugging → reasoning model
+    # Debugging ? reasoning model
     if sub_intent == "debugging":
         return ("openrouter", REASONING_MODEL, None, needs_thinking, "debugging_reasoning")
 
@@ -294,7 +294,7 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     if sub_intent in CREATIVE_INTENTS:
         return ("openrouter", FAST_MODEL, None, False, "creative_override")
     
-    # Analysis/Research → reasoning model (Grounded Temperature 0.2)
+    # Analysis/Research ? reasoning model (Grounded Temperature 0.2)
     if sub_intent in ["analysis", "research", "reasoning", "web_analysis", "web_factual"]:
         return ("openrouter", REASONING_MODEL, 0.2, needs_thinking, "research_reasoning")
     
@@ -381,8 +381,8 @@ class LLMProcessor:
             
         text = html.unescape(text)
         
-        sanitized = text.replace("â€”", " - ").replace("â€“", " - ")
-        sanitized = sanitized.replace("—", " - ").replace("–", " - ")
+        sanitized = text.replace("—", " - ").replace("–", " - ")
+        sanitized = sanitized.replace("�", " - ").replace("�", " - ")
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
@@ -580,7 +580,7 @@ class LLMProcessor:
         
         # Determine system prompt
         if personality and mode == "normal":
-            # 🎭 Personalities are ONLY honored in Normal Mode
+            # ?? Personalities are ONLY honored in Normal Mode
             from app.llm.router import get_system_prompt_for_personality
             system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query)
         else:
@@ -659,7 +659,7 @@ class LLMProcessor:
         user_query = normalize_user_query(user_query)
         # Analyze intent using the consolidated router
         analysis = await analyze_and_route_query(user_query, mode, personality=personality)
-        intent = analysis.get("intent", "DEEP_SEARCH")
+        routed_intent = analysis.get("intent", "DEEP_SEARCH")
         sub_intent = analysis.get("sub_intent", "general")
         emotions = analysis.get("emotions", [])
         intent = "AGENT"
@@ -716,6 +716,9 @@ class LLMProcessor:
                 user_id,
                 session_id,
                 start_time=_time.time(),
+                mode=mode,
+                intent=routed_intent,
+                sub_intent=sub_intent,
             ):
                 if token.startswith("[INFO]"):
                     continue
@@ -788,17 +791,6 @@ class LLMProcessor:
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
 
-        # ==========================================
-        # AGENT MODE: Default for all modes
-        # ==========================================
-        if mode in ("agent", "normal", "business", "deepsearch"):
-            async for token in self._process_agent_mode(
-                user_query, context_messages, personality, user_settings,
-                user_id, session_id, start_time,
-                task_id=task_id, resume_graph=resume_graph
-            ):
-                yield token
-            return
 
         # Phase 1: Planning
         yield f'[INFO]{{"agent_state": "planning", "topic": "Analyzing query & intent"}}'
@@ -806,7 +798,7 @@ class LLMProcessor:
         # Combined Analysis (Intent + Tools)
         t_analysis_start = time.time()
         
-        # 🚀 PARALLEL DATA LOADING
+        # ?? PARALLEL DATA LOADING
         # 1. Start Analysis Task
         analysis_task = asyncio.create_task(
             analyze_and_route_query(user_query, mode, context_messages, personality=personality)
@@ -838,9 +830,10 @@ class LLMProcessor:
 
         # Wait for Analysis (Needed for intent routing)
         analysis = await analysis_task
-        intent = analysis.get("intent", "DEEP_SEARCH")
+        routed_intent = analysis.get("intent", "DEEP_SEARCH")
         selected_tools = analysis.get("tools", [])
         sub_intent = analysis.get("sub_intent", "general")
+        intent = "AGENT"
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
@@ -852,7 +845,10 @@ class LLMProcessor:
             async for token in self._process_agent_mode(
                 user_query, context_messages, personality, user_settings,
                 user_id, session_id, start_time,
-                task_id=task_id, resume_graph=resume_graph
+                task_id=task_id, resume_graph=resume_graph,
+                mode=mode,
+                intent=routed_intent,
+                sub_intent=sub_intent
             ):
                 yield token
             return
@@ -980,7 +976,6 @@ class LLMProcessor:
         except Exception as e:
             print(f"[QueryPlanner] Failed (non-blocking): {e}")
             _query_plan = {"needs_web": True, "needs_memory": True, "needs_chunking": True}
-
         if intent == "INTERNAL":
             _query_plan = {"needs_web": False, "needs_memory": False, "needs_chunking": False, "task_type": "general_chat"}
 
@@ -1164,7 +1159,7 @@ class LLMProcessor:
         except Exception as e:
             print(f"[ContextRouter] Failed (non-blocking): {e}")
 
-        # === URL Auto-Fetch (AFTER Router — conditional on planner) ===
+        # === URL Auto-Fetch (AFTER Router � conditional on planner) ===
         if needs_retrieval and _query_plan.get("needs_web", True):
             try:
                 from app.input_processing.web_fetch import detect_urls, fetch_and_extract
@@ -1260,7 +1255,7 @@ class LLMProcessor:
             optimized_context = context_optimizer.optimize(context_messages, keep_last_n=4)
             post_chars = sum(len(m.get('content', '')) for m in optimized_context)
             if pre_chars != post_chars:
-                print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} → {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
+                print(f"[ContextOptimizer] Compressed: {pre_count} msgs, {pre_chars} ? {post_chars} chars ({100 - (post_chars/max(pre_chars,1))*100:.0f}% reduction)")
 
         # Construct messages with Context
         messages = [{"role": "system", "content": system_prompt}]
@@ -1301,7 +1296,7 @@ class LLMProcessor:
         
         t_stream_start = time.time()
         
-        # 🔀 Multi-Model Routing with Trace
+        # ?? Multi-Model Routing with Trace
         # Initialize trace for this request
         trace = RequestTrace()
         trace.intent = intent
@@ -1369,15 +1364,15 @@ class LLMProcessor:
                 planning_messages = [
                     {"role": "system", "content": (
                         "You are an expert software architect, debugger, and technical analyst. "
-                        "Your job is to THINK, PLAN, and ANALYZE — NOT to write code.\n\n"
+                        "Your job is to THINK, PLAN, and ANALYZE � NOT to write code.\n\n"
                         "Depending on the request:\n"
-                        "• If BUILDING something: Break down requirements, identify tech stack, "
+                        "� If BUILDING something: Break down requirements, identify tech stack, "
                         "structure, layout, design decisions, colors, fonts, interactions, and best practices.\n"
-                        "• If DEBUGGING: Analyze the error/issue, identify root causes, "
+                        "� If DEBUGGING: Analyze the error/issue, identify root causes, "
                         "explain what's going wrong, and outline the exact fix strategy step by step.\n"
-                        "• If EXPLAINING code: Break down the code's purpose, logic flow, "
+                        "� If EXPLAINING code: Break down the code's purpose, logic flow, "
                         "key functions, data flow, and how each part connects.\n"
-                        "• If DESIGNING a system: Identify components, architecture patterns, "
+                        "� If DESIGNING a system: Identify components, architecture patterns, "
                         "data models, APIs, and trade-offs.\n\n"
                         "DO NOT write any code. Only provide a detailed analysis and plan "
                         "that a developer can use to implement or fix the solution perfectly."
@@ -1493,7 +1488,7 @@ class LLMProcessor:
                             yield self._sanitize_output_text(chunk.choices[0].delta.content)
                 except Exception as stream_err:
                     print(f"[Processor] Stream failed in pass 2: {stream_err}")
-                    yield f"\n\n⚠️ **Stream interrupted:** {str(stream_err)}"
+                    yield f"\n\n?? **Stream interrupted:** {str(stream_err)}"
             # End thinking return path
             return
 
@@ -1597,7 +1592,7 @@ class LLMProcessor:
         # Normal streaming path (no STRICT limits or thinking pass)
         create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         
-        # 🔧 PROVIDER ERROR RECOVERY: Retry on 429/timeout
+        # ?? PROVIDER ERROR RECOVERY: Retry on 429/timeout
         stream = None
         for _attempt in range(2):
             try:
@@ -1614,11 +1609,11 @@ class LLMProcessor:
                     continue
                 else:
                     print(f"[RECOVERY] Provider error (final): {api_err}")
-                    yield f"⚠️ The AI provider is temporarily unavailable. Please try again in a moment.\n\n*Error: {type(api_err).__name__}*"
+                    yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.\n\n*Error: {type(api_err).__name__}*"
                     return
         
         if stream is None:
-            yield "⚠️ Failed to connect to AI provider after retries."
+            yield "?? Failed to connect to AI provider after retries."
             return
 
         print(f"[LATENCY] Internal: Stream Connection Established: {time.time() - start_time:.4f}s")
@@ -1710,7 +1705,10 @@ class LLMProcessor:
         session_id: Optional[str] = None,
         start_time: float = 0.0,
         task_id: Optional[str] = None,
-        resume_graph: Optional[Any] = None
+        resume_graph: Optional[Any] = None,
+        mode: str = "normal",
+        intent: str = "AGENT",
+        sub_intent: str = "general"
     ) -> AsyncGenerator[str, None]:
         """
         Structured Action Agent mode.
@@ -1727,13 +1725,13 @@ class LLMProcessor:
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
 
-        # --- Run agent pipeline (classify → time → autonomy → orchestrate) ---
+        # --- Run agent pipeline (classify ? time ? autonomy ? orchestrate) ---
         pipeline_start = _time.time()
         agent_result = await run_agent_pipeline(
             user_query,
             context_messages=context_messages,
-            intent="",
-            sub_intent="",
+            intent=intent,
+            sub_intent=sub_intent,
             user_id=user_id,
             session_id=session_id,
             session_start_time=start_time,
@@ -1832,7 +1830,15 @@ class LLMProcessor:
             return
 
         # --- Build system prompt with runtime context + tool mode ---
-        system_prompt = build_agent_system_prompt(agent_result)
+        system_prompt = build_agent_system_prompt(
+            agent_result,
+            mode=mode,
+            sub_intent=sub_intent,
+            user_settings=user_settings,
+            user_id=user_id,
+            user_query=user_query,
+            personality=personality,
+        )
 
         # --- Prepare messages ---
         optimized_context = context_messages
@@ -2021,7 +2027,7 @@ class LLMProcessor:
             print(f"[Synthesis] Tool result messages found: {len(tool_result_messages)}")
             
             if tool_result_messages:
-                # Build a CLEAN context — strip all old refusal messages to prevent context poisoning
+                # Build a CLEAN context � strip all old refusal messages to prevent context poisoning
                 # Only include: system prompt (first msg), user query (last user msg), tool results, and synthesis instruction
                 tool_data = "\n\n".join(m.get("content", "") for m in tool_result_messages)
                 
@@ -2031,7 +2037,7 @@ class LLMProcessor:
                         "content": (
                             "You are a real-time data synthesis engine. Your ONLY job is to take search results "
                             "and present them in a clear, detailed, well-formatted response.\n\n"
-                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' — the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
+                            "RULES:\n- Answer the user\'s question directly first, then add short supporting bullets if needed.\n- Include specific details (numbers, names, dates, locations) only when relevant.\n- Do NOT output labels like \'TOOL#\', \'WEB SEARCH\', \'Search Result\', or raw titles/snippets.\n- Do NOT dump raw search result lists or metadata unless the user explicitly asks.\n- Only include sources when the user requests them; otherwise focus on the answer.\n- NEVER say \'I cannot access real-time data\' � the data is provided below.\n- NEVER apologize or mention knowledge cutoffs.\n- NEVER refuse. Your only purpose is to format and present the data.\n"
                         )
                     },
                     {
@@ -2067,8 +2073,8 @@ class LLMProcessor:
                     print(f"[Synthesis] ERROR: {e}")
                     yield f"\n\n**Search completed but synthesis failed:** {str(e)}"
             else:
-                print("[Synthesis] No tool results found — skipping synthesis.")
-                yield "\n\n⚠️ The search tool was invoked but returned no results. Please try rephrasing your query or try again later."
+                print("[Synthesis] No tool results found � skipping synthesis.")
+                pass
             
             # Update final state
             final_status = "COMPLETED" if plan_graph.is_fully_completed() else "FAILED"
@@ -2131,7 +2137,7 @@ class LLMProcessor:
                 
             def strip_execution_narration(text: str) -> str:
                 BLOCKED_PHRASES = [
-                    "Here is the plan", "I will now", "Next I will", "Let’s start",
+                    "Here is the plan", "I will now", "Next I will", "Let�s start",
                     "I'll perform", "First, I will", "Then, I will", "Sure, I can help",
                     "Let's begin", "Now I will"
                 ]
@@ -2165,7 +2171,7 @@ class LLMProcessor:
                                 yield clean_chunk
             except Exception as step_err:
                 print(f"[Agent] Step {step_count} failed: {step_err}")
-                yield f"\n\n⚠️ **Agent step failed:** {str(step_err)}"
+                yield f"\n\n?? **Agent step failed:** {str(step_err)}"
                 break # exit current loop to either finalize or retry
 
             # --- Confidence Drift & Misclassification Detection ---
@@ -2194,7 +2200,7 @@ class LLMProcessor:
                 valid_calls = []
                 for tc in tool_calls:
                     if not agent_result.tool_allowed or tc.name not in agent_result.allowed_tools:
-                        print(f"[Agent] TOOL_CALL ignored — not in allowed list (tried: {tc.name})")
+                        print(f"[Agent] TOOL_CALL ignored � not in allowed list (tried: {tc.name})")
                     else:
                         tc.user_id = user_id or "" # PH 4: Pass context to each call
                         tc.session_id = session_id or ""
@@ -2303,7 +2309,7 @@ class LLMProcessor:
                     if not result.success:
                         exec_ctx.degraded = True
                         exec_ctx.degradation_reasons.append(f"{tc.name}: {result.error}")
-                        print(f"[Agent] Tool FAILED: {tc.name} — {result.error}")
+                        print(f"[Agent] Tool FAILED: {tc.name} � {result.error}")
 
                     # Inject untrusted content hint if applicable
                     if getattr(result, "trust", "verified") == "unverified":
@@ -2337,7 +2343,7 @@ class LLMProcessor:
                     messages.append({"role": "user", "content": "You must call the most appropriate tool now (e.g., search_web/search_news/search_scholar/web_fetch). Output ONLY TOOL_CALL."})
                     continue
             if not tool_detected:
-                # No tool call � stream completed naturally
+                # No tool call ? stream completed naturally
                 full_response += step_output
                 if suppress_step_stream and step_output.strip():
                     yield step_output
@@ -2412,7 +2418,7 @@ Rules:
                         yield token
             except Exception as final_err:
                 print(f"[Agent] Final pass failed: {final_err}")
-                yield f"\n\n⚠️ **Response generation failed:** {str(final_err)}"
+                yield f"\n\n?? **Response generation failed:** {str(final_err)}"
 
         # --- Failure Transparency: Internal-First ---
         # Inject degradation note into prompt, let LLM phrase it naturally
@@ -2449,7 +2455,7 @@ Rules:
                     full_response += token
                     yield token
 
-        # --- Layer 14: Self Monitor (passive — record only) ---
+        # --- Layer 14: Self Monitor (passive � record only) ---
         try:
             monitor_report = monitor_evaluate_response(
                 user_query, full_response,
@@ -2515,6 +2521,19 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

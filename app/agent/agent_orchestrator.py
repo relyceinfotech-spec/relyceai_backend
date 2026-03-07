@@ -310,6 +310,10 @@ async def run_agent_pipeline(
         autonomy_action=autonomy.action,
     )
     
+    if intent == "INTERNAL" or sub_intent == "casual_chat":
+        result.tool_allowed = False
+        result.allowed_tools = []
+
     if result.tool_allowed:
         result.allowed_tools.append("get_current_time")
         result.allowed_tools.append("search_web")
@@ -407,6 +411,12 @@ async def run_agent_pipeline(
 
 def build_agent_system_prompt(
     orchestrator_result: OrchestratorResult,
+    mode: str = "normal",
+    sub_intent: str = "general",
+    user_settings: Optional[Dict] = None,
+    user_id: Optional[str] = None,
+    user_query: str = "",
+    personality: Optional[Dict] = None,
 ) -> str:
     """
     Build the complete agent system prompt.
@@ -461,7 +471,29 @@ Only Deliver ONE final structured response.
 -----------------------------------------
 """
 
-    prompt = AGENT_SYSTEM_PROMPT + "\n\n" + AGENT_EXECUTION_RULES
+    # --- Mode / Personality prompt (normal vs business vs deepsearch) ---
+    try:
+        from app.llm.router import (
+            get_system_prompt_for_mode,
+            get_system_prompt_for_personality,
+            INTERNAL_MODE_PROMPTS,
+        )
+        if personality and mode == "normal":
+            base_prompt = get_system_prompt_for_personality(
+                personality, user_settings, user_id, user_query
+            )
+        else:
+            base_prompt = get_system_prompt_for_mode(
+                mode, user_settings, user_id, user_query
+            )
+        if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
+            base_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
+        if sub_intent == "casual_chat":
+            base_prompt = f"{base_prompt}\n\nTONE: Friendly, casual, short replies. Use light slang if it fits."
+    except Exception:
+        base_prompt = ""
+
+    prompt = base_prompt + "\n\n" + AGENT_SYSTEM_PROMPT + "\n\n" + AGENT_EXECUTION_RULES
 
     # --- Runtime clock injection (prevents date hallucination) ---
     now = _dt.now()
@@ -550,6 +582,11 @@ def _build_ask_message(action: ActionDecision) -> str:
         msg += "- Could you be more specific about what you'd like me to do?\n"
 
     return msg
+
+
+
+
+
 
 
 
