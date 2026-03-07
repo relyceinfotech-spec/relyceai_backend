@@ -981,7 +981,7 @@ class LLMProcessor:
             print(f"[QueryPlanner] Failed (non-blocking): {e}")
             _query_plan = {"needs_web": True, "needs_memory": True, "needs_chunking": True}
 
-                if intent == "INTERNAL":
+        if intent == "INTERNAL":
             _query_plan = {"needs_web": False, "needs_memory": False, "needs_chunking": False, "task_type": "general_chat"}
 
         needs_retrieval = intent in ("DEEP_SEARCH", "EXTERNAL")
@@ -2515,6 +2515,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 
