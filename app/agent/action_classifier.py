@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - Action Classifier
 Layers 4+5: Task Detection, Goal Mode, Ask vs Act Intelligence.
 
@@ -99,14 +99,14 @@ _HIGH_RISK_ACTIONS = re.compile(
 )
 
 _MEDIUM_RISK_ACTIONS = re.compile(
-    r"\b(?:send|post|submit|publish|deploy|push|execute|run|"
+    r"\b(?:post|submit|publish|deploy|push|execute|run|"
     r"update|modify|change|install|uninstall|migrate)\b",
     re.IGNORECASE,
 )
 
 _IRREVERSIBLE_ACTIONS = re.compile(
     r"\b(?:delete|remove|drop|destroy|wipe|erase|purge|"
-    r"send|email|post|publish|deploy|push|truncate)\b",
+    r"email|post|publish|deploy|push|truncate)\b",
     re.IGNORECASE,
 )
 
@@ -289,6 +289,10 @@ def _assess_risk(query: str, sub_intent: str) -> str:
 
 
 def is_reversible(query: str) -> bool:
+    q = (query or "").lower()
+    # "send me/show me/list me" are informational phrasings, not irreversible side effects.
+    if re.search(r"\bsend\s+me\b", q) or re.search(r"\bshow\s+me\b", q) or re.search(r"\blist\s+me\b", q):
+        return True
     return not bool(_IRREVERSIBLE_ACTIONS.search(query))
 
 
@@ -357,3 +361,4 @@ def _decide(
     if risk_level == "medium" and not is_reversible(query):
         return "confirm"
     return "act"
+
