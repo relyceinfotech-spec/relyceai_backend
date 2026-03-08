@@ -92,21 +92,6 @@ UI_SUB_INTENTS = {
 
 MAX_VERIFY_TIME = 1.5
 VERIFY_COMPLEXITY_THRESHOLD = 0.65
-NORMAL_GENERIC_FORMAT_RULES = """
-NORMAL MODE (GENERIC) OUTPUT TEMPLATE:
-- Start with a short direct answer (1-2 sentences).
-- Then use markdown headings and concise bullets.
-- Keep sections scannable; avoid long text walls.
-- Do NOT output self-verification/meta-audit sections.
-- Do NOT mention knowledge cutoff/tool limitations unless the user explicitly asks.
-
-Use this structure when relevant:
-## Overview
-## Key Points
-## Example (if relevant)
-## Conclusion
-"""
-
 CREATIVE_INTENTS = {
     "content_creation",
     "ui_design",
@@ -813,18 +798,20 @@ class LLMProcessor:
         if personality:
             system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, mode=mode)
         else:
-            from app.llm.router import _build_user_context_string
-            system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
-            if mode == "normal":
-                from app.llm.router import NORMAL_MARKDOWN_POLISH
-                system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
+            if mode == "normal" and sub_intent == "general":
+                # Main mode: single canonical structured explainer format.
+                system_prompt = get_system_prompt_for_mode("normal", user_settings, user_id, user_query)
+            else:
+                from app.llm.router import _build_user_context_string
+                system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
+                if mode == "normal":
+                    from app.llm.router import NORMAL_MARKDOWN_POLISH
+                    system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
-        elif mode == "normal" and sub_intent == "general":
-            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
             system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
         # Apply Emotion/Tone Instruction
@@ -928,8 +915,6 @@ class LLMProcessor:
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
-        elif mode == "normal" and sub_intent == "general":
-            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
             system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
@@ -1226,11 +1211,15 @@ class LLMProcessor:
             if personality:
                 system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
             else:
-                from app.llm.router import _build_user_context_string
-                system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
-                if mode == "normal":
-                    from app.llm.router import NORMAL_MARKDOWN_POLISH
-                    system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
+                if mode == "normal" and sub_intent == "general":
+                    # Main mode: single canonical structured explainer format.
+                    system_prompt = get_system_prompt_for_mode("normal", user_settings, user_id, user_query, session_id=session_id)
+                else:
+                    from app.llm.router import _build_user_context_string
+                    system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
+                    if mode == "normal":
+                        from app.llm.router import NORMAL_MARKDOWN_POLISH
+                        system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
         else:
             if personality and mode == "normal":
                 from app.llm.router import get_system_prompt_for_personality
@@ -1242,8 +1231,6 @@ class LLMProcessor:
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
-        elif mode == "normal" and sub_intent == "general":
-            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         # Wait for all memory/profile tasks securely
         if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
             system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
@@ -3057,10 +3044,4 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
-
-
-
-
-
-
 

@@ -297,12 +297,30 @@ You must strictly follow this visual structure. Do NOT use numbered lists (1, 2,
   * Format strictly as: `Source: [Link or Filename]`
 """
 
-NORMAL_SYSTEM_PROMPT = f"""{DEFAULT_PERSONA}
-{BASE_LANGUAGE_RULES}
-{BASE_FORMATTING_RULES}
-{NORMAL_MARKDOWN_POLISH}
-{RELYCE_RUNTIME_FORMAT_RULES}
-{SNAP_FORMAT_RULES}
+NORMAL_SYSTEM_PROMPT = """You are a clear and structured explainer.
+
+Always respond using this exact format:
+
+# Title
+
+Short explanation in 2-3 sentences.
+
+## Key Points
+- point
+- point
+- point
+
+## Example (optional)
+
+## Takeaway
+One concise conclusion.
+
+Rules:
+- Keep it rigid and consistent.
+- Use markdown headings and bullets only.
+- Do not add formatting alternatives or style options.
+- Do not output meta-verification/process commentary.
+- Do not force emojis.
 """
 
 BUSINESS_SYSTEM_PROMPT = f"""You are **Relyce AI**, an elite strategic advisor.
@@ -1127,6 +1145,14 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, 
     complexity_hint = _build_format_complexity_hint(user_query, mode=mode)
     followup_hint = _build_followup_hint(mode, user_query)
 
+    if mode == "normal":
+        return (
+            base_prompt
+            + time_context
+            + user_facts_context
+            + _build_user_context_string(user_settings)
+        )
+
     return (
         base_prompt
         + "\n\n"
@@ -1317,7 +1343,4 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 4. Do NOT include Sources or meta-content for casual conversation.
 5. AVOID using em-dashes (â€”), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
    In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
-
-
-
 
