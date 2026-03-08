@@ -595,6 +595,60 @@ class LLMProcessor:
 
         bullets = "\n".join(f"- {d}" for d in details)
         return f"## Direct Answer\n{direct}\n\n## Key Details\n{bullets}"
+    def _enforce_strict_explainer_format(self, text: str, user_query: str) -> str:
+        """
+        Force a rigid explainer template for normal/general answers.
+        This is deterministic so the output stays stable even when model style drifts.
+        """
+        cleaned = self._sanitize_output_text(text or "")
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            cleaned = "No content available."
+
+        q = (user_query or "").strip()
+        q = re.sub(r"[^A-Za-z0-9\s]", " ", q)
+        q = re.sub(r"\s+", " ", q).strip()
+        query_words = [w for w in q.split() if w.lower() not in {"macha", "bro", "yaar", "arey", "da", "dei"}]
+        title_core = " ".join(query_words[:6]).strip() or "Explanation"
+        title = title_core.title()
+
+        sentences = [s.strip(" -") for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+        if not sentences:
+            sentences = [cleaned]
+
+        explanation = " ".join(sentences[:2]).strip()
+        if len(explanation.split()) < 10 and len(sentences) > 2:
+            explanation = " ".join(sentences[:3]).strip()
+
+        point_candidates = [s for s in sentences[1:8] if len(s.split()) >= 4]
+        key_points = point_candidates[:3]
+        if len(key_points) < 3:
+            chunks = [c.strip(" -") for c in re.split(r"[;,]\s*", cleaned) if len(c.strip().split()) >= 4]
+            for ch in chunks:
+                if len(key_points) >= 3:
+                    break
+                if ch not in key_points:
+                    key_points.append(ch)
+        while len(key_points) < 3:
+            key_points.append("Key detail not provided in source response.")
+
+        takeaway = sentences[-1].strip()
+        if len(takeaway.split()) < 5:
+            takeaway = explanation
+
+        return (
+            f"# {title}\n\n"
+            f"{explanation}\n\n"
+            "## Key Points\n"
+            f"- {key_points[0]}\n"
+            f"- {key_points[1]}\n"
+            f"- {key_points[2]}\n\n"
+            "## Example (optional)\n"
+            "- Example not required for this query.\n\n"
+            "## Takeaway\n"
+            f"{takeaway}"
+        )
     def _sanitize_followups(self, items: List[str]) -> List[str]:
         cleaned: List[str] = []
         seen: set = set()
@@ -866,7 +920,10 @@ class LLMProcessor:
         _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
         create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
-        return self._sanitize_output_text(response.choices[0].message.content)
+        out_text = self._sanitize_output_text(response.choices[0].message.content)
+        if strict_structured_mode:
+            out_text = self._enforce_strict_explainer_format(out_text, user_query)
+        return out_text
     
     async def process_deep_search_query(
         self, 
@@ -963,7 +1020,6 @@ class LLMProcessor:
         _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
         create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
-        
         return self._sanitize_output_text(response.choices[0].message.content), selected_tools
     
     async def process_message(
@@ -2069,14 +2125,17 @@ class LLMProcessor:
                         yield "[/THINKING]"
                 sanitized_chunk = self._sanitize_output_text(delta.content, trim_outer=False)
                 streamed_output += sanitized_chunk
+                if strict_structured_mode:
+                    # Buffer full answer and enforce rigid structure at end.
+                    tokens_yielded += 1
+                    continue
                 if not followups_preview_sent:
                     preview_payload = self._build_followup_payload(streamed_output, mode, session_id, persist=False)
                     if preview_payload.get("followups") or preview_payload.get("action_chips"):
                         yield f"[INFO]{json.dumps(preview_payload)}"
                         followups_preview_sent = True
                 yield sanitized_chunk
-                tokens_yielded += 1
-                
+                tokens_yielded += 1                
         # Close reasoning if stream ended during reasoning
         if in_reasoning:
             trace.log("REASONING_COMPLETE", "built-in reasoning done")
@@ -2088,7 +2147,10 @@ class LLMProcessor:
             duration = end_time - first_token_time
             tps = tokens_yielded / duration if duration > 0 else 0
             print(f"[METRICS] Normal Stream Speed: {tps:.1f} tokens/sec ({tokens_yielded} tokens in {duration:.2f}s)")
-        
+        if strict_structured_mode:
+            streamed_output = self._enforce_strict_explainer_format(streamed_output, user_query)
+            yield streamed_output
+
         followup_payload = self._build_followup_payload(streamed_output, mode, session_id)
         yield f"[INFO]{json.dumps(followup_payload)}"
 
