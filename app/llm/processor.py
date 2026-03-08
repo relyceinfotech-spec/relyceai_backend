@@ -1,4 +1,4 @@
-﻿"""
+"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -42,8 +42,12 @@ from app.agent.self_monitor import evaluate_response as monitor_evaluate_respons
 from app.agent.static_validator import static_validation
 from app.agent.repair_engine import repair_cycle as run_repair_cycle, generate_repair_strategy, build_repair_prompt
 from app.agent.strategy_engine import merge_reasoning_tracks
+from app.llm.skill_router_runtime import record_skill_outcome, get_last_skill_trace
+from app.llm.token_counter import estimate_tokens as rough_estimate_tokens
+from app.safety.content_policy import classify_nsfw
 
 active_executions = {}
+_session_followup_cache: Dict[str, List[str]] = {}
 
 async def _execution_registry_cleanup():
     """Background task to clear stalled executions older than 300 seconds."""
@@ -84,6 +88,10 @@ UI_SUB_INTENTS = {
     "ui_demo_html",
     "ui_react",
 }
+
+
+MAX_VERIFY_TIME = 1.5
+VERIFY_COMPLEXITY_THRESHOLD = 0.65
 
 CREATIVE_INTENTS = {
     "content_creation",
@@ -528,6 +536,148 @@ class LLMProcessor:
         
         return content
 
+    def _sanitize_followups(self, items: List[str]) -> List[str]:
+        cleaned: List[str] = []
+        seen: set = set()
+        for q in (items or []):
+            if not isinstance(q, str):
+                continue
+            q2 = re.sub(r"\s+", " ", q).strip(" -?\t\n\r")
+            if not q2:
+                continue
+            words = q2.split()
+            if len(words) < 6 or len(words) > 14:
+                continue
+            key = re.sub(r"[^a-z0-9 ]+", "", q2.lower())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(q2)
+            if len(cleaned) >= 3:
+                break
+        return cleaned
+
+    def _extract_followups_from_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        section = re.search(r"(?:^|\n)##\s*Related Questions\s*\n(?P<body>[\s\S]*?)(?:\n##\s|$)", text, flags=re.IGNORECASE)
+        body = section.group("body") if section else text
+        candidates: List[str] = []
+        for line in body.splitlines():
+            m = re.match(r"^\s*(?:[-*]|\u2022)\s+(.+?)\s*$", line)
+            if m:
+                candidates.append(m.group(1).strip())
+        return self._sanitize_followups(candidates)
+
+    def _extract_action_chips_from_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        chips = re.findall(r"\[([^\]\n]{3,40})\]", text)
+        out: List[str] = []
+        seen: set = set()
+        for chip in chips:
+            c = re.sub(r"\s+", " ", chip).strip()
+            if not c:
+                continue
+            key = c.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+            if len(out) >= 3:
+                break
+        return out
+
+    def _build_followup_payload(
+        self,
+        response_text: str,
+        mode: str,
+        session_id: Optional[str],
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        followups = self._extract_followups_from_text(response_text or "")
+        if session_id:
+            previous = _session_followup_cache.get(session_id, [])
+            previous_set = set(previous)
+            filtered = []
+            for q in followups:
+                key = re.sub(r"[^a-z0-9 ]+", "", q.lower())
+                if key and key not in previous_set:
+                    filtered.append(q)
+            followups = filtered
+            if persist and followups:
+                updated = (previous + [re.sub(r"[^a-z0-9 ]+", "", q.lower()) for q in followups])[-24:]
+                _session_followup_cache[session_id] = updated
+
+        payload: Dict[str, Any] = {
+            "followups": followups[:3],
+            "followup_mode": mode,
+        }
+        chips = self._extract_action_chips_from_text(response_text or "")
+        if chips:
+            payload["action_chips"] = chips[:3]
+        return payload
+
+    def _estimate_query_complexity(self, query: str) -> float:
+        q = (query or "").strip().lower()
+        if not q:
+            return 0.0
+        words = len(q.split())
+        markers = [
+            "compare", "analyze", "architecture", "workflow", "strategy", "trade-off",
+            "optimize", "multi", "step", "research", "evaluate", "design",
+        ]
+        hit = sum(1 for m in markers if m in q)
+        score = min(1.0, (words / 40.0) + (hit * 0.12))
+        return score
+
+    def _should_run_verifier(self, mode: str, query: str, draft: str) -> bool:
+        m = (mode or "normal").lower()
+        if m not in {"business", "agent"}:
+            return False
+        if self._estimate_query_complexity(query) <= VERIFY_COMPLEXITY_THRESHOLD:
+            return False
+        # Budget guard for extra verify pass.
+        verify_prompt_tokens = rough_estimate_tokens([
+            {"role": "system", "content": "verify"},
+            {"role": "user", "content": query},
+            {"role": "assistant", "content": (draft or "")[:4000]},
+        ])
+        return verify_prompt_tokens <= 4500
+
+    async def _verify_response_quality(self, query: str, draft: str, mode: str) -> str:
+        verifier_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict verification assistant. Improve the draft only if needed. "
+                    "Check factual consistency, contradictions, and missing key steps. "
+                    "If draft is already good, return it unchanged. "
+                    "Do not add meta commentary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Query:\n{query}\n\n"
+                    f"Draft Answer:\n{draft}\n\n"
+                    "Return the final improved answer only."
+                ),
+            },
+        ]
+
+        verify_kwargs = {
+            "model": FAST_MODEL,
+            "messages": verifier_messages,
+            "max_tokens": 700,
+            "temperature": 0.1,
+        }
+        verify_kwargs = self._guard_kwargs(verify_kwargs, query)
+        client = get_openrouter_client()
+        resp = await client.chat.completions.create(**verify_kwargs)
+        verified = (resp.choices[0].message.content or "").strip()
+        return self._sanitize_output_text(verified) if verified else draft
+
     async def summarize_context(self, messages: List[Dict], existing_summary: str = "") -> str:
         """
         Summarize a list of messages into a concise context string.
@@ -664,7 +814,8 @@ class LLMProcessor:
         sub_intent: str = "general",
         user_id: Optional[str] = None,
         emotions: List[str] = [],
-        emotional_instruction: Optional[str] = None
+        emotional_instruction: Optional[str] = None,
+        session_id: Optional[str] = None
     ) -> tuple[str, List[str]]:
         """
         Handle external queries that need web search.
@@ -692,11 +843,11 @@ class LLMProcessor:
         if personality and mode == "normal":
             # ?? Personalities are ONLY honored in Normal Mode
             from app.llm.router import get_system_prompt_for_personality
-            system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query)
+            system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query, session_id=session_id)
         else:
             # Business / Deep Search / Normal (without persona) -> Use default System Prompt defined in router.py
             # This ensures Business Mode uses the EXACT "Elite Strategic Advisor" prompt from Business.py
-            system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query)
+            system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query, session_id=session_id)
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
@@ -811,7 +962,8 @@ class LLMProcessor:
                 sub_intent=sub_intent,
                 user_id=user_id,
                 emotions=emotions,
-                emotional_instruction=emotional_instruction
+                emotional_instruction=emotional_instruction,
+                session_id=session_id
             )
             result_response = self._sanitize_output_text(response_text)
         elif intent == "AGENT":
@@ -840,12 +992,42 @@ class LLMProcessor:
                 user_query, mode, context_messages, personality, user_settings, 
                 sub_intent, user_id, 
                 emotions=emotions,
-                emotional_instruction=emotional_instruction
+                emotional_instruction=emotional_instruction,
+                session_id=session_id
             )
             result_response = self._sanitize_output_text(response_text)
 
+        # Optional verification loop for complex business/agent outputs.
+        if self._should_run_verifier(mode, user_query, result_response):
+            try:
+                verified = await asyncio.wait_for(
+                    self._verify_response_quality(user_query, result_response, mode),
+                    timeout=MAX_VERIFY_TIME,
+                )
+                if verified:
+                    result_response = verified
+            except asyncio.TimeoutError:
+                print(f"[Verifier] Timeout after {MAX_VERIFY_TIME:.1f}s, using draft response")
+            except Exception as e:
+                print(f"[Verifier] Non-blocking failure: {e}")
+
+        blocked_out, _block_reason = classify_nsfw(result_response)
+        if blocked_out:
+            result_response = "I can help with educational or safety-oriented discussion, but I can't provide explicit sexual content."
+
         # === Feedback Engine: Log interaction ===
         _latency = (_time.time() - _start) * 1000
+        try:
+            skill_trace = get_last_skill_trace(session_id)
+            record_skill_outcome(
+                session_id=session_id,
+                success=True,
+                latency_ms=_latency,
+                fallback_level=int(skill_trace.get("fallback_level", 0)),
+            )
+        except Exception as e:
+            print(f"[SkillRouter] Outcome logging failed: {e}")
+
         feedback_engine.log_interaction(
             session_id=session_id or "",
             user_id=user_id or "",
@@ -900,7 +1082,7 @@ class LLMProcessor:
         import time
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
-
+        streamed_output = ""
 
         # Phase 1: Planning
         yield f'[INFO]{{"agent_state": "planning", "topic": "Analyzing query & intent"}}'
@@ -976,9 +1158,9 @@ class LLMProcessor:
         else:
             if personality and mode == "normal":
                 from app.llm.router import get_system_prompt_for_personality
-                system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query)
+                system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query, session_id=session_id)
             else:
-                system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query)
+                system_prompt = get_system_prompt_for_mode(mode, user_settings, user_id, user_query, session_id=session_id)
 
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
@@ -1373,11 +1555,17 @@ class LLMProcessor:
 
         # Construct messages with Context
         messages = [{"role": "system", "content": system_prompt}]
-        
+
         if optimized_context:
             messages.extend(optimized_context)
-        
+
         messages.append({"role": "user", "content": user_query})
+
+        # Cost guard: preserve system + primary skill capsule, trim context if over budget.
+        est_tokens = rough_estimate_tokens(messages)
+        if est_tokens > 4500 and optimized_context:
+            trimmed_context = context_optimizer.optimize(optimized_context, keep_last_n=2)
+            messages = [{"role": "system", "content": system_prompt}] + trimmed_context + [{"role": "user", "content": user_query}]
 
         # === Emit Intelligence Metadata for Frontend ===
         import json as _json
@@ -1562,6 +1750,8 @@ class LLMProcessor:
             if context_messages:
                 pass2_messages = [pass2_messages[0]] + context_messages + [pass2_messages[-1]]
             
+            pass2_output = ""
+            pass2_followups_preview_sent = False
             pass2_kwargs = {
                 "model": output_model,
                 "messages": pass2_messages,
@@ -1587,7 +1777,14 @@ class LLMProcessor:
                 except Exception as crit_e:
                     print(f"[Critic] Error (non-blocking): {crit_e}")
                 for i in range(0, len(sanitized), 800):
-                    yield sanitized[i:i+800]
+                    chunk_text = sanitized[i:i+800]
+                    pass2_output += chunk_text
+                    if not pass2_followups_preview_sent:
+                        preview_payload = self._build_followup_payload(pass2_output, mode, session_id, persist=False)
+                        if preview_payload.get("followups") or preview_payload.get("action_chips"):
+                            yield f"[INFO]{json.dumps(preview_payload)}"
+                            pass2_followups_preview_sent = True
+                    yield chunk_text
             else:
                 try:
                     stream = await get_openrouter_client().chat.completions.create(**pass2_kwargs)
@@ -1599,11 +1796,20 @@ class LLMProcessor:
                             if r_tokens:
                                 yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
-                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content)
+                            pass2_output += out_chunk
+                            if not pass2_followups_preview_sent:
+                                preview_payload = self._build_followup_payload(pass2_output, mode, session_id, persist=False)
+                                if preview_payload.get("followups") or preview_payload.get("action_chips"):
+                                    yield f"[INFO]{json.dumps(preview_payload)}"
+                                    pass2_followups_preview_sent = True
+                            yield out_chunk
                 except Exception as stream_err:
                     print(f"[Processor] Stream failed in pass 2: {stream_err}")
                     yield f"\n\n?? **Stream interrupted:** {str(stream_err)}"
             # End thinking return path
+            followup_payload = self._build_followup_payload(pass2_output, mode, session_id)
+            yield f"[INFO]{json.dumps(followup_payload)}"
             return
 
         # === SAFE CHAT AGENT: Single-shot path for STRICT limits ===
@@ -1700,7 +1906,11 @@ class LLMProcessor:
 
             # Yield as chunks
             for i in range(0, len(final_output), 800):
-                yield final_output[i:i+800]
+                chunk_text = final_output[i:i+800]
+                streamed_output += chunk_text
+                yield chunk_text
+            followup_payload = self._build_followup_payload(final_output, mode, session_id)
+            yield f"[INFO]{json.dumps(followup_payload)}"
             return
 
         # Normal streaming path (no STRICT limits or thinking pass)
@@ -1739,6 +1949,7 @@ class LLMProcessor:
         # Performance Tracking
         first_token_time = None
         tokens_yielded = 0
+        followups_preview_sent = False
         
         async for chunk in stream:
             if first_token_time is None:
@@ -1790,6 +2001,12 @@ class LLMProcessor:
                     if emit_raw_reasoning:
                         yield "[/THINKING]"
                 sanitized_chunk = self._sanitize_output_text(delta.content)
+                streamed_output += sanitized_chunk
+                if not followups_preview_sent:
+                    preview_payload = self._build_followup_payload(streamed_output, mode, session_id, persist=False)
+                    if preview_payload.get("followups") or preview_payload.get("action_chips"):
+                        yield f"[INFO]{json.dumps(preview_payload)}"
+                        followups_preview_sent = True
                 yield sanitized_chunk
                 tokens_yielded += 1
                 
@@ -1805,6 +2022,9 @@ class LLMProcessor:
             tps = tokens_yielded / duration if duration > 0 else 0
             print(f"[METRICS] Normal Stream Speed: {tps:.1f} tokens/sec ({tokens_yielded} tokens in {duration:.2f}s)")
         
+        followup_payload = self._build_followup_payload(streamed_output, mode, session_id)
+        yield f"[INFO]{json.dumps(followup_payload)}"
+
         # End of Unified Normal Mode
         return
 
@@ -2010,6 +2230,7 @@ class LLMProcessor:
             user_id=user_id,
             user_query=user_query,
             personality=personality,
+            session_id=session_id,
         )
 
         # --- Prepare messages ---
@@ -2023,6 +2244,12 @@ class LLMProcessor:
         if optimized_context:
             messages.extend(optimized_context)
         messages.append({"role": "user", "content": user_query})
+
+        # Cost guard: preserve system + primary skill capsule, trim context if over budget.
+        est_tokens = rough_estimate_tokens(messages)
+        if est_tokens > 4500 and optimized_context:
+            trimmed_context = context_optimizer.optimize(optimized_context, keep_last_n=2)
+            messages = [{"role": "system", "content": system_prompt}] + trimmed_context + [{"role": "user", "content": user_query}]
 
         # --- Hybrid Strategy: Inject reasoning / emit metadata ---
         strategy = getattr(agent_result, "strategy", None)
@@ -2200,6 +2427,8 @@ class LLMProcessor:
             
             print(f"[Synthesis] Tool result messages found: {len(tool_result_messages)}")
             
+            synthesis_output = ""
+            synthesis_followups_preview_sent = False
             if tool_result_messages:
                 # Build a CLEAN context - strip all old refusal messages to prevent context poisoning
                 # Only include: system prompt (first msg), user query (last user msg), tool results, and synthesis instruction
@@ -2241,7 +2470,14 @@ class LLMProcessor:
                                 yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                             token_count += 1
-                            yield self._sanitize_output_text(chunk.choices[0].delta.content)
+                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content)
+                            synthesis_output += out_chunk
+                            if not synthesis_followups_preview_sent:
+                                preview_payload = self._build_followup_payload(synthesis_output, mode, session_id, persist=False)
+                                if preview_payload.get("followups") or preview_payload.get("action_chips"):
+                                    yield f"[INFO]{_json.dumps(preview_payload)}"
+                                    synthesis_followups_preview_sent = True
+                            yield out_chunk
                     print(f"[Synthesis] Completed. Streamed {token_count} tokens.")
                 except Exception as e:
                     print(f"[Synthesis] ERROR: {e}")
@@ -2254,6 +2490,8 @@ class LLMProcessor:
             final_status = "COMPLETED" if plan_graph.is_fully_completed() else "FAILED"
             update_task_graph(session_id, task_id, plan_graph.serialize(), new_status=final_status)
             
+            graph_followups = self._build_followup_payload(synthesis_output, mode, session_id)
+            yield f"[INFO]{_json.dumps(graph_followups)}"
             yield f"[INFO]{_json.dumps({'agent_state': 'completed', 'completed': True})}"
             
             # TODO: Gracefully extract memory outcome mapping for DAG here
@@ -2720,11 +2958,16 @@ Rules:
                     from app.state.transaction_manager import commit_transaction
                     commit_transaction(session_id, task_id)
         
+        final_followups = self._build_followup_payload(full_response, mode, session_id)
+        yield f"[INFO]{_json.dumps(final_followups)}"
         active_executions.pop(execution_id, None)
         yield f"[INFO]{_json.dumps({'agent_state': 'completed', 'completed': True})}"
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
 
 
 

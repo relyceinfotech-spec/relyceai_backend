@@ -1,4 +1,4 @@
-﻿"""
+"""
 Relyce AI - Tool Executor (Production Hardened)
 Tool Execution Layer: Real backend tool execution with standardized contract.
 
@@ -25,6 +25,8 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+from app.safety.content_policy import classify_nsfw, has_prompt_injection_markers
 
 
 # ============================================
@@ -1687,6 +1689,59 @@ async def safe_execute(tool_func, *args, timeout: int = TOOL_TIMEOUT, is_async: 
         }
 
 
+
+# ============================================
+# TOOL ARGUMENT VALIDATION
+# ============================================
+
+_SEARCH_TOOLS = {
+    "search_web", "search_news", "search_images", "search_videos", "search_places", "search_maps",
+    "search_reviews", "search_shopping", "search_scholar", "search_patents", "search_weather",
+    "search_finance", "search_currency", "search_company", "search_legal", "search_jobs",
+    "search_academic", "search_tech_docs", "compare_products", "search_products", "search_competitors",
+    "search_trends", "faq_builder", "extract_tables", "summarize_url", "web_fetch"
+}
+
+
+def _safe_json_extract_arg(raw_args: str, keys: List[str]) -> str:
+    try:
+        if raw_args and raw_args.strip().startswith("{"):
+            payload = json.loads(raw_args)
+            if isinstance(payload, dict):
+                for k in keys:
+                    if payload.get(k):
+                        return str(payload.get(k))
+    except Exception:
+        return raw_args or ""
+    return raw_args or ""
+
+
+def _validate_tool_args(tool_call: ToolCall) -> Optional[str]:
+    args = tool_call.args or ""
+
+    # Hard length cap to avoid abuse payloads.
+    if len(args) > 8000:
+        return "Tool arguments too large for safe execution."
+
+    # Prompt-injection markers in tool args are suspicious for fetched/RAG content flows.
+    if has_prompt_injection_markers(args):
+        return "Tool arguments blocked: prompt-injection markers detected."
+
+    if tool_call.name in _SEARCH_TOOLS:
+        query = _safe_json_extract_arg(args, ["q", "query", "url", "text"])
+        blocked, reason = classify_nsfw(query)
+        if blocked:
+            return reason
+
+    # URL safety for URL-based tools.
+    if tool_call.name in {"summarize_url", "web_fetch"}:
+        url = _safe_json_extract_arg(args, ["url"])
+        if url:
+            parsed = urlparse(url.strip())
+            if parsed.scheme and parsed.scheme not in {"http", "https"}:
+                return "Only http/https URLs are allowed."
+
+    return None
 # ============================================
 # TOOL EXECUTION (with retry + timeout)
 # ============================================
@@ -1703,6 +1758,13 @@ async def execute_tool(tool_call: ToolCall, exec_ctx: Optional[ExecutionContext]
 
     if tool_call.name not in TOOLS:
         result.error = f"Unknown tool: {tool_call.name}"
+        return result
+
+    arg_error = _validate_tool_args(tool_call)
+    if arg_error:
+        result.error = arg_error
+        result.source = tool_call.name
+        result.confidence = "low"
         return result
 
     # --- PHASE 4D: Transaction State Capture ---
@@ -1834,6 +1896,11 @@ def format_tool_result(result: ToolResult) -> str:
             f"CONFIDENCE: {result.confidence}\n"
             f"REASON: {result.error}"
         )
+
+
+
+
+
 
 
 

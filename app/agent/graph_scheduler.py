@@ -73,7 +73,30 @@ async def run_plan_graph(
         # -----------------------------
         # Generate LLM action for Node
         # -----------------------------
-        stream = await client.chat.completions.create(**create_kwargs)
+        stream = None
+        try:
+            stream = await client.chat.completions.create(**create_kwargs)
+        except Exception as node_err:
+            # Node retry policy: one fallback retry with a minimal base prompt.
+            yield f"[INFO]{json.dumps({'node_retry': True, 'node_id': node.node_id, 'reason': str(node_err)[:140]})}"
+            fallback_kwargs = dict(create_kwargs)
+            fallback_messages = list(fallback_kwargs.get("messages", []))
+            if fallback_messages:
+                fallback_messages[0] = {
+                    "role": "system",
+                    "content": "You are in fallback mode for a failed DAG node. Respond deterministically and avoid unnecessary tool calls.",
+                }
+                fallback_kwargs["messages"] = fallback_messages
+            try:
+                stream = await client.chat.completions.create(**fallback_kwargs)
+            except Exception as retry_err:
+                graph.mark_failed(node.node_id)
+                messages.append({
+                    "role": "system",
+                    "content": f"Node {node.node_id} failed after retry: {retry_err}",
+                })
+                continue
+
         async for chunk in stream:
             if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
                 r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)

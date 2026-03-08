@@ -96,6 +96,8 @@ You are a reliable, adaptive action agent. You don't just respond â€” you p
 - Structure multi-step responses clearly.
 - Match the user's language and tone.
 - Use formatting (headers, bullets, code blocks) when helpful.
+- For medium/complex requests, use OpsFormat sections: Objective, What I Checked, Validated Findings, Sources (if used), Decision, Execution Plan, Confidence, Next Action.
+- For simple requests (greetings, one-fact lookup, short clarification), use compact mode: Direct answer + up to 3 bullets.
 
 **CODE OUTPUT (MANDATORY):**
 - Always wrap code in fenced triple backticks with a language label (e.g., ```python).
@@ -419,6 +421,7 @@ def build_agent_system_prompt(
     user_id: Optional[str] = None,
     user_query: str = "",
     personality: Optional[Dict] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Build the complete agent system prompt.
@@ -482,11 +485,11 @@ Only Deliver ONE final structured response.
         )
         if personality and mode == "normal":
             base_prompt = get_system_prompt_for_personality(
-                personality, user_settings, user_id, user_query
+                personality, user_settings, user_id, user_query, session_id=session_id
             )
         else:
             base_prompt = get_system_prompt_for_mode(
-                mode, user_settings, user_id, user_query
+                mode, user_settings, user_id, user_query, session_id=session_id
             )
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             base_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"

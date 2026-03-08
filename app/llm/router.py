@@ -17,6 +17,7 @@ from app.config import (
     SERPER_CONNECT_TIMEOUT, SERPER_READ_TIMEOUT, SERPER_MAX_RETRIES, SERPER_RETRY_BACKOFF
 )
 from app.llm.embeddings import classify_emotion
+from app.llm.skill_router_runtime import inject_skill_capsules, select_skills
 
 import httpx
 
@@ -148,6 +149,74 @@ BASE_FORMATTING_RULES = """
 - Heavily utilize markdown formatting (titles, bolding, italics) to establish visual hierarchy without relying on empty whitespace.
 """
 
+RELYCE_RUNTIME_FORMAT_RULES = """
+**RELYCE FORMAT RUNTIME RULES (MANDATORY):**
+- Use the full mode template when the request is medium/complex.
+- If the request is simple (greeting, one-fact lookup, short clarification), use compact mode:
+  - `## Direct Answer` plus up to 3 short bullets.
+- Never output giant text walls.
+- Never output internal verification/meta loops in final answers.
+- Never output empty sections.
+- Omit any section that has no meaningful content (do not print placeholders like "None" or "N/A").
+"""
+
+SNAP_FORMAT_RULES = """
+**SNAPFORMAT (NORMAL / FREE):**
+- `## Direct Answer` (1-2 lines)
+- `## Why This Matters` (3-5 bullets)
+- `## Do Next` (max 3 numbered steps, only if actionable)
+- Keep it accurate and concise. No raw tool/source dump unless asked.
+"""
+
+BRIEF_FORMAT_RULES = """
+**BRIEFFORMAT (BUSINESS):**
+- `## Executive Summary` (3-5 lines)
+- `## Key Findings` (bullets)
+- `## Options` (A/B/C with concise pros and cons)
+- `## Recommendation` (single clear choice)
+- `## Impact` (expected outcome)
+- `## Action Plan` (numbered steps)
+- `## Risk Watch` (top risks)
+"""
+
+OPS_FORMAT_RULES = """
+**OPSFORMAT (AGENT / PRO):**
+- `## Objective`
+- `## What I Checked`
+- `## Validated Findings`
+- `## Sources` (only when tools/docs are actually used)
+- `## Decision`
+- `## Execution Plan`
+- `## Confidence`
+- `## Next Action`
+"""
+
+FOLLOWUP_TEMPLATE_RULES = """
+**FOLLOW-UP QUESTION TEMPLATE (ALL MODES):**
+- Add follow-ups only for informational/task queries.
+- Skip follow-ups for greetings, thanks, or one-shot commands.
+- Max 3 follow-up questions.
+- Ensure follow-ups are DISTINCT and cover different angles.
+- Keep each follow-up short and clickable (6-14 words).
+- Never include duplicate or near-duplicate questions.
+
+Mode-specific follow-up pattern:
+- Normal: Clarify -> Implement -> Pitfall
+- Business: Impact -> Resources -> Risk
+- Agent: Data -> Execution -> Validation
+
+Optional action chips (only when clearly useful):
+- `[Compare options]`
+- `[Show example]`
+- `[Generate code]`
+
+Output format:
+## Related Questions
+- ...
+- ...
+- ...
+"""
+
 NORMAL_MARKDOWN_POLISH = """
 **NORMAL MODE PRESENTATION (Generic Only):**
 - Always use clear section headings with `##` or `###`.
@@ -232,6 +301,8 @@ NORMAL_SYSTEM_PROMPT = f"""{DEFAULT_PERSONA}
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
 {NORMAL_MARKDOWN_POLISH}
+{RELYCE_RUNTIME_FORMAT_RULES}
+{SNAP_FORMAT_RULES}
 """
 
 BUSINESS_SYSTEM_PROMPT = f"""You are **Relyce AI**, an elite strategic advisor.
@@ -245,13 +316,23 @@ Provide fact-based, high-level guidance operating with:
 * **Tone:** Professional, authoritative, and advisory.
 
 {BASE_FORMATTING_RULES}
+{RELYCE_RUNTIME_FORMAT_RULES}
+{BRIEF_FORMAT_RULES}
 """
 
 # Duplicate removed
 
 
-# Re-use Business prompt for DeepSearch for now, or customize if needed
-DEEPSEARCH_SYSTEM_PROMPT = BUSINESS_SYSTEM_PROMPT
+# DeepSearch keeps Business structure and depth.
+DEEPSEARCH_SYSTEM_PROMPT = f"""{BUSINESS_SYSTEM_PROMPT}
+{RELYCE_RUNTIME_FORMAT_RULES}
+{BRIEF_FORMAT_RULES}
+"""
+
+AGENT_FORMAT_PROMPT = f"""{BUSINESS_SYSTEM_PROMPT}
+{RELYCE_RUNTIME_FORMAT_RULES}
+{OPS_FORMAT_RULES}
+"""
 
 INTERNAL_SYSTEM_PROMPT = f"""You are **Relyce AI**, an advanced AI assistant with deep expertise in Artificial Intelligence, Computer Science, and real-world problem solving.
 
@@ -941,58 +1022,134 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
     )
 
 
-def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "") -> str:
-    """Get the appropriate system prompt for the chat mode"""
-    base_prompt = ""
+_SIMPLE_QUERY_KEYWORDS = (
+    "what is",
+    "define",
+    "meaning",
+    "difference",
+    "example",
+)
+
+
+def is_simple_query(text: str) -> bool:
+    """Heuristic: classify short/straightforward prompts for compact formatting."""
+    if not text:
+        return True
+
+    cleaned = text.strip().lower()
+    if len(cleaned.split()) < 12:
+        return True
+
+    return any(k in cleaned for k in _SIMPLE_QUERY_KEYWORDS)
+
+
+def _build_format_complexity_hint(user_query: str) -> str:
+    if is_simple_query(user_query):
+        return (
+            "\n\n**FORMAT COMPLEXITY MODE: SIMPLE**\n"
+            "Use compact mode: `## Direct Answer` + up to 3 concise bullets. "
+            "Do not force full templates.\n"
+        )
+
+    return (
+        "\n\n**FORMAT COMPLEXITY MODE: DETAILED**\n"
+        "Use the full mode template for this response. "
+        "Skip any section that has no meaningful content.\n"
+    )
+
+
+
+def _build_followup_hint(mode: str, user_query: str) -> str:
+    q = (user_query or "").strip().lower()
+    if not q:
+        return "\n\nSkip follow-ups for this reply.\n"
+
+    # Skip on conversational one-liners to avoid UI clutter.
+    skip_markers = ("hi", "hello", "hey", "thanks", "thank you", "bye")
+    if len(q.split()) <= 4 and any(m in q for m in skip_markers):
+        return "\n\nSkip follow-ups for this reply.\n"
+
+    if mode == "business":
+        pattern = "Use Business pattern: Impact -> Resources -> Risk."
+    elif mode == "agent":
+        pattern = "Use Agent pattern: Data -> Execution -> Validation."
+    else:
+        pattern = "Use Normal pattern: Clarify -> Implement -> Pitfall."
+
+    return (
+        "\n\nGenerate up to 3 distinct follow-up questions.\n"
+        + pattern + "\n"
+        + "Do not repeat the same angle.\n"
+        + "Also include up to 3 optional action chips ONLY if helpful: "
+        + "[Compare options], [Show example], [Generate code].\n"
+    )
+
+def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "", session_id: Optional[str] = None) -> str:
+    """Get the appropriate system prompt for the chat mode."""
     if mode == "normal":
         base_prompt = NORMAL_SYSTEM_PROMPT
     elif mode == "business":
         base_prompt = BUSINESS_SYSTEM_PROMPT
+    elif mode == "agent":
+        base_prompt = AGENT_FORMAT_PROMPT
     else:
         base_prompt = DEEPSEARCH_SYSTEM_PROMPT
-    
-    # Inject user facts if available
+
     user_facts_context = ""
     if user_id:
         try:
             from app.chat.smart_memory import format_memories_for_prompt
-            # Pass user_query so memory is only fetched if they ask for it
             user_facts_context = format_memories_for_prompt(user_id, user_query)
         except Exception as e:
             print(f"[Router] Error loading user facts: {e}")
-        
+
+    skill_selection = select_skills(user_query, mode, session_id=session_id)
+    base_prompt = inject_skill_capsules(base_prompt, skill_selection, token_budget=4500)
+
     current_date = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
     time_context = f"\n\n**CURRENT DATE & TIME:** {current_date}\n"
-    
-    return base_prompt + time_context + user_facts_context + _build_user_context_string(user_settings)
+    complexity_hint = _build_format_complexity_hint(user_query)
+    followup_hint = _build_followup_hint(mode, user_query)
+
+    return (
+        base_prompt
+        + "\n\n"
+        + FOLLOWUP_TEMPLATE_RULES
+        + complexity_hint
+        + followup_hint
+        + time_context
+        + user_facts_context
+        + _build_user_context_string(user_settings)
+    )
 
 
-def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "") -> str:
+def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "", session_id: Optional[str] = None) -> str:
     """
     Combine BASE formatting/language rules with custom personality prompt.
-    Now includes SPECIALTY context for domain expertise and USER FACTS.
+    Includes specialty context and runtime-selected skill capsules.
     """
     custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+
+    user_facts_context = ""
+    if user_id:
+        try:
+            from app.chat.smart_memory import format_memories_for_prompt
+            user_facts_context = format_memories_for_prompt(user_id, user_query)
+        except Exception as e:
+            print(f"[Router] Error loading user facts: {e}")
+
     if personality.get("id") == "coding_buddy" or personality.get("name") == "Coding Buddy":
-        user_facts_context = ""
-        if user_id:
-            try:
-                from app.chat.smart_memory import format_memories_for_prompt
-                # If we have a way to pass query here, we'd do it. For now, rely on default behavior
-                user_facts_context = format_memories_for_prompt(user_id, user_query)
-            except Exception as e:
-                print(f"[Router] Error loading user facts: {e}")
         return f"""{CORE_POLICY}
 {custom_prompt}
 {user_facts_context}
 {_build_user_context_string(user_settings)}"""
+
     if personality.get("id") == "default_relyce" or personality.get("name") == "Relyce AI":
-        return f"""{CORE_POLICY}
-{custom_prompt}"""
+        # Keep default personality, but still apply runtime skill routing and normal-mode formatting.
+        return get_system_prompt_for_mode("normal", user_settings, user_id, user_query, session_id=session_id)
+
     specialty = personality.get("specialty", "general")
-    
-    # Specialty-specific context overlays
-    SPECIALTY_CONTEXTS = {
+    specialty_contexts = {
         "coding": """
 **EXPERTISE: Coding & Technology**
 - You are an expert programmer and software architect.
@@ -1004,59 +1161,40 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
 - You are a seasoned business consultant and strategist.
 - Focus on ROI, metrics, market analysis, and actionable insights.
 - Provide data-driven recommendations.
-- Think like a CEO - consider scalability, risks, and competitive advantage.""",
+- Think like a CEO: scalability, risks, and competitive advantage.""",
         "ecommerce": """
 **EXPERTISE: E-Commerce & Retail**
-- You are an e-commerce specialist (Shopify, Amazon FBA, WooCommerce).
-- Expert in product listings, SEO, conversion optimization.
-- Understand pricing strategies, inventory, and fulfillment.
-- Provide actionable tips for increasing sales and reducing cart abandonment.""",
+- You are an e-commerce specialist.
+- Focus on conversion, listing quality, pricing, and fulfillment.
+- Provide practical growth recommendations.""",
         "creative": """
 **EXPERTISE: Creative & Design**
-- You are a creative director with expertise in design and content.
-- Provide visually-focused guidance and aesthetic recommendations.
-- Understand branding, UX/UI principles, and content strategy.
-- Balance creativity with practical implementation.""",
+- You are a creative director with strong design judgment.
+- Balance aesthetics with practical implementation.""",
         "music": """
 **EXPERTISE: Music & Audio**
-- You are a professional musician and music producer.
-- Expert in songwriting, composition, vocal coaching, and production.
-- Understand music theory, DAWs, mixing, and mastering.
-- Provide constructive feedback on lyrics, melodies, and arrangements.""",
+- You are a music producer and composition guide.
+- Provide clear, constructive production advice.""",
         "legal": """
 **EXPERTISE: Legal & Compliance**
-- You are knowledgeable in legal matters and contract review.
-- Focus on clarity, risks, and compliance requirements.
-- Provide general guidance (not legal advice - always recommend consulting a lawyer).
-- Understand terms of service, privacy policies, and intellectual property.""",
+- Provide general legal/compliance guidance.
+- Flag risk clearly and recommend legal counsel when needed.""",
         "health": """
 **EXPERTISE: Health & Wellness**
-- You are a knowledgeable health and wellness guide.
-- Focus on fitness, nutrition, mental health, and lifestyle.
-- Provide evidence-based suggestions (not medical advice - recommend consulting doctors).
-- Be encouraging and supportive of healthy habits.""",
+- Provide evidence-informed wellness guidance.
+- Recommend professional care for medical decisions.""",
         "education": """
 **EXPERTISE: Education & Learning**
-- You are an expert educator and tutor.
-- Break down complex topics into digestible explanations.
-- Use analogies, examples, and step-by-step teaching methods.
-- Adapt your explanations to the learner's level."""
+- Teach step-by-step with examples and adaptive clarity.""",
     }
-    
-    specialty_context = SPECIALTY_CONTEXTS.get(specialty, "")
-    
-    # Inject user facts if available
-    user_facts_context = ""
-    if user_id:
-        try:
-            from app.chat.smart_memory import format_memories_for_prompt
-            user_facts_context = format_memories_for_prompt(user_id)
-        except Exception as e:
-            print(f"[Router] Error loading user facts: {e}")
-    
+    specialty_context = specialty_contexts.get(specialty, "")
+
+    skill_selection = select_skills(user_query, "normal", session_id=session_id)
+    custom_prompt = inject_skill_capsules(custom_prompt, skill_selection, token_budget=4500)
+
     current_date = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
     time_context = f"\n\n**CURRENT DATE & TIME:** {current_date}\n"
-    
+
     return f"""{CORE_POLICY}
 {custom_prompt}
 {specialty_context}
@@ -1065,7 +1203,6 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
 {BASE_LANGUAGE_RULES}
 {BASE_FORMATTING_RULES}
 {_build_user_context_string(user_settings)}"""
-
 
 def get_tools_for_mode(mode: str) -> Dict[str, str]:
     """Get the appropriate tools dict for the chat mode"""

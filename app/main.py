@@ -42,6 +42,7 @@ from app.llm.emotion_engine import emotion_engine
 from app.llm.feedback_engine import feedback_engine
 from app.llm.prompt_optimizer import prompt_optimizer
 from app.llm.user_profiler import user_profiler
+from app.safety.stream_moderator import StreamingOutputModerator
 
 from app.llm.processor import active_executions
 from pydantic import BaseModel
@@ -70,6 +71,7 @@ async def lifespan(app: FastAPI):
     try:
         import asyncio
         from app.llm.embeddings import load_intent_embeddings
+        from app.llm.skill_router_runtime import preload_skill_vectors
 
         async def _load_embeddings_background():
             try:
@@ -82,6 +84,12 @@ async def lifespan(app: FastAPI):
                 print(f"[Startup] ! Embedding load failed: {e}")
 
         asyncio.create_task(_load_embeddings_background())
+
+        try:
+            preload_skill_vectors()
+            print("[Startup] - Skill vectors cache loaded")
+        except Exception as e:
+            print(f"[Startup] ! Skill vector preload failed: {e}")
 
     except Exception as e:
         print(f"[Startup] ! Embedding task init failed: {e}")
@@ -111,7 +119,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! Execution cleanup init failed: {e}")
 
-    # 🔧 API WARMUP: Pre-warm OpenRouter TLS/DNS pools to eliminate cold start latency
+    # ðŸ”§ API WARMUP: Pre-warm OpenRouter TLS/DNS pools to eliminate cold start latency
     try:
         async def _warmup_api():
             try:
@@ -127,7 +135,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! API warmup task init failed: {e}")
 
-    # 🔧 WEAVIATE WARMUP: Pre-connect to Weaviate Cloud for vector memory
+    # ðŸ”§ WEAVIATE WARMUP: Pre-connect to Weaviate Cloud for vector memory
     try:
         async def _warmup_weaviate():
             try:
@@ -243,7 +251,7 @@ async def agent_metrics():
 async def agent_cancel(request: Request):
     """
     Cancel a running agent execution for a given chat session.
-    Enables interrupt safety — frontend calls this before sending a new prompt.
+    Enables interrupt safety â€” frontend calls this before sending a new prompt.
     """
     body = await request.json()
     user_id = body.get("user_id", "")
@@ -428,7 +436,7 @@ Keep it concise but informative. Write in third person (e.g., "User is..."). If 
     except Exception as e:
         print(f"[MemorySummary] Error: {e}")
         # Fallback: just list them
-        fallback = "\n".join([f"• {m.content}" for m in memories[:20]])
+        fallback = "\n".join([f"â€¢ {m.content}" for m in memories[:20]])
         return {"status": "success", "summary": fallback, "memory_count": len(memories)}
 
 @app.patch("/api/memories/{user_id}/{memory_id}")
@@ -531,7 +539,7 @@ async def circuit_breaker_gate():
         logger = get_event_logger()
         from app.observability.event_types import EventType
         logger.emit(EventType.ANOMALY_ALERT, {
-            "reason": "Circuit open — execution blocked",
+            "reason": "Circuit open â€” execution blocked",
             "signal": signal,
         })
         return JSONResponse(
@@ -582,7 +590,7 @@ async def governance_gate(user_id: str, tier: str = "free"):
     Reusable governance gate. Call before any LLM execution.
     Returns None if allowed, or a JSONResponse with error if blocked.
 
-    Chain: rate_limiter → quota_manager → spend_guard
+    Chain: rate_limiter â†’ quota_manager â†’ spend_guard
     """
     # 1. Burst rate limit
     limiter = get_rate_limiter()
@@ -760,6 +768,7 @@ async def resume_task(task_id: str, request: ResumeRequest, req: Request, user_i
             effective_settings = get_user_settings(user_id)
             
             # Fire LLM (passing resume_graph into kwargs)
+            stream_moderator = StreamingOutputModerator()
             async for token in llm_processor.process_message_stream(
                 user_query=augmented_message,
                 mode="normal",
@@ -775,8 +784,14 @@ async def resume_task(task_id: str, request: ResumeRequest, req: Request, user_i
                     clean_info = token.replace("[INFO]", "").strip()
                     yield f"data: {json.dumps({'type': 'info', 'content': clean_info})}\n\n"
                     continue
-                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                safe_chunk = stream_moderator.ingest(token)
+                if safe_chunk:
+                    yield f"data: {json.dumps({'type': 'token', 'content': safe_chunk})}\n\n"
                 
+            tail_chunk = stream_moderator.finalize()
+            if tail_chunk:
+                yield f"data: {json.dumps({'type': 'token', 'content': tail_chunk})}\n\n"
+
             yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
             
         except Exception as e:
@@ -1064,7 +1079,7 @@ async def chat_stream(request: ChatRequest, req: Request, user_info: dict = Depe
     async def generate():
         store = None
         try:
-            # 🚀 Force flush buffer immediately with padding (1KB)
+            # ðŸš€ Force flush buffer immediately with padding (1KB)
             # This helps in environments like Vercel/Nginx/Render that buffer responses
             yield ": " + (" " * 1024) + "\n\n"
 
@@ -1111,6 +1126,7 @@ async def chat_stream(request: ChatRequest, req: Request, user_info: dict = Depe
             store = get_usage_store()
             store.increment_concurrent(user_id)
             stream_generator = None
+            stream_moderator = StreamingOutputModerator()
             try:
                 stream_generator = llm_processor.process_message_stream(
                     request.message,
@@ -1126,12 +1142,20 @@ async def chat_stream(request: ChatRequest, req: Request, user_info: dict = Depe
                         clean_info = token.replace("[INFO]", "").strip()
                         yield f"data: {json.dumps({'type': 'info', 'content': clean_info})}\n\n"
                         continue
-                    full_response += token
-                    yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-                
+
+                    safe_chunk = stream_moderator.ingest(token)
+                    if safe_chunk:
+                        full_response += safe_chunk
+                        yield f"data: {json.dumps({'type': 'token', 'content': safe_chunk})}\n\n"
+
                 # Send done signal
+                tail_chunk = stream_moderator.finalize()
+                if tail_chunk:
+                    full_response += tail_chunk
+                    yield f"data: {json.dumps({'type': 'token', 'content': tail_chunk})}\n\n"
+
                 yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
-            
+
                 # Update context and save to Firebase
                 if request.session_id:
                     update_context_with_exchange(
@@ -1401,3 +1425,8 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+
+
+
+
+
