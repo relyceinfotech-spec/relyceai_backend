@@ -1,4 +1,4 @@
-﻿"""
+"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -488,7 +488,7 @@ class LLMProcessor:
 
         return sampling
     
-    def _sanitize_output_text(self, text: str, allow_double_hyphen: bool = False) -> str:
+    def _sanitize_output_text(self, text: str, allow_double_hyphen: bool = False, trim_outer: bool = True) -> str:
         """
         Normalize punctuation to avoid em-dashes/double-hyphen in outputs.
         Also unescapes HTML entities to ensure code renders correctly.
@@ -519,7 +519,7 @@ class LLMProcessor:
         sanitized = re.sub(r"^\s*(Verification Report|Accuracy Assessment|Completeness Assessment|Uncertainties|Improvements Recommended).*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
 
-        return sanitized.strip()
+        return sanitized.strip() if trim_outer else sanitized
 
     def _fix_html_css_output(self, text: str) -> str:
         if not text:
@@ -578,7 +578,7 @@ class LLMProcessor:
         direct = parts[0]
         details = []
         for p in parts[1:]:
-            p2 = p.strip("-• \t\n\r")
+            p2 = p.strip("-� \t\n\r")
             if p2:
                 details.append(p2)
             if len(details) >= 4:
@@ -1763,7 +1763,7 @@ class LLMProcessor:
                     content_chunk = chunk.choices[0].delta.content
                     thinking_response += content_chunk
                     # Stream the thinking content to the UI
-                    yield self._sanitize_output_text(content_chunk)
+                    yield self._sanitize_output_text(content_chunk, trim_outer=False)
             
             trace.log("THINKING_COMPLETE", f"chars={len(thinking_response)}")
             
@@ -1849,7 +1849,7 @@ class LLMProcessor:
                             if r_tokens:
                                 yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, "content", None):
-                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content)
+                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                             pass2_output += out_chunk
                             if not pass2_followups_preview_sent:
                                 preview_payload = self._build_followup_payload(pass2_output, mode, session_id, persist=False)
@@ -2040,7 +2040,7 @@ class LLMProcessor:
                                 in_reasoning = True
                                 trace.log("REASONING_START", f"model={model_to_use} (built-in)")
                                 yield "[THINKING]"
-                            yield self._sanitize_output_text(reasoning)
+                            yield self._sanitize_output_text(reasoning, trim_outer=False)
                         else:
                             if not in_reasoning:
                                 in_reasoning = True
@@ -2053,7 +2053,7 @@ class LLMProcessor:
                     trace.log("REASONING_COMPLETE", "built-in reasoning done")
                     if emit_raw_reasoning:
                         yield "[/THINKING]"
-                sanitized_chunk = self._sanitize_output_text(delta.content)
+                sanitized_chunk = self._sanitize_output_text(delta.content, trim_outer=False)
                 streamed_output += sanitized_chunk
                 if not followups_preview_sent:
                     preview_payload = self._build_followup_payload(streamed_output, mode, session_id, persist=False)
@@ -2469,7 +2469,7 @@ class LLMProcessor:
                 model_to_use=model_to_use,
                 create_kwargs=create_kwargs
             ):
-                yield self._sanitize_output_text(token)
+                yield self._sanitize_output_text(token, trim_outer=False)
             
             # --- Synthesis Pass: Convert tool results into readable output ---
             # Extract tool results from messages (added by graph scheduler)
@@ -2523,7 +2523,7 @@ class LLMProcessor:
                                 yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                         if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
                             token_count += 1
-                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content)
+                            out_chunk = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                             synthesis_output += out_chunk
                             if not synthesis_followups_preview_sent:
                                 preview_payload = self._build_followup_payload(synthesis_output, mode, session_id, persist=False)
@@ -2632,7 +2632,7 @@ class LLMProcessor:
                         if r_tokens:
                             yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
-                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                         step_output += token
                         if not suppress_step_stream:
                             clean_chunk = strip_execution_narration(token)
@@ -2868,7 +2868,7 @@ class LLMProcessor:
                         if r_tokens:
                             yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
-                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                         full_response += token
                         yield token
                 break
@@ -2908,7 +2908,7 @@ Rules:
                         if r_tokens:
                             yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                     if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
-                        token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                        token = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                         full_response += token
                         yield token
             except Exception as final_err:
@@ -2946,7 +2946,7 @@ Rules:
                     if r_tokens:
                         yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
                 if hasattr(chunk, "choices") and chunk.choices and getattr(chunk.choices[0].delta, 'content', None):
-                    token = self._sanitize_output_text(chunk.choices[0].delta.content)
+                    token = self._sanitize_output_text(chunk.choices[0].delta.content, trim_outer=False)
                     full_response += token
                     yield token
 
@@ -3018,6 +3018,9 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
 
 
 
