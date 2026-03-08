@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - FastAPI Main Application
 Production-grade ChatGPT-style API with REST and WebSocket support
 """
@@ -119,7 +119,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! Execution cleanup init failed: {e}")
 
-    # ðŸ”§ API WARMUP: Pre-warm OpenRouter TLS/DNS pools to eliminate cold start latency
+    # Ã°Å¸â€Â§ API WARMUP: Pre-warm OpenRouter TLS/DNS pools to eliminate cold start latency
     try:
         async def _warmup_api():
             try:
@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[Startup] ! API warmup task init failed: {e}")
 
-    # ðŸ”§ WEAVIATE WARMUP: Pre-connect to Weaviate Cloud for vector memory
+    # Ã°Å¸â€Â§ WEAVIATE WARMUP: Pre-connect to Weaviate Cloud for vector memory
     try:
         async def _warmup_weaviate():
             try:
@@ -251,7 +251,7 @@ async def agent_metrics():
 async def agent_cancel(request: Request):
     """
     Cancel a running agent execution for a given chat session.
-    Enables interrupt safety â€” frontend calls this before sending a new prompt.
+    Enables interrupt safety Ã¢â‚¬â€ frontend calls this before sending a new prompt.
     """
     body = await request.json()
     user_id = body.get("user_id", "")
@@ -436,7 +436,7 @@ Keep it concise but informative. Write in third person (e.g., "User is..."). If 
     except Exception as e:
         print(f"[MemorySummary] Error: {e}")
         # Fallback: just list them
-        fallback = "\n".join([f"â€¢ {m.content}" for m in memories[:20]])
+        fallback = "\n".join([f"Ã¢â‚¬Â¢ {m.content}" for m in memories[:20]])
         return {"status": "success", "summary": fallback, "memory_count": len(memories)}
 
 @app.patch("/api/memories/{user_id}/{memory_id}")
@@ -539,7 +539,7 @@ async def circuit_breaker_gate():
         logger = get_event_logger()
         from app.observability.event_types import EventType
         logger.emit(EventType.ANOMALY_ALERT, {
-            "reason": "Circuit open â€” execution blocked",
+            "reason": "Circuit open Ã¢â‚¬â€ execution blocked",
             "signal": signal,
         })
         return JSONResponse(
@@ -590,7 +590,7 @@ async def governance_gate(user_id: str, tier: str = "free"):
     Reusable governance gate. Call before any LLM execution.
     Returns None if allowed, or a JSONResponse with error if blocked.
 
-    Chain: rate_limiter â†’ quota_manager â†’ spend_guard
+    Chain: rate_limiter Ã¢â€ â€™ quota_manager Ã¢â€ â€™ spend_guard
     """
     # 1. Burst rate limit
     limiter = get_rate_limiter()
@@ -768,7 +768,7 @@ async def resume_task(task_id: str, request: ResumeRequest, req: Request, user_i
             effective_settings = get_user_settings(user_id)
             
             # Fire LLM (passing resume_graph into kwargs)
-            stream_moderator = StreamingOutputModerator()
+            stream_moderator = StreamingOutputModerator(query=request.message)
             async for token in llm_processor.process_message_stream(
                 user_query=augmented_message,
                 mode="normal",
@@ -1079,7 +1079,7 @@ async def chat_stream(request: ChatRequest, req: Request, user_info: dict = Depe
     async def generate():
         store = None
         try:
-            # ðŸš€ Force flush buffer immediately with padding (1KB)
+            # Ã°Å¸Å¡â‚¬ Force flush buffer immediately with padding (1KB)
             # This helps in environments like Vercel/Nginx/Render that buffer responses
             yield ": " + (" " * 1024) + "\n\n"
 
@@ -1126,7 +1126,7 @@ async def chat_stream(request: ChatRequest, req: Request, user_info: dict = Depe
             store = get_usage_store()
             store.increment_concurrent(user_id)
             stream_generator = None
-            stream_moderator = StreamingOutputModerator()
+            stream_moderator = StreamingOutputModerator(query=request.message)
             try:
                 stream_generator = llm_processor.process_message_stream(
                     request.message,
@@ -1425,6 +1425,9 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+
+
+
 
 
 

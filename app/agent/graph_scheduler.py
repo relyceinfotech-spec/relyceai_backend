@@ -1,4 +1,4 @@
-"""
+﻿"""
 Deterministic Graph Scheduler
 Executes a PlanGraph strictly sequentially. 
 Never executes nodes in parallel, but evaluates dependency clearance dynamically.
@@ -109,8 +109,6 @@ async def run_plan_graph(
                 step_output += token
                 if "TOOL_CALL" in step_output:
                     is_tool_call = True
-                if not is_tool_call:
-                    yield token
 
         # Intercept tool parsing
         while "TOOL_CALL:" in step_output:
@@ -246,3 +244,6 @@ async def run_plan_graph(
     
     if transaction_active and graph.is_fully_completed():
         commit_transaction(session_id, graph.graph_id)
+
+
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -327,7 +327,16 @@ def _single_file_html_instruction() -> str:
         "- Output one fenced code block only, language html\n"
         "- Ensure valid tags: <title> and <link rel=\"stylesheet\" ...> must be complete\n"
     )
-def _resolve_runtime_intent(mode: str, routed_intent: str) -> str:
+
+def _is_factual_lookup_query(query: str) -> bool:
+    q = (query or "").lower()
+    patterns = [
+        "who is", "founder", "ceo", "board", "affiliation", "cbse", "matric",
+        "address", "phone", "website", "price", "current", "latest", "today",
+        "how many", "when was", "incorporated", "din", "cin",
+    ]
+    return any(p in q for p in patterns)
+def _resolve_runtime_intent(mode: str, routed_intent: str, query: str = "") -> str:
     """
     Execution intent policy by mode:
     - agent/business: always structured agent path
@@ -497,13 +506,20 @@ class LLMProcessor:
         sanitized = sanitized.replace("\u2014", " - ").replace("\u2013", " - ")
         sanitized = re.sub(r"^\s*TOOL\b[#:\-\s]*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*_?CALL\s*:\s*.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*TOOL_CALL\s*:\s*.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*Assistant:\s*First,.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*First,\s*the user.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*You have completed all required execution steps\.?\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*WEB SEARCH\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         # Strip raw tool dump artifacts so users only see the final answer.
         sanitized = re.sub(r"^\s*(Title|Snippet Details|Link|Source Link|Copy text|Export)\s*[:\-]?.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*##\s*Verification.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*(Verification Report|Accuracy Assessment|Completeness Assessment|Uncertainties|Improvements Recommended).*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
 
-        return sanitized
+        return sanitized.strip()
 
     def _fix_html_css_output(self, text: str) -> str:
         if not text:
@@ -536,6 +552,43 @@ class LLMProcessor:
         
         return content
 
+
+    def _format_user_answer(self, text: str, mode: str) -> str:
+        """Normalize final user-facing output into clear concise markdown blocks."""
+        cleaned = self._sanitize_output_text(text or "")
+        if not cleaned:
+            return cleaned
+
+        # Preserve code-heavy answers.
+        if "```" in cleaned:
+            return cleaned
+
+        # Keep already-structured markdown.
+        if re.search(r"(?m)^##\s+", cleaned):
+            return cleaned
+
+        # Very short casual replies should stay natural.
+        if len(cleaned.split()) <= 12 and "?" not in cleaned:
+            return cleaned
+
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned) if p.strip()]
+        if not parts:
+            return cleaned
+
+        direct = parts[0]
+        details = []
+        for p in parts[1:]:
+            p2 = p.strip("-• \t\n\r")
+            if p2:
+                details.append(p2)
+            if len(details) >= 4:
+                break
+
+        if not details:
+            return f"## Direct Answer\n{direct}"
+
+        bullets = "\n".join(f"- {d}" for d in details)
+        return f"## Direct Answer\n{direct}\n\n## Key Details\n{bullets}"
     def _sanitize_followups(self, items: List[str]) -> List[str]:
         cleaned: List[str] = []
         seen: set = set()
@@ -923,7 +976,7 @@ class LLMProcessor:
         routed_intent = analysis.get("intent", "DEEP_SEARCH")
         sub_intent = analysis.get("sub_intent", "general")
         emotions = analysis.get("emotions", [])
-        intent = _resolve_runtime_intent(mode, routed_intent)
+        intent = _resolve_runtime_intent(mode, routed_intent, user_query)
         
         import time as _time
         _start = _time.time()
@@ -965,7 +1018,7 @@ class LLMProcessor:
                 emotional_instruction=emotional_instruction,
                 session_id=session_id
             )
-            result_response = self._sanitize_output_text(response_text)
+            result_response = self._format_user_answer(response_text, mode)
         elif intent == "AGENT":
             # Run structured agent pipeline even for non-stream requests
             import time as _time
@@ -986,7 +1039,7 @@ class LLMProcessor:
                     continue
                 _agent_tokens.append(token)
             response_text = "".join(_agent_tokens)
-            result_response = self._sanitize_output_text(response_text)
+            result_response = self._format_user_answer(response_text, mode)
         else:
             response_text, tools = await self.process_deep_search_query(
                 user_query, mode, context_messages, personality, user_settings, 
@@ -995,7 +1048,7 @@ class LLMProcessor:
                 emotional_instruction=emotional_instruction,
                 session_id=session_id
             )
-            result_response = self._sanitize_output_text(response_text)
+            result_response = self._format_user_answer(response_text, mode)
 
         # Optional verification loop for complex business/agent outputs.
         if self._should_run_verifier(mode, user_query, result_response):
@@ -1125,7 +1178,7 @@ class LLMProcessor:
         routed_intent = analysis.get("intent", "DEEP_SEARCH")
         selected_tools = analysis.get("tools", [])
         sub_intent = analysis.get("sub_intent", "general")
-        intent = _resolve_runtime_intent(mode, routed_intent)
+        intent = _resolve_runtime_intent(mode, routed_intent, user_query)
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
@@ -2864,7 +2917,7 @@ Rules:
 
         # --- Failure Transparency: Internal-First ---
         # Inject degradation note into prompt, let LLM phrase it naturally
-        if exec_ctx.degraded:
+        # Do not emit an additional second answer pass to users; it causes duplicated/confusing output.`r`n        if False and exec_ctx.degraded:
             degradation_note = "[INTERNAL] Execution note: "
             if exec_ctx.forced_finalize:
                 degradation_note += "Response was finalized before all steps could complete. "
@@ -2965,6 +3018,15 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
+
+
+
+
+
+
 
 
 

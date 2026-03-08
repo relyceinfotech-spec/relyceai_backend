@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - WebSocket Manager
 Multi-device safe WebSocket implementation
 """
@@ -52,7 +52,7 @@ class ConnectionManager:
     Multi-device safe connection manager.
 
     Key Design (from architecture):
-    - One user â†’ Multiple devices â†’ Multiple WebSocket connections â†’ SAME chat_id
+    - One user Ã¢â€ â€™ Multiple devices Ã¢â€ â€™ Multiple WebSocket connections Ã¢â€ â€™ SAME chat_id
     - Connections are organized by (user_id, chat_id) to prevent cross-user leakage
     - This allows multiple devices for the same user to connect to the same chat and receive synced responses
     """
@@ -170,7 +170,7 @@ class ConnectionManager:
                 "connected_at": datetime.now().isoformat()
             }
 
-        print(f"[WS] âœ… Connected: {connection_id} to chat {chat_id} (user={user_id})")
+        print(f"[WS] Ã¢Å“â€¦ Connected: {connection_id} to chat {chat_id} (user={user_id})")
         print(f"[WS] Active connections for chat {chat_id} (user={user_id}): {len(self.active_connections[chat_key])}")
 
         return connection_id
@@ -203,7 +203,7 @@ class ConnectionManager:
             # Remove connection info
             del self.connection_info[connection_id]
 
-        print(f"[WS] âŒ Disconnected: {connection_id} from chat {chat_id}")
+        print(f"[WS] Ã¢ÂÅ’ Disconnected: {connection_id} from chat {chat_id}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket) -> None:
         """Send message to a specific connection"""
@@ -282,7 +282,7 @@ class ConnectionManager:
         Used for real-time streaming responses.
         
         NOTE: Bypasses Redis _publish_broadcast intentionally.
-        Tokens are ephemeral â€” cross-node fan-out adds per-token overhead
+        Tokens are ephemeral Ã¢â‚¬â€ cross-node fan-out adds per-token overhead
         that directly increases visible streaming latency.
         Only the 'done' and 'info' signals use full broadcast_to_chat.
         """
@@ -483,7 +483,7 @@ async def handle_websocket_message(
         json.dumps({"type": "info", "content": "processing"})
     )
     
-    # ðŸš€ Send immediate empty token to instantly transition UI from 'loading' to 'streaming' state
+    # Ã°Å¸Å¡â‚¬ Send immediate empty token to instantly transition UI from 'loading' to 'streaming' state
     await manager.stream_to_chat(chat_key, "\u200B")
     
     # Extract and store user facts (Run in background to not block)
@@ -519,9 +519,9 @@ async def handle_websocket_message(
     # Stream response to all connected devices
     full_response = ""
     stream_generator = None
-    stream_moderator = StreamingOutputModerator()
+    stream_moderator = StreamingOutputModerator(query=content)
     
-    # ðŸ”§ BACKPRESSURE: Bounded queue between LLM producer and WebSocket consumer
+    # Ã°Å¸â€Â§ BACKPRESSURE: Bounded queue between LLM producer and WebSocket consumer
     # If client is slow, queue fills up and naturally throttles the model stream
     BACKPRESSURE_QUEUE_SIZE = 128
     token_queue = asyncio.Queue(maxsize=BACKPRESSURE_QUEUE_SIZE)
@@ -665,7 +665,7 @@ async def handle_websocket_message(
         asyncio.create_task(save_history_background())
 
         # === Memory Extraction (background, rate-limited, 3s timeout) ===
-        # Skip if response too short (~40 tokens â‰ˆ 200 chars) â€” trivial replies produce junk
+        # Skip if response too short (~40 tokens Ã¢â€°Ë† 200 chars) Ã¢â‚¬â€ trivial replies produce junk
         if user_id and user_id != "anonymous" and full_response and len(full_response) > 200:
             async def _extract_vector_memory():
                 async with _EXTRACTION_SEMAPHORE:
@@ -752,6 +752,7 @@ async def handle_websocket_message(
         # Release agent concurrency lock
         _uid_cleanup = (user_id or "anonymous")
         _agent_active_requests.discard(_uid_cleanup)
+
 
 
 
