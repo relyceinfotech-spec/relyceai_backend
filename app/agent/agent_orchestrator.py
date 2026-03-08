@@ -311,8 +311,8 @@ async def run_agent_pipeline(
         is_time_sensitive=temporal.is_time_sensitive,
         autonomy_action=autonomy.action,
     )
-    
-    if intent == "INTERNAL" or sub_intent == "casual_chat":
+    # Keep tools enabled for INTERNAL factual/task queries; only casual chat stays tool-free.
+    if sub_intent == "casual_chat":
         result.tool_allowed = False
         result.allowed_tools = []
 

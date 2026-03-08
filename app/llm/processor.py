@@ -1985,7 +1985,6 @@ class LLMProcessor:
                     print(f"[RECOVERY] Provider error (attempt 1): {api_err}. Retrying in {wait_time}s...")
                     yield "[INFO]{\"provider_retry\": true}"
                     await asyncio.sleep(wait_time)
-                    continue
                 else:
                     print(f"[RECOVERY] Provider error (final): {api_err}")
                     yield f"?? The AI provider is temporarily unavailable. Please try again in a moment.\n\n*Error: {type(api_err).__name__}*"
@@ -2110,15 +2109,16 @@ class LLMProcessor:
             parse_tool_calls, execute_tool, format_tool_result,
             ExecutionContext,
         )
-
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
-        MIN_AGENT_STEPS = 3   # Ensure multi-pass verification before final answer
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
         is_casual_query = _is_casual_query(user_query)
-        if is_casual_query:
-            MIN_AGENT_STEPS = 1
         is_profile_query = _is_profile_query(user_query)
-        if is_profile_query:
+
+        # Adaptive verification depth to avoid meta-verification loops on simple prompts.
+        MIN_AGENT_STEPS = 1
+        if _is_factual_lookup_query(user_query) or self._estimate_query_complexity(user_query) > 0.58:
+            MIN_AGENT_STEPS = 3
+        if is_casual_query or is_profile_query:
             MIN_AGENT_STEPS = 1
 
         if _is_recall_query(user_query):
@@ -2728,7 +2728,6 @@ class LLMProcessor:
                         _loop_broken = True
                         break
                 if _loop_broken:
-                    continue
 
                 print(f"[Agent] Executing {len(valid_calls)} tools in PARALLEL: {[tc.name for tc in valid_calls]} "
                       f"[total calls: {exec_ctx.tool_calls_made}/{MAX_TOTAL_TOOL_CALLS}]")
@@ -2832,7 +2831,6 @@ class LLMProcessor:
                             "Prioritize official registries, company pages, and LinkedIn. Output ONLY TOOL_CALL."
                         ),
                     })
-                    continue
             if not tool_detected:
                 # Enforce multi-pass verification even if an answer exists
                 if step_count < MIN_AGENT_STEPS:
@@ -2840,13 +2838,14 @@ class LLMProcessor:
                     messages.append({
                         "role": "user",
                         "content": (
-                            "Verify the above answer for accuracy and completeness. "
-                            "If this is an external factual query and no tools were used yet, call tools now instead of rewriting. "
-                            "If anything is unclear, missing, or uncertain, improve it or call tools. "
-                            "Do not finalize yet."
+                            "Refine only if needed for factual accuracy and completeness. "
+                            "If this is a factual query and no tools were used yet, call tools now instead of rewriting. "
+                            "If the answer is already sufficient, finalize directly. "
+                            "Never output meta-verification reports or self-audits."
                         )
                     })
                     continue
+
 
                 # No tool call ? stream completed naturally
                 full_response += step_output
