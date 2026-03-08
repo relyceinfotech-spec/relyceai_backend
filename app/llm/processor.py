@@ -517,6 +517,8 @@ class LLMProcessor:
         sanitized = re.sub(r"^\s*(Title|Snippet Details|Link|Source Link|Copy text|Export)\s*[:\-]?.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*##\s*Verification.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*(Verification Report|Accuracy Assessment|Completeness Assessment|Uncertainties|Improvements Recommended).*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*.*tools?\s+disabled.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*.*no external fetches possible.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
 
         return sanitized.strip() if trim_outer else sanitized
@@ -1326,10 +1328,10 @@ class LLMProcessor:
         if intent == "INTERNAL":
             _query_plan = {"needs_web": False, "needs_memory": False, "needs_chunking": False, "task_type": "general_chat"}
 
-        needs_retrieval = intent in ("DEEP_SEARCH", "EXTERNAL")
+        factual_lookup = _is_factual_lookup_query(user_query)
+        needs_retrieval = intent in ("DEEP_SEARCH", "EXTERNAL") or factual_lookup
         if needs_retrieval:
             _query_plan["needs_web"] = True
-
         # Phase 2: Researching
         if needs_retrieval:
             yield f'[INFO]{{"agent_state": "researching", "topic": "Fetching relevant context"}}'
@@ -2447,18 +2449,15 @@ class LLMProcessor:
             
             # Seed state with new graph snapshot
             update_task_graph(session_id, task_id, plan_graph.serialize(), new_status="RUNNING")
-            
             create_kwargs = {
                 "model": model_to_use,
                 "messages": messages,
                 "temperature": temperature,
                 "stream": True
             }
-            
+
             graph_messages_start_len = len(messages)
-            print("\n\n--- GRAPH MESSAGES DUMP ---")
-            print(repr(messages))
-            print("---------------------------\n\n")
+            # Graph prompt dump disabled in production logs.
             
             async for token in run_plan_graph(
                 graph=plan_graph,

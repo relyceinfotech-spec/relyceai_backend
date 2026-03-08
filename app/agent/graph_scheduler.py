@@ -110,6 +110,18 @@ async def run_plan_graph(
                 if "TOOL_CALL" in step_output:
                     is_tool_call = True
 
+        factual_markers = ("who is", "founder", "ceo", "affiliation", "cbse", "matric", "price", "latest", "today", "current")
+        q_low = (user_query or "").lower()
+        needs_forced_tool = any(m in q_low for m in factual_markers)
+        if agent_result.tool_allowed and needs_forced_tool and "TOOL_CALL:" not in step_output:
+            messages.append({"role": "assistant", "content": step_output})
+            messages.append({
+                "role": "user",
+                "content": "Factual query detected. Output ONLY one TOOL_CALL now. Use search_web first.",
+            })
+            node.status = NodeStatus.PENDING
+            continue
+
         # Intercept tool parsing
         while "TOOL_CALL:" in step_output:
             first_call_idx = step_output.find("TOOL_CALL:")
