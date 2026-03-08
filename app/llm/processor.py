@@ -520,6 +520,9 @@ class LLMProcessor:
         
         sanitized = text
         sanitized = sanitized.replace("\u2014", " - ").replace("\u2013", " - ")
+        # Remove mojibake emoji artifacts (e.g., "ðŸ¤”", "ðŸš€") caused by encoding mismatch.
+        sanitized = re.sub(r"ðŸ[\x80-\xBF]{2,4}", "", sanitized)
+        sanitized = re.sub(r"Ã[\x80-\xBF]+", "", sanitized)
         sanitized = re.sub(r"^\s*TOOL\b[#:\-\s]*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*TOOL#\s*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*_?CALL\s*:\s*.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
@@ -3054,6 +3057,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 

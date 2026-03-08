@@ -812,7 +812,7 @@ async def analyze_and_route_query(
         "hey macha", "hi macha", "macha", "da", "bro", "hey bro", "hi bro", "machan", "dei",
         "vanakkam", "namaste", "kya haal", "wassup", "whats up", "howdy"
     ]
-    if (q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list)) and not _has_tech_intent(q):
+    if (q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list)) and len(q.split()) <= 3 and not _has_tech_intent(q):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 1.1 Tamil/Tanglish Casual Questions - FAST PATH
@@ -1317,6 +1317,7 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 4. Do NOT include Sources or meta-content for casual conversation.
 5. AVOID using em-dashes (â€”), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
    In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
+
 
 
 
