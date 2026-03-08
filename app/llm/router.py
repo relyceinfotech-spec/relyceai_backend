@@ -802,6 +802,7 @@ async def analyze_and_route_query(
         
     # âš¡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
+    q_compact = re.sub(r"[!?.,;:]+$", "", q).strip()
     factual_markers = [
         "who is", "founder", "ceo", "owner", "board", "affiliation", "cbse",
         "matric", "matriculation", "address", "price", "latest", "today",
@@ -833,6 +834,11 @@ async def analyze_and_route_query(
         and any(m in q for m in explanation_markers)
         and len(q.split()) >= 3
     )
+
+    # Priority rule: explanation intent must win over slang/casual markers.
+    if force_non_casual:
+        non_casual_emotions = [e for e in detected_emotions if e != "casual"]
+        return {"intent": "INTERNAL", "sub_intent": "general", "tools": [], "emotions": non_casual_emotions}
     if is_tanglish and not is_factual_query and not is_structured_info_query and not force_non_casual:
         print(f"[Router] ðŸ•µï¸ Tanglish detected! Force Casual Mode.")
         # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
@@ -851,15 +857,12 @@ async def analyze_and_route_query(
         return any(k in query for k in tech_intent_keywords)
     
     # 1. Greetings (Strict Internal -> Casual) - FAST PATH, no LLM needed
-    greeting_list = [
-        "hi", "hello", "hey", "test", "ping", "hola", "greetings", "hii", "hiii", "yo", "sup",
-        # Tanglish / Indian greetings
-        "hey macha", "hi macha", "macha", "da", "bro", "hey bro", "hi bro", "machan", "dei",
-        "vanakkam", "namaste", "kya haal", "wassup", "whats up", "howdy"
-    ]
-    if (q in greeting_list or any(q.startswith(g + " ") or q == g for g in greeting_list)) and len(q.split()) <= 3 and not _has_tech_intent(q):
+    greeting_only = {
+        "hi", "hello", "hey", "yo", "sup", "hola", "greetings",
+        "macha", "bro", "machan", "dei", "da", "vanakkam", "namaste", "howdy"
+    }
+    if q_compact in greeting_only and not _has_tech_intent(q):
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
-
     # 1.1 Tamil/Tanglish Casual Questions - FAST PATH
     # Catches common personal/conversational questions in Tamil
     tamil_casual_patterns = [
