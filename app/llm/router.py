@@ -766,6 +766,12 @@ async def analyze_and_route_query(
         
     # âš¡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
+    factual_markers = [
+        "who is", "founder", "ceo", "owner", "board", "affiliation", "cbse",
+        "matric", "matriculation", "address", "price", "latest", "today",
+        "current", "when was", "incorporated", "registered", "school", "college"
+    ]
+    is_factual_query = any(m in q for m in factual_markers)
 
     # 1.0 Explicit Tanglish Detection (Heuristic)
     # Detects common Tanglish markers to force casual mode + Tanglish instruction
@@ -777,7 +783,7 @@ async def analyze_and_route_query(
         " theriyala", " theriyuma", " enaku", " unaku", " namaku"
     ]
     is_tanglish = any(m in q for m in tanglish_markers)
-    if is_tanglish:
+    if is_tanglish and not is_factual_query:
         print(f"[Router] ðŸ•µï¸ Tanglish detected! Force Casual Mode.")
         # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
         # But for 'Explain Quantum Physics', we want INTENT=INTERNAL, SUB=general (or reasoning), but TONE=Casual.
@@ -835,7 +841,12 @@ async def analyze_and_route_query(
         "reviews", "rating", "buy", "cost", "deal", "discount", "release",
         "near me", "nearby", "address", "map", "open now", "hours", "schedule"
     ]
-    if len(q) < 40 and not any(sk in q for sk in search_intent_keywords) and not _has_tech_intent(q):
+    if (
+        len(q) < 40
+        and not any(sk in q for sk in search_intent_keywords)
+        and not _has_tech_intent(q)
+        and not is_factual_query
+    ):
         # Likely a casual conversational question - don't waste time on external search
         # The LLM can answer personal/casual questions without web data
         if "?" in q or q.endswith("?"):
@@ -1301,5 +1312,4 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 4. Do NOT include Sources or meta-content for casual conversation.
 5. AVOID using em-dashes (â€”), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
    In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
-
 

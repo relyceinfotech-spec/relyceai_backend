@@ -16,6 +16,7 @@ that orchestrates the full 16-layer decision pipeline.
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, AsyncGenerator
 
@@ -312,7 +313,13 @@ async def run_agent_pipeline(
         autonomy_action=autonomy.action,
     )
     # Keep tools enabled for INTERNAL factual/task queries; only casual chat stays tool-free.
-    if sub_intent == "casual_chat":
+    is_factual_query = bool(
+        re.search(
+            r"\b(who is|founder|ceo|owner|board|affiliation|cbse|matric|matriculation|address|price|latest|today|current|when was|incorporated|registered)\b",
+            user_query.lower(),
+        )
+    )
+    if sub_intent == "casual_chat" and not is_factual_query:
         result.tool_allowed = False
         result.allowed_tools = []
 
@@ -587,13 +594,4 @@ def _build_ask_message(action: ActionDecision) -> str:
         msg += "- Could you be more specific about what you'd like me to do?\n"
 
     return msg
-
-
-
-
-
-
-
-
-
 

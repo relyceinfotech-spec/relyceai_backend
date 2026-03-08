@@ -345,6 +345,8 @@ def _resolve_runtime_intent(mode: str, routed_intent: str, query: str = "") -> s
     if mode in {"agent", "business"}:
         return "AGENT"
     if mode == "normal":
+        if _is_factual_lookup_query(query):
+            return "AGENT"
         if routed_intent in {"DEEP_SEARCH", "EXTERNAL"}:
             return routed_intent
         return "INTERNAL"
@@ -2184,6 +2186,12 @@ class LLMProcessor:
             ]
             if not agent_result.allowed_tools:
                 agent_result.tool_allowed = False
+        # Force tool availability for factual lookups in agent execution.
+        if _is_factual_lookup_query(user_query) and not is_casual_query:
+            agent_result.tool_allowed = True
+            for _tool in ["search_web", "search_company", "search_legal", "search_documents", "get_current_time"]:
+                if _tool not in agent_result.allowed_tools:
+                    agent_result.allowed_tools.append(_tool)
         # Override tool classification if we are resuming a deterministic graph node
         if resume_graph:
             agent_result.tool_allowed = True
@@ -2832,20 +2840,18 @@ class LLMProcessor:
                         ),
                     })
             if not tool_detected:
-                # Enforce multi-pass verification even if an answer exists
+                # Optional second pass for harder queries only; avoid recursive self-verification prompts.
                 if step_count < MIN_AGENT_STEPS:
                     messages.append({"role": "assistant", "content": step_output})
                     messages.append({
-                        "role": "user",
+                        "role": "system",
                         "content": (
-                            "Refine only if needed for factual accuracy and completeness. "
-                            "If this is a factual query and no tools were used yet, call tools now instead of rewriting. "
-                            "If the answer is already sufficient, finalize directly. "
-                            "Never output meta-verification reports or self-audits."
+                            "If more evidence is required for factual claims, call an appropriate tool now. "
+                            "Otherwise finalize in the next response. "
+                            "Do not output verification summaries, self-audits, or process commentary."
                         )
                     })
                     continue
-
 
                 # No tool call ? stream completed naturally
                 full_response += step_output
@@ -2927,7 +2933,8 @@ Rules:
 
         # --- Failure Transparency: Internal-First ---
         # Inject degradation note into prompt, let LLM phrase it naturally
-        # Do not emit an additional second answer pass to users; it causes duplicated/confusing output.`r`n        if False and exec_ctx.degraded:
+        # Do not emit an additional second answer pass to users; it causes duplicated/confusing output.
+        if False and exec_ctx.degraded:
             degradation_note = "[INTERNAL] Execution note: "
             if exec_ctx.forced_finalize:
                 degradation_note += "Response was finalized before all steps could complete. "
@@ -3028,55 +3035,4 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
