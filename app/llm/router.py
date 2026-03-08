@@ -299,7 +299,12 @@ You must strictly follow this visual structure. Do NOT use numbered lists (1, 2,
 
 NORMAL_SYSTEM_PROMPT = """You are a clear and structured explainer.
 
-Always respond using this exact format:
+You MUST follow the exact output structure below for every explanation response.
+Do NOT write free-form paragraphs outside the sections.
+Do NOT use emojis.
+Do NOT use conversational slang.
+
+Required output format:
 
 # Title
 
@@ -315,12 +320,25 @@ Short explanation in 2-3 sentences.
 ## Takeaway
 One concise conclusion.
 
-Rules:
-- Keep it rigid and consistent.
-- Use markdown headings and bullets only.
-- Do not add formatting alternatives or style options.
-- Do not output meta-verification/process commentary.
-- Do not force emojis.
+If your draft does not match the format, rewrite it until it does.
+
+Example response:
+
+# Quantum Computer
+
+A quantum computer uses qubits that can represent multiple states at once. This enables specific classes of problems to be solved more efficiently than on classical systems.
+
+## Key Points
+- Uses qubits instead of classical bits
+- Relies on superposition and entanglement
+- Useful for optimization, simulation, and cryptography research
+
+## Example (optional)
+Classical bit: 0 or 1
+Qubit: can encode a superposition of 0 and 1 before measurement
+
+## Takeaway
+Quantum computers are specialized, still early-stage systems with high long-term impact.
 """
 
 BUSINESS_SYSTEM_PROMPT = f"""You are **Relyce AI**, an elite strategic advisor.
@@ -846,7 +864,7 @@ async def analyze_and_route_query(
         "nalla irruke", "nalla iruken", "nalla iruka", "saptiya", "saptacha",
         "eppadi iruka", "nalama", "soukyama", "sughama", "yenna panra"
     ]
-    if any(tp in q for tp in tamil_casual_patterns):
+    if any(tp in q for tp in tamil_casual_patterns) and not is_structured_info_query and not is_factual_query:
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
     
     # 1.2 "Who created you" - FAST PATH

@@ -808,6 +808,8 @@ class LLMProcessor:
                     from app.llm.router import NORMAL_MARKDOWN_POLISH
                     system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
 
+        strict_structured_mode = mode == "normal" and sub_intent == "general" and not personality
+
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
@@ -815,14 +817,14 @@ class LLMProcessor:
         if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
             system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
         # Apply Emotion/Tone Instruction
-        if emotional_instruction:
-            system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
-        else:
-            # Fallback to multi-label static map
-            for emotion in emotions:
-                if emotion in TONE_MAP:
-                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
-             
+        if not strict_structured_mode:
+            if emotional_instruction:
+                system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+            else:
+                # Fallback to multi-label static map
+                for emotion in emotions:
+                    if emotion in TONE_MAP:
+                        system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"             
         # Check for Coding Buddy override
         model_to_use = self.model
         if sub_intent in UI_SUB_INTENTS:
@@ -1188,6 +1190,7 @@ class LLMProcessor:
         sub_intent = analysis.get("sub_intent", "general")
         intent = _resolve_runtime_intent(mode, routed_intent, user_query)
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
+        strict_structured_mode = mode == "normal" and sub_intent == "general" and not personality
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
@@ -1250,10 +1253,10 @@ class LLMProcessor:
 
         # Apply Emotion/Tone Instruction (Streaming Path - Multi-Label)
         emotions = analysis.get("emotions", [])
-        for emotion in emotions:
-            if emotion in TONE_MAP:
-                system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"
-        
+        if not strict_structured_mode:
+            for emotion in emotions:
+                if emotion in TONE_MAP:
+                    system_prompt = f"{system_prompt}\n\n{TONE_MAP[emotion]}"        
         # === Intelligence Layer (Streaming) ===
         # Strategy Memory
         strategy_instruction = None
@@ -1277,37 +1280,37 @@ class LLMProcessor:
             asyncio.create_task(emotion_engine.save_state(session_id, state, user_id=user_id))
             skill_level = state.skill_level
             
-            # Get dynamic instruction
-            emotional_instruction = emotion_engine.get_instruction(state)
-            if emotional_instruction:
-                print(f"[EmotionEngine] Injecting instruction")
-                system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
+            if not strict_structured_mode:
+                # Get dynamic instruction
+                emotional_instruction = emotion_engine.get_instruction(state)
+                if emotional_instruction:
+                    print(f"[EmotionEngine] Injecting instruction")
+                    system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
 
-            # === Frustration Prediction (Priority #6) ===
-            frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
-            proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
-            if proactive_instruction:
-                system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
+                # === Frustration Prediction (Priority #6) ===
+                frustration_prob = emotion_engine.predict_frustration(state, user_query, sub_intent)
+                proactive_instruction = emotion_engine.get_proactive_instruction(frustration_prob)
+                if proactive_instruction:
+                    system_prompt = f"{system_prompt}\n\n{proactive_instruction}"
 
-            # === Autonomous Debug Mode (Priority #5) ===
-            if debug_agent.should_activate(emotions, state, sub_intent):
-                is_debug_mode = True
-                debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
-                system_prompt = f"{system_prompt}\n\n{debug_prompt}"
-                yield debug_agent.get_info_message()
-
+                # === Autonomous Debug Mode (Priority #5) ===
+                if debug_agent.should_activate(emotions, state, sub_intent):
+                    is_debug_mode = True
+                    debug_prompt = debug_agent.get_debug_system_prompt(sub_intent)
+                    system_prompt = f"{system_prompt}\n\n{debug_prompt}"
+                    yield debug_agent.get_info_message()
         # === User Profiler (Priority #2) ===
-        if user_id and user_profile:
+        if not strict_structured_mode and user_id and user_profile:
             personalization = user_profiler.get_personalization_instruction(user_profile)
             if personalization:
                 system_prompt = f"{system_prompt}\n\n{personalization}"
 
         # Inject strategy instruction
-        if strategy_instruction:
+        if not strict_structured_mode and strategy_instruction:
             system_prompt = f"{system_prompt}\n\n{strategy_instruction}"
 
         # Inject prompt variant
-        if prompt_variant_instruction:
+        if not strict_structured_mode and prompt_variant_instruction:
             system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
 
         # === SAFE CHAT AGENT: Constraint Analysis (Steps 1-11) ===
