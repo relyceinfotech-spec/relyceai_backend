@@ -824,7 +824,16 @@ async def analyze_and_route_query(
         "difference", "compare", "guide", "steps", "why", "quantum", "computer", "algorithm"
     ]
     is_structured_info_query = any(m in q for m in structured_info_markers) and len(q.split()) >= 4
-    if is_tanglish and not is_factual_query and not is_structured_info_query:
+    explanation_markers = [
+        "what is", "what are", "explain", "tell me", "how", "why", "difference",
+        "compare", "about", "overview", "guide", "steps", "benefits", "uses"
+    ]
+    force_non_casual = (
+        mode == "normal"
+        and any(m in q for m in explanation_markers)
+        and len(q.split()) >= 3
+    )
+    if is_tanglish and not is_factual_query and not is_structured_info_query and not force_non_casual:
         print(f"[Router] ðŸ•µï¸ Tanglish detected! Force Casual Mode.")
         # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
         # But for 'Explain Quantum Physics', we want INTENT=INTERNAL, SUB=general (or reasoning), but TONE=Casual.
@@ -864,12 +873,12 @@ async def analyze_and_route_query(
         "nalla irruke", "nalla iruken", "nalla iruka", "saptiya", "saptacha",
         "eppadi iruka", "nalama", "soukyama", "sughama", "yenna panra"
     ]
-    if any(tp in q for tp in tamil_casual_patterns) and not is_structured_info_query and not is_factual_query:
+    if any(tp in q for tp in tamil_casual_patterns) and not is_structured_info_query and not is_factual_query and not force_non_casual:
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
     
     # 1.2 "Who created you" - FAST PATH
     identity_patterns = ["who created you", "who made you", "who built you", "your creator", "who are you"]
-    if any(p in q for p in identity_patterns):
+    if any(p in q for p in identity_patterns) and not force_non_casual:
         return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 1.3 SHORT QUERY FAST PATH (< 40 chars, no explicit search intent)
@@ -890,7 +899,7 @@ async def analyze_and_route_query(
     ):
         # Likely a casual conversational question - don't waste time on external search
         # The LLM can answer personal/casual questions without web data
-        if "?" in q or q.endswith("?"):
+        if ("?" in q or q.endswith("?")) and not force_non_casual:
             return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 1.5 LEGACY BUSINESS LOGIC (Strict Separation)
@@ -911,7 +920,7 @@ async def analyze_and_route_query(
     # 4. Personal/Conversational Questions (Strict Internal -> Casual)
     # Includes: "you", "your", "we", "us" (when short) - catches "Can we go for dinner?"
     convo_triggers = ["you", "your", " we ", " we?", " we.", " us ", " us?", "myself", "can we", "shall we"]
-    if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers) and not _has_tech_intent(q):
+    if mode == "normal" and len(q) < 80 and any(t in q for t in convo_triggers) and not _has_tech_intent(q) and not force_non_casual:
          return {"intent": "INTERNAL", "sub_intent": "casual_chat", "tools": [], "emotions": detected_emotions}
 
     # 2. Tech Keywords / Patterns (Heuristic Classification)
@@ -1169,6 +1178,7 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, 
             + time_context
             + user_facts_context
             + _build_user_context_string(user_settings)
+            + "\n\nNORMAL MODE HARD OVERRIDE:\n- Follow the exact format sections in NORMAL_SYSTEM_PROMPT.\n- Do not use emojis.\n- Do not use casual slang.\n- Do not output verification/meta commentary.\n"
         )
 
     return (

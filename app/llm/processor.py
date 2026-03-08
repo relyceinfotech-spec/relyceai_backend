@@ -1314,7 +1314,7 @@ class LLMProcessor:
             system_prompt = f"{system_prompt}\n\n{prompt_variant_instruction}"
 
         # === SAFE CHAT AGENT: Constraint Analysis (Steps 1-11) ===
-        if constraint_result and constraint_result.constraint_prompt:
+        if not strict_structured_mode and constraint_result and constraint_result.constraint_prompt:
             system_prompt = f"{system_prompt}\n\n{constraint_result.constraint_prompt}"
             if DEBUG_SAFE_AGENT:
                 print(f"[SafeAgent] Pipeline complete: {constraint_result.log_summary()}")
