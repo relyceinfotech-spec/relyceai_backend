@@ -783,7 +783,12 @@ async def analyze_and_route_query(
         " theriyala", " theriyuma", " enaku", " unaku", " namaku"
     ]
     is_tanglish = any(m in q for m in tanglish_markers)
-    if is_tanglish and not is_factual_query:
+    structured_info_markers = [
+        "tell me", "about", "explain", "what is", "what are", "how does", "overview",
+        "difference", "compare", "guide", "steps", "why", "quantum", "computer", "algorithm"
+    ]
+    is_structured_info_query = any(m in q for m in structured_info_markers) and len(q.split()) >= 4
+    if is_tanglish and not is_factual_query and not is_structured_info_query:
         print(f"[Router] ðŸ•µï¸ Tanglish detected! Force Casual Mode.")
         # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
         # But for 'Explain Quantum Physics', we want INTENT=INTERNAL, SUB=general (or reasoning), but TONE=Casual.
@@ -1312,4 +1317,6 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 4. Do NOT include Sources or meta-content for casual conversation.
 5. AVOID using em-dashes (â€”), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
    In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
+
+
 
