@@ -2736,6 +2736,7 @@ class LLMProcessor:
                         _loop_broken = True
                         break
                 if _loop_broken:
+                    continue
 
                 print(f"[Agent] Executing {len(valid_calls)} tools in PARALLEL: {[tc.name for tc in valid_calls]} "
                       f"[total calls: {exec_ctx.tool_calls_made}/{MAX_TOTAL_TOOL_CALLS}]")
@@ -3035,4 +3036,6 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
 
