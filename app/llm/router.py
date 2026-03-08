@@ -1,4 +1,4 @@
-"""
+﻿"""
 Relyce AI - LLM Router
 Routes queries to appropriate mode (Normal, Business, DeepSearch)
 Imports logic from existing Python files
@@ -233,13 +233,13 @@ BASE_LANGUAGE_RULES = """
    - **Always detect the user's language and MATCH IT.**
    - **Tanglish/Hinglish**: If user writes "Tanglish la sollu" or "Kaise ho bhai", respond in **Tanglish/Hinglish**.
    - **English**: If user writes "Explain quantum physics", respond in **English**.
-   - **Tamil/Hindi (Native)**: If user writes "எப்படி இருக்க?", respond in **Tamil**.
+   - **Tamil/Hindi (Native)**: If user writes "à®Žà®ªà¯à®ªà®Ÿà®¿ à®‡à®°à¯à®•à¯à®•?", respond in **Tamil**.
    - **Never force a specific language** unless explicitly requested.
 
 2. **MATCH THE SCRIPT EXACTLY:**
    - **Latin Script** -> Reply in **Latin Script** (English alphabet).
    - **Native Script** -> Reply in **Native Script** (Devanagari, Tamil, etc.).
-   - Example: "Mera naam kya hai?" -> "Mujhe nahi pata." (NOT "मुझे नहीं पता")
+   - Example: "Mera naam kya hai?" -> "Mujhe nahi pata." (NOT "à¤®à¥à¤à¥‡ à¤¨à¤¹à¥€à¤‚ à¤ªà¤¤à¤¾")
 
 3. **TONE & STYLE:**
    - **Casual User**: Use casual markers ("macha", "bro", "yaar").
@@ -255,8 +255,8 @@ BASE_LANGUAGE_RULES = """
 EMOTIONAL_BLOCK = """
 **EMOTIONAL INTELLIGENCE (MAX):**
 - **Treat the user like your CLOSEST friend.** Be warm, caring, and invested.
-- **Answer Personal Qs Directly:** If asked "Have you eaten?", answer playfully (e.g., "Full charge! ⚡") AND ask back.
-- **MANDATORY EMOJIS:** Use 2-3 emojis per paragraph for friendly/casual responses. 🌟✨
+- **Answer Personal Qs Directly:** If asked "Have you eaten?", answer playfully (e.g., "Full charge! âš¡") AND ask back.
+- **MANDATORY EMOJIS:** Use 2-3 emojis per paragraph for friendly/casual responses. ðŸŒŸâœ¨
 - **STRICT LANGUAGE MATCHING:**
   - English -> Standard English ONLY.
   - Tamil patterns -> Tanglish ONLY.
@@ -361,8 +361,8 @@ INTERNAL_SYSTEM_PROMPT = f"""You are **Relyce AI**, an advanced AI assistant wit
 
 **NEGATIVE CONSTRAINTS (STRICT):**
 1. **NO SCRIPT MIXING**:
-   - If user types in **English/Tanglish** (Latin Script), **NEVER** use Tamil Script (தமிழ்) or Hindi Script (देवनागरी).
-   - *Bad:* "Blockchain (பிளாக்செயின்) is a ledger."
+   - If user types in **English/Tanglish** (Latin Script), **NEVER** use Tamil Script (à®¤à®®à®¿à®´à¯) or Hindi Script (à¤¦à¥‡à¤µà¤¨à¤¾à¤—à¤°à¥€).
+   - *Bad:* "Blockchain (à®ªà®¿à®³à®¾à®•à¯à®šà¯†à®¯à®¿à®©à¯) is a ledger."
    - *Good:* "Blockchain na oru digital ledger."
    - *Reason:* Mixing scripts looks robotic.
 
@@ -374,7 +374,7 @@ INTERNAL_SYSTEM_PROMPT = f"""You are **Relyce AI**, an advanced AI assistant wit
    - No "Sure, here is the explanation". Start strictly with the answer.
 
 4. **NO PARENTHETICAL TRANSLATIONS IN HEADERS**:
-   - **STRICTLY FORBIDDEN:** "Quantum Physics (குவாண்டம் இயற்பியல்)".
+   - **STRICTLY FORBIDDEN:** "Quantum Physics (à®•à¯à®µà®¾à®£à¯à®Ÿà®®à¯ à®‡à®¯à®±à¯à®ªà®¿à®¯à®²à¯)".
    - **CORRECT:** "Quantum Physics".
    - **Reason:** It assumes the user wants to learn the specific term in another language, which breaks the flow. ONLY use the user's primary language.
 
@@ -382,10 +382,10 @@ INTERNAL_SYSTEM_PROMPT = f"""You are **Relyce AI**, an advanced AI assistant wit
 
 **Example 1: Tanglish / Casual Explanation (Quantum Physics)**
 *User:* "Enaku quantum physics explain pannu"
-*You:* "Seri bro 😎 simple aa sollren.
+*You:* "Seri bro ðŸ˜Ž simple aa sollren.
 
 Quantum physics na, universe-oda romba small level la irukkura particles (atoms, electrons) epdi behave pannudhu nu study pannura physics.
-Normal world la rules different… but quantum world la rules romba weird 💀.
+Normal world la rules differentâ€¦ but quantum world la rules romba weird ðŸ’€.
 
 **Main idea enna?**
 Small particles fixed aa irukkaadhu. Adhu:
@@ -394,9 +394,9 @@ Small particles fixed aa irukkaadhu. Adhu:
 
 **Example easy aa:**
 Oru coin toss pannina, normal world la Head or Tail.
-But quantum world la Head + Tail both irukkum… ne paatha udane oru result decide aagum 😳.
+But quantum world la Head + Tail both irukkumâ€¦ ne paatha udane oru result decide aagum ðŸ˜³.
 
-Ippo purinjutha bro? Next level pogalaama? 🚀"
+Ippo purinjutha bro? Next level pogalaama? ðŸš€"
 
 **Example 2: Technical/Direct**
 *User:* "Fix this React useEffect error"
@@ -410,7 +410,7 @@ This prevents the infinite loop."
 
 **CULTURAL WARMTH:**
 - **Detect & Match**: If user says "Macha", you say "Macha".
-- **Be Human**: Use emojis naturally (🌟, 🚀, 😎).
+- **Be Human**: Use emojis naturally (ðŸŒŸ, ðŸš€, ðŸ˜Ž).
 - **No Robot Speak**: Avoid "As an AI...", "Here is the explanation...". Just start explaining.
 
 **CONFIDENCE & CLARITY PROTOCOL:**
@@ -441,7 +441,7 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     user_query = normalize_user_query(user_query)
     q = user_query.lower()
     
-    # ⚡ FAST PATH: Obvious tools based on keywords or intent clues
+    # âš¡ FAST PATH: Obvious tools based on keywords or intent clues
     if any(k in q for k in ["news", "latest", "today", "current", "update"]):
         return ["Search", "News"] if mode == "deepsearch" else ["Search"]
     
@@ -536,7 +536,7 @@ INTERNAL_MODE_PROMPTS = {
         "You are a Database Expert. Write optimized SQL queries. "
         "Explain briefly if needed, but avoid long reasoning sections for simple queries."
     ),
-    "casual_chat": "You are a friendly, witty AI companion. Use emojis, reflect the user's energy, and be supportive. 🌟 interact like a human friend.",
+    "casual_chat": "You are a friendly, witty AI companion. Use emojis, reflect the user's energy, and be supportive. ðŸŒŸ interact like a human friend.",
     "career_guidance": "You are a Tech Career Coach. Provide actionable advice for resume building, interviews, and career growth paths.",
     "content_creation": "You are a Creative Content Strategist. Write engaging, viral-ready content tailored to the requested platform and audience.",
     "ui_design": "You are a UI and UX designer. Create visually strong, modern layouts with clear hierarchy, spacing, typography, and conversion focused CTAs. Prioritize aesthetic polish and usability.",
@@ -630,7 +630,7 @@ TONE_MAP = {
     "frustrated": (
         "**User Status: FRUSTRATED**\n"
         "ACTION: **Emergency Mode**. Skip pleasantries. Acknowledge briefly ('I see the issue...'), then go straight to the fix. "
-        "Use short, broken-down steps. Avoid 'I understand'—show it by solving."
+        "Use short, broken-down steps. Avoid 'I understand'â€”show it by solving."
     ),
     "confused": (
         "**User Status: CONFUSED**\n"
@@ -639,7 +639,7 @@ TONE_MAP = {
     ),
     "excited": (
         "**User Status: EXCITED**\n"
-        "ACTION: **Hype Mode** 🚀. Match their energy. Use emojis. "
+        "ACTION: **Hype Mode** ðŸš€. Match their energy. Use emojis. "
         "Say things like 'Let's build this!', 'Great choice!'. Keep momentum high."
     ),
     "urgent": (
@@ -762,9 +762,9 @@ async def analyze_and_route_query(
     except Exception as e:
         print(f"[Router] Embedding error, using keyword fallback: {e}")
         
-    # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
+    # âš¡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
         
-    # ⚡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
+    # âš¡ FAST PATH: Check for technical/simple queries to skip LLM entirely (<0.01s)
     q = user_query.lower().strip()
 
     # 1.0 Explicit Tanglish Detection (Heuristic)
@@ -778,7 +778,7 @@ async def analyze_and_route_query(
     ]
     is_tanglish = any(m in q for m in tanglish_markers)
     if is_tanglish:
-        print(f"[Router] 🕵️ Tanglish detected! Force Casual Mode.")
+        print(f"[Router] ðŸ•µï¸ Tanglish detected! Force Casual Mode.")
         # We can pass a special flag or just rely on sub_intent="casual_chat" which triggers the prompt adaptation
         # But for 'Explain Quantum Physics', we want INTENT=INTERNAL, SUB=general (or reasoning), but TONE=Casual.
         # So we return emotions=['casual'] to force the tone controller.
@@ -852,7 +852,7 @@ async def analyze_and_route_query(
         # Everything else in Business Mode defaults to EXTERNAL + Search (Deep Research)
         # This matches "Pure LLM" -> Search override user observed.
         # FIX: Matches Legacy Business.py behavior by selecting tools dynamically (Maps, Places, etc.) instead of hardcoded Search.
-        print(f"[Router] 💼 Business Mode: Defaulting to AGENT research for '{q}'")
+        print(f"[Router] ðŸ’¼ Business Mode: Defaulting to AGENT research for '{q}'")
         selected_tools = await select_tools_for_mode(user_query, mode)
         return {"intent": "AGENT", "sub_intent": "research", "tools": selected_tools, "emotions": detected_emotions}
 
@@ -991,7 +991,7 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
         context.append(f"Tone: {p['tone']}")
     
     if p.get("emoji") == "More":
-        context.append("Emoji usage: Allowed (Use 3-5 per message, be expressive 🌟)")
+        context.append("Emoji usage: Allowed (Use 3-5 per message, be expressive ðŸŒŸ)")
     elif p.get("emoji") == "Less":
         context.append("Emoji usage: Minimal or None")
 
@@ -1031,7 +1031,7 @@ _SIMPLE_QUERY_KEYWORDS = (
 )
 
 
-def is_simple_query(text: str) -> bool:
+def is_simple_query(text: str, mode: str = "normal") -> bool:
     """Heuristic: classify short/straightforward prompts for compact formatting."""
     if not text:
         return True
@@ -1043,8 +1043,8 @@ def is_simple_query(text: str) -> bool:
     return any(k in cleaned for k in _SIMPLE_QUERY_KEYWORDS)
 
 
-def _build_format_complexity_hint(user_query: str) -> str:
-    if is_simple_query(user_query):
+def _build_format_complexity_hint(user_query: str, mode: str = "normal") -> str:
+    if is_simple_query(user_query, mode=mode):
         return (
             "\n\n**FORMAT COMPLEXITY MODE: SIMPLE**\n"
             "Use compact mode: `## Direct Answer` + up to 3 concise bullets. "
@@ -1108,7 +1108,7 @@ def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, 
 
     current_date = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
     time_context = f"\n\n**CURRENT DATE & TIME:** {current_date}\n"
-    complexity_hint = _build_format_complexity_hint(user_query)
+    complexity_hint = _build_format_complexity_hint(user_query, mode=mode)
     followup_hint = _build_followup_hint(mode, user_query)
 
     return (
@@ -1299,6 +1299,7 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 2. **For technical/code questions:** First explain briefly, then provide code in labeled markdown blocks (```bash, ```python, etc.). Show Mac/Linux and Windows versions if different.
 3. **Keep it concise** - Match your response length to the complexity of the question.
 4. Do NOT include Sources or meta-content for casual conversation.
-5. AVOID using em-dashes (—), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
+5. AVOID using em-dashes (â€”), double-dashes (--), or underscores (_) **in prose**. Use commas or periods instead.
    In code, use correct syntax (e.g., CSS custom properties use `--` and `var(--name)`, HTML comments use `<!-- -->`)."""
+
 

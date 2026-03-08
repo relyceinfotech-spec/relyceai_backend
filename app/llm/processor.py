@@ -2572,7 +2572,7 @@ class LLMProcessor:
         step_count = 0
         forced_tool_attempted = False
         fact_lookup_query = bool(re.search(
-            r"\b(who is|founder|ceo|owner|director|price|market cap|valuation|address|incorporated|registered|linkedin|crunchbase)\b",
+            r"\b(who is|founder|ceo|owner|director|price|market cap|valuation|address|incorporated|registered|linkedin|crunchbase|cbse|matric|matriculation|affiliation|board|school|college)\b",
             (user_query or "").lower()
         ))
         while True:
@@ -3030,6 +3030,7 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
 
 
 
