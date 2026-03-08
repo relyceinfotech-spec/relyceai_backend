@@ -2455,6 +2455,7 @@ class LLMProcessor:
                 "stream": True
             }
             
+            graph_messages_start_len = len(messages)
             print("\n\n--- GRAPH MESSAGES DUMP ---")
             print(repr(messages))
             print("---------------------------\n\n")
@@ -2536,8 +2537,19 @@ class LLMProcessor:
                     print(f"[Synthesis] ERROR: {e}")
                     yield f"\n\n**Search completed but synthesis failed:** {str(e)}"
             else:
-                print("[Synthesis] No tool results found - skipping synthesis.")
-                pass
+                print("[Synthesis] No tool results found - using graph text fallback.")
+                graph_delta = messages[graph_messages_start_len:]
+                fallback_segments = [
+                    m.get("content", "") for m in graph_delta
+                    if m.get("role") == "assistant" and isinstance(m.get("content"), str) and m.get("content", "").strip()
+                ]
+                if fallback_segments:
+                    fallback_text = "\\n\\n".join(fallback_segments[-2:])
+                    fallback_text = self._sanitize_output_text(fallback_text)
+                    if fallback_text:
+                        synthesis_output = fallback_text
+                        for j in range(0, len(fallback_text), 800):
+                            yield fallback_text[j:j+800]
             
             # Update final state
             final_status = "COMPLETED" if plan_graph.is_fully_completed() else "FAILED"

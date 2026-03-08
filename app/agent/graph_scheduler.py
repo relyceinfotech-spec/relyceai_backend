@@ -235,10 +235,15 @@ async def run_plan_graph(
                             t_res_data = "Blocked by safety policy or malformed call."
                             
                         current_result.append({"command": t_name, "result": t_res_data})
-                        graph.mark_completed(node.node_id, current_result)
         else:
-            # Reasoing only node
+            # Reasoning-only node: persist text output so processor can fall back
+            # when no tool results exist for synthesis.
             graph.mark_completed(node.node_id, {"raw_output": step_output})
+            if step_output and step_output.strip():
+                messages.append({
+                    "role": "assistant",
+                    "content": step_output
+                })
 
         # End of Node Loop Execution
     
