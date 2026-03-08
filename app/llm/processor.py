@@ -92,6 +92,20 @@ UI_SUB_INTENTS = {
 
 MAX_VERIFY_TIME = 1.5
 VERIFY_COMPLEXITY_THRESHOLD = 0.65
+NORMAL_GENERIC_FORMAT_RULES = """
+NORMAL MODE (GENERIC) OUTPUT TEMPLATE:
+- Start with a short direct answer (1-2 sentences).
+- Then use markdown headings and concise bullets.
+- Keep sections scannable; avoid long text walls.
+- Do NOT output self-verification/meta-audit sections.
+- Do NOT mention knowledge cutoff/tool limitations unless the user explicitly asks.
+
+Use this structure when relevant:
+## Overview
+## Key Points
+## Example (if relevant)
+## Conclusion
+"""
 
 CREATIVE_INTENTS = {
     "content_creation",
@@ -806,7 +820,8 @@ class LLMProcessor:
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
-            
+        elif mode == "normal" and sub_intent == "general":
+            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
             system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
         # Apply Emotion/Tone Instruction
@@ -910,7 +925,8 @@ class LLMProcessor:
         from app.llm.router import INTERNAL_MODE_PROMPTS
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
-
+        elif mode == "normal" and sub_intent == "general":
+            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         # Apply Emotion/Tone Instruction
         if emotional_instruction:
             system_prompt = f"{system_prompt}\n\n{emotional_instruction}"
@@ -1223,6 +1239,8 @@ class LLMProcessor:
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             specialized_prompt = INTERNAL_MODE_PROMPTS[sub_intent]
             system_prompt = f"{system_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{specialized_prompt}"
+        elif mode == "normal" and sub_intent == "general":
+            system_prompt = f"{system_prompt}\n\n{NORMAL_GENERIC_FORMAT_RULES}"
         # Wait for all memory/profile tasks securely
         if sub_intent == "ui_demo_html" and _wants_single_file_html(user_query):
             system_prompt = f"{system_prompt}{_single_file_html_instruction()}"
@@ -3036,6 +3054,9 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
+
+
+
 
 
 
