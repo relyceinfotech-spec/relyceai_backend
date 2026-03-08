@@ -1,4 +1,4 @@
-"""
+ï»¿"""
 Relyce AI - LLM Processor
 Handles message processing with streaming support
 Includes legacy prompts and routing logic consolidated into app/llm
@@ -578,7 +578,7 @@ class LLMProcessor:
         direct = parts[0]
         details = []
         for p in parts[1:]:
-            p2 = p.strip("-• \t\n\r")
+            p2 = p.strip("-* \t\n\r")
             if p2:
                 details.append(p2)
             if len(details) >= 4:
