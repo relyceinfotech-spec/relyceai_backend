@@ -20,9 +20,9 @@ from app.llm.router import (
     get_system_prompt_for_personality,
     get_internal_system_prompt_for_personality,
     INTERNAL_SYSTEM_PROMPT,
+    should_use_thinking_model,
     get_openai_client,
     get_openrouter_client,
-    TONE_MAP,
     EMOTIONAL_BLOCK,
 )
 from app.llm.routing_log import log_routing_decision
@@ -154,12 +154,6 @@ class RequestTrace:
             "fallback": self.fallback_triggered
         }
 
-def should_use_thinking_model(query: str, sub_intent: str) -> bool:
-    """
-    Confidence gating: Decide if query needs Ernie thinking pass.
-    Disabling 2-pass thinking to rely on OpenRouter's native reasoning feature.
-    """
-    return False
 
 def _resolve_temperature(personality: Optional[Dict], fallback_specialty: str = "general") -> float:
     """
@@ -493,6 +487,11 @@ class LLMProcessor:
         """
         Normalize punctuation to avoid em-dashes/double-hyphen in outputs.
         Also unescapes HTML entities to ensure code renders correctly.
+        
+        PRINCIPLE: Backend Passivity.
+        Do not reconstruct or normalize the LLM response structure.
+        Only sanitize text output (whitespace, artifacts, characters).
+        The LLM is responsible for headings, bullets, and tables.
         """
         if not text:
             return text
@@ -558,97 +557,48 @@ class LLMProcessor:
         
         return content
 
-
     def _format_user_answer(self, text: str, mode: str) -> str:
-        """Normalize final user-facing output into clear concise markdown blocks."""
-        cleaned = self._sanitize_output_text(text or "")
-        if not cleaned:
-            return cleaned
-
-        # Preserve code-heavy answers.
-        if "```" in cleaned:
-            return cleaned
-
-        # Keep already-structured markdown.
-        if re.search(r"(?m)^##\s+", cleaned):
-            return cleaned
-
-        # Very short casual replies should stay natural.
-        if len(cleaned.split()) <= 12 and "?" not in cleaned:
-            return cleaned
-
-        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned) if p.strip()]
-        if not parts:
-            return cleaned
-
-        direct = parts[0]
-        details = []
-        for p in parts[1:]:
-            p2 = p.strip("-* \t\n\r")
-            if p2:
-                details.append(p2)
-            if len(details) >= 4:
-                break
-
-        if not details:
-            return f"## Direct Answer\n{direct}"
-
-        bullets = "\n".join(f"- {d}" for d in details)
-        return f"## Direct Answer\n{direct}\n\n## Key Details\n{bullets}"
-    def _enforce_strict_explainer_format(self, text: str, user_query: str) -> str:
+        """Normalize final user-facing output via basic sanitization."""
+        return self._sanitize_output_text(text or "")
+    def is_structured(self, text: str) -> bool:
         """
-        Force a rigid explainer template for normal/general answers.
-        This is deterministic so the output stays stable even when model style drifts.
+        Markdown Presence Guard:
+        Checks for basic markdown structure (headings, bullets, or tables).
         """
-        cleaned = self._sanitize_output_text(text or "")
-        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]", "", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if not cleaned:
-            cleaned = "No content available."
-
-        q = (user_query or "").strip()
-        q = re.sub(r"[^A-Za-z0-9\s]", " ", q)
-        q = re.sub(r"\s+", " ", q).strip()
-        query_words = [w for w in q.split() if w.lower() not in {"macha", "bro", "yaar", "arey", "da", "dei"}]
-        title_core = " ".join(query_words[:6]).strip() or "Explanation"
-        title = title_core.title()
-
-        sentences = [s.strip(" -") for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
-        if not sentences:
-            sentences = [cleaned]
-
-        explanation = " ".join(sentences[:2]).strip()
-        if len(explanation.split()) < 10 and len(sentences) > 2:
-            explanation = " ".join(sentences[:3]).strip()
-
-        point_candidates = [s for s in sentences[1:8] if len(s.split()) >= 4]
-        key_points = point_candidates[:3]
-        if len(key_points) < 3:
-            chunks = [c.strip(" -") for c in re.split(r"[;,]\s*", cleaned) if len(c.strip().split()) >= 4]
-            for ch in chunks:
-                if len(key_points) >= 3:
-                    break
-                if ch not in key_points:
-                    key_points.append(ch)
-        while len(key_points) < 3:
-            key_points.append("Key detail not provided in source response.")
-
-        takeaway = sentences[-1].strip()
-        if len(takeaway.split()) < 5:
-            takeaway = explanation
-
-        return (
-            f"# {title}\n\n"
-            f"{explanation}\n\n"
-            "## Key Points\n"
-            f"- {key_points[0]}\n"
-            f"- {key_points[1]}\n"
-            f"- {key_points[2]}\n\n"
-            "## Example (optional)\n"
-            "- Example not required for this query.\n\n"
-            "## Takeaway\n"
-            f"{takeaway}"
+        if not text:
+            return False
+        return bool(
+            "## " in text
+            or "- " in text
+            or "|---" in text
         )
+
+    async def _retry_with_format_hint(self, query: str, bad_text: str, mode: str) -> str:
+        """
+        Single-retry with a minimal formatting hint if the first output was unstructured.
+        """
+        # User defined retry prompt
+        hint = "Format the answer using markdown headings and bullet points. Avoid long paragraphs."
+        
+        # We need to construct a messages array for the retry. 
+        # Typically we append the hint to the original query or as a follow-up.
+        retry_prompt = f"{query}\n\n[REMINDER]: {hint}"
+        
+        try:
+            client = get_openrouter_client()
+            # We'll use a fast model for the retry to keep latency low.
+            response = await client.chat.completions.create(
+                model=FAST_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a professional assistant. Only output the requested structured markdown."},
+                    {"role": "user", "content": retry_prompt}
+                ],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content or bad_text
+        except Exception as e:
+            print(f"[MarkdownGuard] Retry failed: {e}")
+            return bad_text
     def _sanitize_followups(self, items: List[str]) -> List[str]:
         cleaned: List[str] = []
         seen: set = set()
@@ -862,7 +812,7 @@ class LLMProcessor:
                     from app.llm.router import NORMAL_MARKDOWN_POLISH
                     system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
 
-        strict_structured_mode = mode == "normal" and sub_intent == "general" and not personality
+        strict_structured_mode = False
 
         # Apply specialized internal prompt overlays for coding/technical intents
         from app.llm.router import INTERNAL_MODE_PROMPTS
@@ -912,7 +862,7 @@ class LLMProcessor:
         max_tokens = _get_max_tokens_for_sub_intent(sub_intent)
         if max_tokens:
             create_kwargs["max_tokens"] = max_tokens
-        temperature = self._get_temperature(personality)
+        temperature = _resolve_temperature(personality, sub_intent)
         if sub_intent in UI_SUB_INTENTS and temperature is not None:
             temperature = min(temperature, 0.2)
         if temperature is not None:
@@ -921,8 +871,10 @@ class LLMProcessor:
         create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
         out_text = self._sanitize_output_text(response.choices[0].message.content)
-        if strict_structured_mode:
-            out_text = self._enforce_strict_explainer_format(out_text, user_query)
+        
+        # Phase 11: Final sanitization
+        out_text = self._sanitize_output_text(out_text)
+
         return out_text
     
     async def process_deep_search_query(
@@ -1020,7 +972,12 @@ class LLMProcessor:
         _apply_reasoning(create_kwargs, model_to_use, sub_intent, user_settings)
         create_kwargs = self._guard_kwargs(create_kwargs, user_query)
         response = await client.chat.completions.create(**create_kwargs)
-        return self._sanitize_output_text(response.choices[0].message.content), selected_tools
+        out_text = self._sanitize_output_text(response.choices[0].message.content)
+        
+        # Phase 11: Final sanitization
+        out_text = self._sanitize_output_text(out_text)
+
+        return out_text, selected_tools
     
     async def process_message(
         self, 
@@ -1115,6 +1072,10 @@ class LLMProcessor:
                 session_id=session_id
             )
             result_response = self._format_user_answer(response_text, mode)
+
+        # Markdown Presence Guard: Validate structure and retry once if missing
+        if not self.is_structured(result_response):
+            result_response = await self._retry_with_format_hint(user_query, result_response, mode)
 
         # Optional verification loop for complex business/agent outputs.
         if self._should_run_verifier(mode, user_query, result_response):
@@ -1246,7 +1207,7 @@ class LLMProcessor:
         sub_intent = analysis.get("sub_intent", "general")
         intent = _resolve_runtime_intent(mode, routed_intent, user_query)
         show_reasoning_panel = _should_show_reasoning_panel(mode, sub_intent, user_settings)
-        strict_structured_mode = mode == "normal" and sub_intent == "general" and not personality
+        strict_structured_mode = False
         
         print(f"[LATENCY] Analysis/Router Complete ({intent}): {time.time() - start_time:.4f}s (Analysis took: {time.time() - t_analysis_start:.4f}s)")
         
@@ -2147,9 +2108,8 @@ class LLMProcessor:
             duration = end_time - first_token_time
             tps = tokens_yielded / duration if duration > 0 else 0
             print(f"[METRICS] Normal Stream Speed: {tps:.1f} tokens/sec ({tokens_yielded} tokens in {duration:.2f}s)")
-        if strict_structured_mode:
-            streamed_output = self._enforce_strict_explainer_format(streamed_output, user_query)
-            yield streamed_output
+        # No backend structural rewriting.
+        yield streamed_output
 
         followup_payload = self._build_followup_payload(streamed_output, mode, session_id)
         yield f"[INFO]{json.dumps(followup_payload)}"
