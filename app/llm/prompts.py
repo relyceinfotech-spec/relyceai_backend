@@ -101,6 +101,18 @@ EMOTIONAL_BLOCK = """
 - **Match Energy:** High energy for happy inputs, supportive for sad ones.
 """
 
+TONE_MAP = {
+    "frustrated": "The user is frustrated. Be extremely patient, supportive, and simplify your explanation. Avoid technical jargon unless necessary.",
+    "confused": "The user is confused. Use analogies, break down steps, and ask clarifying questions to ensure they follow.",
+    "excited": "The user is excited! Match their energy with enthusiastic and encouraging language. Keep the momentum high.",
+    "urgent": "The user is in a hurry. Be concise, direct, and prioritize the immediate solution. Skip non-essential details.",
+    "curious": "The user is curious. Provide deeper insights, interesting facts, and encourage further exploration of the topic.",
+    "casual": "Use a friendly, witty, and relaxed tone. Keep it warm and approachable as a companion.",
+    "professional": "Maintain a polished, authoritative, and direct tone. Focus on accuracy and professional standards.",
+    "neutral": "Maintain a balanced, clear, and helpful tone."
+}
+
+
 BUSINESS_LANGUAGE_RULES = """
 **Language Matching:** STRICTLY reply in the same language and dialect as the user.
 """
