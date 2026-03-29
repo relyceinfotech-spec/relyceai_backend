@@ -50,6 +50,8 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 
 # Server Configuration
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV in {"prod", "production"}
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8080))
 
@@ -64,11 +66,14 @@ _DEFAULT_CORS_ORIGINS = [
     "https://relyceai.com",
     "https://www.relyceai.com",
     "https://relyceai-frontend.vercel.app",
-    "http://localhost:5173",      # Vite dev server
-    "http://localhost:3000",      # Alternative dev port
-    "http://127.0.0.1:5173",      # Vite dev server (IP)
-    "http://127.0.0.1:3000",      # Alternative dev port (IP)
 ]
+_DEV_CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+]
+_DEFAULT_CORS_ORIGINS += ([] if IS_PRODUCTION else _DEV_CORS_ORIGINS)
 
 CORS_ORIGINS = _csv_env_list("CORS_ORIGINS", _DEFAULT_CORS_ORIGINS)
 
@@ -92,10 +97,11 @@ CORS_ORIGIN_REGEX = os.getenv(
 )
 
 # HTTPS enforcement (recommended to enable in production)
-FORCE_HTTPS = os.getenv("FORCE_HTTPS", "false").lower() == "true"
+FORCE_HTTPS = os.getenv("FORCE_HTTPS", "true" if IS_PRODUCTION else "false").lower() == "true"
 
 # Chat input limits
 MAX_CHAT_MESSAGE_CHARS = int(os.getenv("MAX_CHAT_MESSAGE_CHARS", 6000))
+DATA_RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "30"))
 
 # Upload constraints
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", 25))
@@ -215,3 +221,28 @@ SANDBOX_ENABLED = os.getenv("SANDBOX_ENABLED", "true").lower() == "true"
 SANDBOX_TIMEOUT = int(os.getenv("SANDBOX_TIMEOUT", 10))  # seconds
 SANDBOX_MEMORY_LIMIT_MB = int(os.getenv("SANDBOX_MEMORY_LIMIT_MB", 256))
 SANDBOX_CPU_SECONDS = int(os.getenv("SANDBOX_CPU_SECONDS", 5))
+
+# Reliability hardening flags (v1 + v2 unified package)
+FF_CONFIDENCE_CRITIC_LOOPS = os.getenv("FF_CONFIDENCE_CRITIC_LOOPS", "true").lower() == "true"
+FF_TOOL_FIRST_EVIDENCE = os.getenv("FF_TOOL_FIRST_EVIDENCE", "true").lower() == "true"
+FF_TOOL_MEMORY = os.getenv("FF_TOOL_MEMORY", "true").lower() == "true"
+FF_LLM_INTENT_CLASSIFIER = os.getenv("FF_LLM_INTENT_CLASSIFIER", "true").lower() == "true"
+FF_TOOL_CONFIDENCE_SCORING = os.getenv("FF_TOOL_CONFIDENCE_SCORING", "true").lower() == "true"
+
+# Reliability thresholds and loop budgets
+CRITIC_CONFIDENCE_MIN = float(os.getenv("CRITIC_CONFIDENCE_MIN", "0.70"))
+CRITIC_MAX_REPAIRS = int(os.getenv("CRITIC_MAX_REPAIRS", "2"))
+FAST_LANE_RELIABILITY_BUDGET_MS = int(os.getenv("FAST_LANE_RELIABILITY_BUDGET_MS", "15000"))
+HEAVY_LANE_RELIABILITY_BUDGET_MS = int(os.getenv("HEAVY_LANE_RELIABILITY_BUDGET_MS", "45000"))
+CURRENT_INFO_RECENCY_DAYS = int(os.getenv("CURRENT_INFO_RECENCY_DAYS", "180"))
+RELIABILITY_TOOL_RETRY_BACKOFF_MS = os.getenv("RELIABILITY_TOOL_RETRY_BACKOFF_MS", "200,600")
+
+# Tool-memory v2.1 settings
+TOOL_SCHEMA_VERSION = os.getenv("TOOL_SCHEMA_VERSION", "v2.1")
+TOOL_MEMORY_TTL_SECONDS = int(os.getenv("TOOL_MEMORY_TTL_SECONDS", "86400"))
+TOOL_MEMORY_FRESHNESS_MIN = float(os.getenv("TOOL_MEMORY_FRESHNESS_MIN", "0.25"))
+TOOL_MEMORY_MAX_ITEMS_PER_USER = int(os.getenv("TOOL_MEMORY_MAX_ITEMS_PER_USER", "200"))
+TOOL_MEMORY_MAX_ITEMS_PER_SESSION = int(os.getenv("TOOL_MEMORY_MAX_ITEMS_PER_SESSION", "50"))
+
+# Tool confidence/adaptive planning
+TOOL_CONFIDENCE_MIN_SAMPLES = int(os.getenv("TOOL_CONFIDENCE_MIN_SAMPLES", "4"))

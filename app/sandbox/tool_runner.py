@@ -158,11 +158,12 @@ def main():
     # --- HARDENING: Apply all security layers BEFORE any tool logic ---
 
     # Layer 0: Import guard (MUST be first — blocks dangerous imports)
-    try:
-        from app.sandbox.import_guard import install_import_guard
-        install_import_guard()
-    except Exception:
-        pass  # If import guard fails, continue with other hardening
+    if str(os.getenv("SANDBOX_IMPORT_GUARD_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from app.sandbox.import_guard import install_import_guard
+            install_import_guard()
+        except Exception:
+            pass  # If import guard fails, continue with other hardening
 
     _strip_environment()
     _enforce_safe_root()

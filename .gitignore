@@ -1,31 +1,28 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Environment and Tooling
 .env
+.env.*
+!.env.example
 .venv
-env/
 venv/
-ENV/
-
-# Firebase
-firebase-debug.log*
-
-# OS
-.DS_Store
-Thumb.db
-
-# Project Specific
-tests/
-__pycache__/
-.env
-*.log
-uploads/
-*.txt
-.pytest_cache/
+env/
 .python-version
 .tool-versions
-Procfile
-README.md
+
+# Project Specific
+tests/output/
+tests/debug_archive/
+tests/__pycache__/
+.pytest_cache/
+*.log
+*.txt
 !requirements.txt
+!README.md
+uploads/
+data/
+cache/
+logs/
+temp/
+tmp/
+
+# Keep app code
 !app/

@@ -9,15 +9,14 @@ import os
 import time
 from typing import Dict, List, Optional, Tuple
 from openai import AsyncOpenAI
-import httpx
 
-from app.config import OPENROUTER_API_KEY
+from app.config import OPENROUTER_API_KEY, EMBEDDING_MODEL as CONFIG_EMBEDDING_MODEL
 from app.auth import get_firestore_db
 
 # ============================================
 # CONFIGURATION
 # ============================================
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = CONFIG_EMBEDDING_MODEL
 TIEBREAKER_MODEL = "openai/gpt-4o-mini"
 THRESHOLD_HIGH = 0.55
 THRESHOLD_MEDIUM = 0.35
@@ -313,31 +312,24 @@ def get_openrouter_client() -> AsyncOpenAI:
 
 
 # ============================================
-# LOCAL EMBEDDING MODEL
-# ============================================
-_local_embedding_model = None
-
-def get_embedding_model():
-    global _local_embedding_model
-    if _local_embedding_model is None:
-        print("[Embedding] Loading local SentenceTransformer model...")
-        from sentence_transformers import SentenceTransformer
-        _local_embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-        print("[Embedding] Model loaded.")
-    return _local_embedding_model
-
-
-# ============================================
 # CORE FUNCTIONS
 # ============================================
 
 async def generate_embedding(text: str) -> List[float]:
-    """Generate embedding vector for text using local model."""
+    """Generate embedding vector for text using OpenRouter embeddings API."""
     try:
-        def _encode():
-            model = get_embedding_model()
-            return model.encode(text).tolist()
-        return await asyncio.to_thread(_encode)
+        client = get_openrouter_client()
+        response = await asyncio.wait_for(
+            client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=(text or "").strip(),
+            ),
+            timeout=TIMEOUT_SECONDS,
+        )
+        data = getattr(response, "data", None) or []
+        if not data:
+            return []
+        return data[0].embedding or []
     except Exception as e:
         print(f"[Embedding] Error generating embedding: {e}")
         return []

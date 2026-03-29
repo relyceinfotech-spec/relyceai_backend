@@ -87,7 +87,7 @@ _COMPARISON_PATTERNS = re.compile(
 
 _RESEARCH_PATTERNS = re.compile(
     r"\b(?:analyze|evaluate|assess|review|audit|investigate|"
-    r"research|study|examine|deep\s*dive|break\s*down|"
+    r"research|reserch|reseach|study|examine|deep\s*dive|break\s*down|"
     r"comprehensive|thorough|detailed\s+analysis)\b",
     re.IGNORECASE,
 )

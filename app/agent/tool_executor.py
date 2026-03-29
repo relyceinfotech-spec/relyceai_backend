@@ -35,9 +35,11 @@ from app.safety.content_policy import classify_nsfw, has_prompt_injection_marker
 
 MAX_TOOL_CALLS = 2        # max tool invocations per request
 MAX_RETRIES = 2           # retry failed tools up to N times
-TOOL_TIMEOUT = 3          # seconds before tool execution is aborted
+TOOL_TIMEOUT = 10         # seconds before tool execution is aborted
 MAX_TOOL_PAYLOAD = 4000   # max characters returned by a tool
-TOOL_COOLDOWN_SECONDS = 2.0
+# Keep search/tool cooldown disabled for conversational reliability.
+# We prefer returning an answer over blocking tool execution.
+TOOL_COOLDOWN_SECONDS = 0.0
 _RATE_LIMITED_TOOLS = {
     "search_web", "search_news", "search_images", "search_videos", "search_places", "search_maps",
     "search_reviews", "search_shopping", "search_scholar", "search_patents", "search_weather",
@@ -145,17 +147,23 @@ def _tool_get_current_time(args: str = "") -> Dict:
 
 
 # Session-based search latency control
-LAST_SEARCH_TIME: Dict[str, float] = {}
+LAST_SEARCH_TIME: Dict[tuple[str, str], float] = {}
 
-def can_call_search(session_id: str) -> bool:
+def can_call_search(session_id: str, tool_name: str = "search") -> bool:
+    if TOOL_COOLDOWN_SECONDS <= 0:
+        return True
     if not session_id:
         return True
     now = time.time()
-    last = LAST_SEARCH_TIME.get(session_id, 0)
-    if now - last < 5:
-        return False
-    LAST_SEARCH_TIME[session_id] = now
-    return True
+    key = (str(session_id), str(tool_name or "search"))
+    last = LAST_SEARCH_TIME.get(key, 0.0)
+    return (now - last) >= TOOL_COOLDOWN_SECONDS
+
+def mark_search_call(session_id: str, tool_name: str = "search") -> None:
+    if not session_id:
+        return
+    key = (str(session_id), str(tool_name or "search"))
+    LAST_SEARCH_TIME[key] = time.time()
 
 
 async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
@@ -164,10 +172,10 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
     Extracts organic results from Serper response format.
     Returns standard contract.
     """
-    if not can_call_search(session_id):
+    if not can_call_search(session_id, "search_web"):
         return {
             "status": "failure",
-            "data": "Search cooldown active. Please wait a moment before searching again.",
+            "data": "Search temporarily throttled by cooldown.",
             "source": "search_cooldown",
             "confidence": "low",
         }
@@ -181,12 +189,13 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
         if not endpoint:
             return {
                 "status": "failure",
-                "data": None,
-                "source": "serper",
+                "data": "Search provider endpoint is not configured.",
+                "source": "serper_config",
                 "confidence": "low",
             }
 
-        raw_result = await execute_serper_batch(endpoint, [args], param_key="q")
+        query_value = _clean_search_query(_extract_text_query(args))
+        raw_result = await execute_serper_batch(endpoint, [query_value], param_key="q")
 
         # Parse Serper response: result is a list of dicts with "organic" key
         cleaned = []
@@ -196,11 +205,11 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
             if not organic:
                 return {
                     "status": "failure",
-                    "data": None,
-                    "source": "serper_no_organic",
+                    "data": "No organic web results returned from provider.",
+                    "source": "serper_no_results",
                     "confidence": "low",
                 }
-            for r in organic[:5]:
+            for r in organic[:16]:
                 if isinstance(r, dict):
                     cleaned.append({
                         "title": r.get("title", ""),
@@ -213,11 +222,11 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
             if not organic:
                 return {
                     "status": "failure",
-                    "data": None,
-                    "source": "serper_no_organic",
+                    "data": "No organic web results returned from provider.",
+                    "source": "serper_no_results",
                     "confidence": "low",
                 }
-            for r in organic[:5]:
+            for r in organic[:16]:
                 if isinstance(r, dict):
                     cleaned.append({
                         "title": r.get("title", ""),
@@ -226,30 +235,284 @@ async def _tool_search_web(args: str = "", session_id: str = "") -> Dict:
                     })
 
         if cleaned:
+            linked = [item for item in cleaned if _is_http_url(item.get("link"))]
+            query_lower = str(query_value or "").lower()
+            prefer_news = any(token in query_lower for token in ("news", "latest", "today", "recent", "update", "war", "conflict", "fight"))
+            if prefer_news:
+                curated = [item for item in linked if not _is_low_signal_news_link(item.get("link"))]
+                if curated:
+                    linked = curated
+            ranked = _rank_and_filter_search_items(linked, query_value, prefer_news=prefer_news, max_items=10)
+            if not linked:
+                return {
+                    "status": "failure",
+                    "data": "Search returned non-verifiable results without source links.",
+                    "source": "serper_unverifiable_results",
+                    "confidence": "low",
+                }
+            mark_search_call(session_id, "search_web")
             return {
                 "status": "success",
-                "data": cleaned,
+                "data": ranked or linked[:10],
                 "source": "serper",
                 "confidence": "high",
             }
         else:
             return {
                 "status": "failure",
-                "data": None,
-                "source": "serper",
+                "data": "Search returned empty response payload.",
+                "source": "serper_empty_response",
                 "confidence": "low",
             }
 
     except Exception as e:
         return {
             "status": "failure",
-            "data": None,
-            "source": "serper",
+            "data": f"Search provider error: {str(e)}",
+            "source": "serper_error",
             "confidence": "low",
         }
 
 
 SERPER_LIST_KEYS = ["organic", "news", "images", "videos", "places", "maps", "reviews", "shopping", "scholar", "patents"]
+LOW_SIGNAL_NEWS_DOMAINS = {
+    "instagram.com",
+    "facebook.com",
+    "m.facebook.com",
+    "x.com",
+    "twitter.com",
+    "tiktok.com",
+    "youtube.com",
+    "youtu.be",
+}
+HIGH_SIGNAL_NEWS_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "aljazeera.com",
+    "cfr.org",
+    "crisisgroup.org",
+    "atlanticcouncil.org",
+    "iaea.org",
+    "state.gov",
+    "un.org",
+    "ft.com",
+    "wsj.com",
+    "nytimes.com",
+    "theguardian.com",
+}
+QUERY_STOPWORDS = {
+    "the", "and", "for", "with", "from", "this", "that", "about",
+    "latest", "recent", "news", "update", "updates", "official", "statement",
+    "statements", "timeline", "event", "events", "summary", "reliable", "sources",
+}
+BRAND_DOMAIN_HINTS = {
+    "apple": ["apple.com"],
+    "mac": ["apple.com"],
+    "macbook": ["apple.com"],
+    "iphone": ["apple.com"],
+    "microsoft": ["microsoft.com"],
+    "windows": ["microsoft.com"],
+    "google": ["google.com"],
+    "android": ["google.com"],
+    "tesla": ["tesla.com"],
+    "nvidia": ["nvidia.com"],
+}
+
+def _is_http_url(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text.startswith("http://") or text.startswith("https://")
+
+
+def _host_from_url(value: Any) -> str:
+    try:
+        return (urlparse(str(value or "").strip()).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _query_terms(value: str) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+        if len(token) < 3 or token in QUERY_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out[:12]
+
+
+def _is_wikipedia_relation_page(item: Dict[str, Any]) -> bool:
+    title = str(item.get("title") or "").lower()
+    link = str(item.get("link") or "").lower()
+    if "wikipedia.org" not in link:
+        return False
+    noise = ("relations", "history of", "list of", "regime change")
+    return any(n in title or n in link for n in noise)
+
+
+def _score_search_item(item: Dict[str, Any], query_terms: List[str], prefer_news: bool) -> float:
+    title = str(item.get("title") or "").lower()
+    snippet = str(item.get("snippet") or "").lower()
+    link = str(item.get("link") or "").lower()
+    host = _host_from_url(link)
+    text = f"{title} {snippet} {link}"
+
+    score = 0.0
+    overlap = sum(1 for t in query_terms if t in text)
+    score += min(overlap, 6) * 1.8
+
+    if host and any(host == d or host.endswith(f".{d}") for d in HIGH_SIGNAL_NEWS_DOMAINS):
+        score += 5.0
+    if host and any(host == d or host.endswith(f".{d}") for d in LOW_SIGNAL_NEWS_DOMAINS):
+        score -= 5.0
+
+    if "wikipedia.org" in host:
+        score -= 1.0
+    if _is_wikipedia_relation_page(item):
+        score -= 6.0
+
+    if prefer_news:
+        if any(k in title for k in ("timeline", "live", "war", "conflict", "strike", "ceasefire")):
+            score += 1.5
+        if overlap == 0 and not any(host == d or host.endswith(f".{d}") for d in HIGH_SIGNAL_NEWS_DOMAINS):
+            score -= 3.0
+
+    for q_token, domains in BRAND_DOMAIN_HINTS.items():
+        if q_token in query_terms and any(host == d or host.endswith(f".{d}") for d in domains):
+            score += 6.0
+            break
+    return score
+
+
+def _rank_and_filter_search_items(
+    items: List[Dict[str, Any]],
+    query: str,
+    *,
+    prefer_news: bool = False,
+    max_items: int = 10,
+) -> List[Dict[str, Any]]:
+    query_terms = _query_terms(query)
+    scored: List[tuple[float, Dict[str, Any]]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        link = str(item.get("link") or item.get("url") or "").strip()
+        if not _is_http_url(link):
+            continue
+        normalized = dict(item)
+        normalized["link"] = link
+        if not str(normalized.get("title") or "").strip():
+            normalized["title"] = link
+        scored.append((_score_search_item(normalized, query_terms, prefer_news), normalized))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    if not scored:
+        return []
+
+    primary = [item for score, item in scored if score >= (1.8 if prefer_news else 0.8)]
+    if len(primary) < 3:
+        primary = [item for _, item in scored]
+
+    deduped: List[Dict[str, Any]] = []
+    seen_links = set()
+    domain_counts: Dict[str, int] = {}
+    for item in primary:
+        link = str(item.get("link") or "").strip()
+        host = _host_from_url(link)
+        if not link or link in seen_links:
+            continue
+        if host and domain_counts.get(host, 0) >= 2:
+            continue
+        seen_links.add(link)
+        if host:
+            domain_counts[host] = domain_counts.get(host, 0) + 1
+        deduped.append(item)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _extract_text_query(args: str) -> str:
+    text = str(args or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                for key in ("q", "query", "question", "text"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        except Exception:
+            pass
+    return text
+
+
+def _clean_search_query(query: str) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    q = re.sub(r"\s+", " ", q).strip()
+    q = re.sub(r"[\"'`]+", "", q)
+    q = re.sub(r"\b(hey|hi|hello|hii|yo|macha|bro|buddy|pls|please)\b", " ", q, flags=re.IGNORECASE)
+    q = re.sub(
+        r"\b(i\s*(got|fgot|forgot|heard|need|want)\s*(an|a)?\s*news\s*(that)?)\b",
+        " ",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(
+        r"\b(can you|could you|tell me|search|research|reserch|find)\b",
+        " ",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\b(hwy|hw|wey)\b", " ", q, flags=re.IGNORECASE)
+    lower = q.lower()
+    for marker in ("news that", "about", "regarding", "on"):
+        idx = lower.find(marker)
+        if idx >= 0:
+            tail = q[idx + len(marker):].strip(" :,-")
+            if len(tail) >= 12:
+                q = tail
+                break
+    q = re.sub(r"\b(haas|pakaistan|pakisthan|reserch|thaty)\b", lambda m: {
+        "haas": "has",
+        "pakaistan": "pakistan",
+        "pakisthan": "pakistan",
+        "reserch": "research",
+        "thaty": "",
+    }.get(m.group(1).lower(), m.group(0)), q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip(" ,.-")
+    return q or str(query or "").strip()
+
+
+def _is_low_signal_news_link(value: Any) -> bool:
+    try:
+        host = (urlparse(str(value or "").strip()).netloc or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    return any(host == domain or host.endswith(f".{domain}") for domain in LOW_SIGNAL_NEWS_DOMAINS)
+
+
+def _has_real_serper_evidence(items: List[Dict[str, Any]]) -> bool:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if _is_http_url(item.get("link")):
+            return True
+        if _is_http_url(item.get("source")):
+            return True
+        if _is_http_url(item.get("imageUrl")):
+            return True
+    return False
+
 
 def _extract_serper_items(raw_result: Any) -> List[Dict[str, Any]]:
     """Normalize Serper responses into a compact list of items."""
@@ -276,7 +539,7 @@ def _extract_serper_items(raw_result: Any) -> List[Dict[str, Any]]:
                 out["link"] = item.get("url")
             if out:
                 results.append(out)
-            if len(results) >= 5:
+            if len(results) >= 12:
                 return results
     return results
 
@@ -285,10 +548,10 @@ async def _tool_serper_generic(args: str = "", session_id: str = "", tool_key: s
     """
     Executes a Serper tool endpoint and returns a compact list of results.
     """
-    if not can_call_search(session_id):
+    if not can_call_search(session_id, f"serper:{tool_key.lower()}"):
         return {
             "status": "failure",
-            "data": "Search cooldown active. Please wait a moment before searching again.",
+            "data": f"{tool_key} search temporarily throttled by cooldown.",
             "source": "search_cooldown",
             "confidence": "low",
         }
@@ -301,16 +564,36 @@ async def _tool_serper_generic(args: str = "", session_id: str = "", tool_key: s
         if not endpoint:
             return {
                 "status": "failure",
-                "data": None,
-                "source": "serper",
+                "data": f"{tool_key} endpoint is not configured.",
+                "source": "serper_config",
                 "confidence": "low",
             }
 
         param_key = "url" if tool_key.lower() == "webpage" else "q"
-        raw_result = await execute_serper_batch(endpoint, [args], param_key=param_key)
+        query_value = _extract_text_query(args) if param_key == "q" else str(args or "")
+        if param_key == "q":
+            query_value = _clean_search_query(query_value)
+        raw_result = await execute_serper_batch(endpoint, [query_value], param_key=param_key)
         cleaned = _extract_serper_items(raw_result)
+        tool_key_lower = str(tool_key or "").strip().lower()
+        if cleaned and tool_key_lower in {"search", "news"}:
+            query_for_rank = str(query_value or args or "")
+            prefer_news = tool_key_lower == "news" or any(
+                t in query_for_rank.lower() for t in ("news", "latest", "today", "recent", "war", "conflict")
+            )
+            ranked = _rank_and_filter_search_items(cleaned, query_for_rank, prefer_news=prefer_news, max_items=10)
+            if ranked:
+                cleaned = ranked
 
         if cleaned:
+            if not _has_real_serper_evidence(cleaned):
+                return {
+                    "status": "failure",
+                    "data": f"{tool_key} search returned unlinked or non-verifiable results.",
+                    "source": "serper_unverifiable_results",
+                    "confidence": "low",
+                }
+            mark_search_call(session_id, f"serper:{tool_key.lower()}")
             return {
                 "status": "success",
                 "data": cleaned,
@@ -319,21 +602,36 @@ async def _tool_serper_generic(args: str = "", session_id: str = "", tool_key: s
             }
         return {
             "status": "failure",
-            "data": None,
+            "data": f"No usable {tool_key.lower()} results returned from provider.",
             "source": "serper_no_results",
             "confidence": "low",
         }
-    except Exception:
+    except Exception as e:
         return {
             "status": "failure",
-            "data": None,
-            "source": "serper",
+            "data": f"{tool_key} search provider error: {str(e)}",
+            "source": "serper_error",
             "confidence": "low",
         }
 
 
 async def _tool_search_news(args: str = "", session_id: str = "") -> Dict:
-    return await _tool_serper_generic(args, session_id=session_id, tool_key="News")
+    news_query = _clean_search_query(_extract_text_query(args))
+    news_result = await _tool_serper_generic(news_query, session_id=session_id, tool_key="News")
+    if news_result.get("status") == "success":
+        data = news_result.get("data")
+        if isinstance(data, list):
+            filtered = [item for item in data if not _is_low_signal_news_link(item.get("link"))]
+            ranked = _rank_and_filter_search_items(filtered or data, news_query, prefer_news=True, max_items=10)
+            if ranked:
+                news_result["data"] = ranked
+                return news_result
+    fallback_query = _decorate_query(news_query, ["news", "latest", "today", "recent"], "latest news Reuters BBC AP Al Jazeera")
+    fallback_result = await _tool_serper_generic(fallback_query, session_id=session_id, tool_key="Search")
+    if fallback_result.get("status") == "success":
+        fallback_result["source"] = "serper_news_fallback_search"
+        return fallback_result
+    return news_result
 
 async def _tool_search_images(args: str = "", session_id: str = "") -> Dict:
     return await _tool_serper_generic(args, session_id=session_id, tool_key="Images")
@@ -358,7 +656,7 @@ async def _tool_search_scholar(args: str = "", session_id: str = "") -> Dict:
 
 
 def _decorate_query(args: str, required_tokens: List[str], prefix: str) -> str:
-    q = (args or "").strip()
+    q = _clean_search_query(_extract_text_query(args))
     if not q:
         return ""
     ql = q.lower()
@@ -1608,32 +1906,27 @@ def parse_tool_calls(text: str) -> List[ToolCall]:
     Expected format: TOOL_CALL: tool_name("args") or TOOL_CALL: tool_name(args)
     Supports multiple parallel generations concatenated or separated by spaces/newlines.
     """
-    calls = []
+    calls: List[ToolCall] = []
+    if not text:
+        return calls
 
-    # Regex setup (allows matching sequentially within the same string segment)
-    # Extracts the full chunk raw match, plus the tool name and argument block.
-    pattern_with_quotes = r'TOOL_CALL:\s*(\w+)\s*\(\s*"([^"]*)"\s*\)'
-    pattern_without_quotes = r'TOOL_CALL:\s*(\w+)\s*\(([^)]*)\)'
+    # Keep extraction in one pass so order is stable across mixed quoted/unquoted calls.
+    pattern = r'TOOL_CALL:\s*(\w+)\s*\(\s*(?:"((?:[^"\\]|\\.)*)"|([^)]*))\s*\)'
+    for match in re.finditer(pattern, text):
+        quoted_args = match.group(2)
+        unquoted_args = match.group(3)
+        if quoted_args is not None:
+            args = quoted_args.replace('\\"', '"')
+        else:
+            args = (unquoted_args or "").strip().strip("\"'")
 
-    # Process all quote variants first across entire string...
-    # Warning: finditer returns all sequences so we don't accidentally swallow items!
-    
-    for match in re.finditer(pattern_with_quotes, text):
-        calls.append(ToolCall(
-            name=match.group(1),
-            args=match.group(2),
-            raw=match.group(0)
-        ))
-        # Strip processed segments to avoid overlap processing with the second regex pass
-        text = text.replace(match.group(0), "")
-
-    # Process unquoted tool matches sequentially locally (like boolean expressions or calculations without string wrapper).
-    for match in re.finditer(pattern_without_quotes, text):
-        calls.append(ToolCall(
-            name=match.group(1),
-            args=match.group(2).strip().strip('\"\''),
-            raw=match.group(0)
-        ))
+        calls.append(
+            ToolCall(
+                name=match.group(1),
+                args=args,
+                raw=match.group(0),
+            )
+        )
 
     return calls
 
@@ -1856,7 +2149,17 @@ async def execute_tool(tool_call: ToolCall, exec_ctx: Optional[ExecutionContext]
             return result
         else:
             result.retries = attempt + 1
-            result.error = raw.get("source", "") if raw else "no response"
+            if isinstance(raw, dict):
+                err_data = raw.get("data")
+                err_source = str(raw.get("source", "")).strip()
+                if isinstance(err_data, str) and err_data.strip():
+                    result.error = err_data.strip()[:240]
+                elif err_source:
+                    result.error = err_source[:240]
+                else:
+                    result.error = "tool returned invalid result contract"
+            else:
+                result.error = "no response"
             # Track retry in execution context
             if exec_ctx:
                 exec_ctx.retry_count += 1

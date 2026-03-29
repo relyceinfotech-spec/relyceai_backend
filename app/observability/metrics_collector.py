@@ -56,6 +56,16 @@ class MetricsCollector:
         self.research_calls: int = 0
         self.research_cache_hits: int = 0
 
+        # Capability routing counters
+        self.capability_routes: Dict[str, int] = {}
+        self.capability_requests: Dict[str, Dict[str, float]] = {}
+
+        # Agent execution counters
+        self.planner_bypass_count: int = 0
+        self.query_cache_hits: int = 0
+        self.termination_reasons: Dict[str, int] = {}
+        self.custom_counters: Dict[str, int] = {}
+
     # ---- Recording Methods ----
 
     def record_task_started(self) -> None:
@@ -115,6 +125,43 @@ class MetricsCollector:
         with self._lock:
             self.research_cache_hits += 1
 
+    def record_planner_bypass(self) -> None:
+        with self._lock:
+            self.planner_bypass_count += 1
+
+    def record_query_cache_hit(self) -> None:
+        with self._lock:
+            self.query_cache_hits += 1
+
+    def record_termination(self, reason: str) -> None:
+        key = str(reason or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            self.termination_reasons[key] = int(self.termination_reasons.get(key, 0)) + 1
+
+    def record_capability_route(self, capability: str) -> None:
+        key = str(capability or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            self.capability_routes[key] = int(self.capability_routes.get(key, 0)) + 1
+
+    def record_capability_request(self, capability: str, latency_ms: float, success: bool) -> None:
+        key = str(capability or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            bucket = self.capability_requests.setdefault(
+                key,
+                {"count": 0.0, "success": 0.0, "failure": 0.0, "latency_ms_total": 0.0},
+            )
+            bucket["count"] += 1.0
+            bucket["latency_ms_total"] += float(latency_ms or 0.0)
+            if success:
+                bucket["success"] += 1.0
+            else:
+                bucket["failure"] += 1.0
+
+    def record_custom_counter(self, name: str, delta: int = 1) -> None:
+        key = str(name or "unknown").strip().lower() or "unknown"
+        with self._lock:
+            self.custom_counters[key] = int(self.custom_counters.get(key, 0)) + int(delta)
+
     # ---- Aggregation ----
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -164,6 +211,23 @@ class MetricsCollector:
                 "research_calls": self.research_calls,
                 "research_cache_hits": self.research_cache_hits,
                 "research_cache_rate": round(research_cache_rate, 4),
+                "planner_bypass_count": self.planner_bypass_count,
+                "query_cache_hits": self.query_cache_hits,
+                "termination_reasons": dict(self.termination_reasons),
+                "custom_counters": dict(self.custom_counters),
+                "capability_routes": dict(self.capability_routes),
+                "capability_requests": {
+                    name: {
+                        "count": int(values.get("count", 0.0)),
+                        "success": int(values.get("success", 0.0)),
+                        "failure": int(values.get("failure", 0.0)),
+                        "avg_latency_ms": round(
+                            float(values.get("latency_ms_total", 0.0)) / max(float(values.get("count", 0.0)), 1.0),
+                            2,
+                        ),
+                    }
+                    for name, values in self.capability_requests.items()
+                },
             }
 
     def reset(self) -> None:
@@ -184,6 +248,12 @@ class MetricsCollector:
             self.strategy_drift_count = 0
             self.research_calls = 0
             self.research_cache_hits = 0
+            self.planner_bypass_count = 0
+            self.query_cache_hits = 0
+            self.termination_reasons = {}
+            self.custom_counters = {}
+            self.capability_routes = {}
+            self.capability_requests = {}
 
 
 # ============================================

@@ -10,10 +10,10 @@ router = APIRouter()
 client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 DEFAULT_PRICING = {
-    # "starter": {"monthly": 199, "yearly": 1999},
+    "starter": {"monthly": 199, "yearly": 1999},
     "plus": {"monthly": 999, "yearly": 9999},
     "pro": {"monthly": 1999, "yearly": 19999},
-    # "business": {"monthly": 2499, "yearly": 24999}
+    "business": {"monthly": 2499, "yearly": 24999},
 }
 
 VALID_BILLING_CYCLES = {"monthly", "yearly"}

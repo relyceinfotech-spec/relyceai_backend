@@ -18,15 +18,19 @@ class PlanNode:
     node_id: str
     action_type: str  # TOOL_CALL | REASONING | VALIDATION | REPAIR
     payload: Dict
+    role: str = ""
     dependencies: List[str] = field(default_factory=list)
     status: str = NodeStatus.PENDING
     result: Optional[Dict] = None
+    role_fallback_applied: bool = False
+    role_resolution_source: str = "default"
 
 @dataclass
 class PlanGraph:
     graph_id: str
     session_id: str
     nodes: Dict[str, PlanNode] = field(default_factory=dict)
+    metadata: Dict = field(default_factory=dict)
     
     def add_node(self, node: PlanNode) -> None:
         if node.node_id in self.nodes:
@@ -123,14 +127,18 @@ class PlanGraph:
         return {
             "graph_id": self.graph_id,
             "session_id": self.session_id,
+            "metadata": self.metadata,
             "nodes": {
                 n_id: {
                     "node_id": node.node_id,
                     "action_type": node.action_type,
                     "payload": node.payload,
+                    "role": node.role,
                     "dependencies": node.dependencies,
                     "status": node.status,
-                    "result": node.result
+                    "result": node.result,
+                    "role_fallback_applied": bool(node.role_fallback_applied),
+                    "role_resolution_source": str(node.role_resolution_source or "default"),
                 } for n_id, node in self.nodes.items()
             }
         }
@@ -140,16 +148,20 @@ class PlanGraph:
         """Restores a PlanGraph from a dictionary representation."""
         graph = cls(
             graph_id=data.get("graph_id", "restored_graph"),
-            session_id=data.get("session_id", "unknown")
+            session_id=data.get("session_id", "unknown"),
+            metadata=data.get("metadata", {}) or {},
         )
         for n_id, n_data in data.get("nodes", {}).items():
             node = PlanNode(
                 node_id=n_data["node_id"],
                 action_type=n_data["action_type"],
                 payload=n_data.get("payload", {}),
+                role=n_data.get("role", ""),
                 dependencies=n_data.get("dependencies", []),
                 status=n_data.get("status", NodeStatus.PENDING),
-                result=n_data.get("result")
+                result=n_data.get("result"),
+                role_fallback_applied=bool(n_data.get("role_fallback_applied", False)),
+                role_resolution_source=str(n_data.get("role_resolution_source", "default") or "default"),
             )
             graph.add_node(node)
         return graph

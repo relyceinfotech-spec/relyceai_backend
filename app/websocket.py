@@ -32,6 +32,7 @@ from app.chat.context import (
 )
 from app.chat.history import save_message_to_firebase
 from app.chat.session_rules import increment_turn as _increment_session_turn
+from app.chat.mode_mapper import normalize_chat_mode, is_agent_premium_mode
 from app.rate_limit import check_rate_limit
 from app.config import MAX_CHAT_MESSAGE_CHARS, RATE_LIMIT_PER_MINUTE, MAX_WS_CONNECTIONS_PER_CHAT, MAX_WS_CONNECTIONS_TOTAL, REDIS_URL, REDIS_WS_CHANNEL_PREFIX
 from app.state.phase_guard import get_phase_guard
@@ -357,7 +358,7 @@ async def handle_websocket_message(
     
     # Process chat message
     content = data.get("content", "")
-    chat_mode = data.get("chat_mode", "normal")
+    chat_mode = normalize_chat_mode(data.get("chat_mode", "smart"))
     personality_id = data.get("personality_id")
     user_settings = data.get("user_settings")
     effective_settings = merge_settings(get_user_settings(user_id), user_settings)
@@ -381,7 +382,7 @@ async def handle_websocket_message(
             p_data = get_personality_by_id(user_id, personality_id)
             if p_data:
                 personality = p_data
-        if not personality and chat_mode == "normal":
+        if not personality and chat_mode == "smart":
             p_data = get_personality_by_id(user_id, "default_relyce")
             if p_data:
                 personality = p_data
@@ -397,7 +398,7 @@ async def handle_websocket_message(
         return
 
     # === AGENT MODE: Tiered Rate Limit + Concurrency Guard ===
-    if chat_mode == "agent":
+    if is_agent_premium_mode(chat_mode):
         import time as _rl_time
         _now = _rl_time.time()
         _uid = user_id or "anonymous"
@@ -511,7 +512,7 @@ async def handle_websocket_message(
 
     # Get context for LLM (personality-aware)
     try:
-        context_messages = await asyncio.to_thread(get_context_for_llm, user_id, chat_id, resolved_personality_id)
+        context_messages = await asyncio.to_thread(get_context_for_llm, user_id, chat_id, resolved_personality_id, chat_mode)
     except Exception as e:
         print(f"[WS] Failed to load context: {e}")
         context_messages = []
@@ -535,7 +536,7 @@ async def handle_websocket_message(
         try:
             stream_generator = llm_processor.process_message_stream(
                 content, 
-                mode=chat_mode,
+                mode=("normal" if chat_mode == "smart" else chat_mode),
                 context_messages=context_messages,
                 personality=personality,
                 user_settings=effective_settings,
@@ -640,7 +641,7 @@ async def handle_websocket_message(
         )
         
         # Update context with this exchange
-        update_context_with_exchange(user_id, chat_id, content, full_response, resolved_personality_id)
+        update_context_with_exchange(user_id, chat_id, content, full_response, resolved_personality_id, chat_mode)
         
         # === SAFE CHAT AGENT: Track session turn ===
         try:
@@ -657,7 +658,7 @@ async def handle_websocket_message(
                 # Smart Memory Compression
                 from app.llm.router import get_openrouter_client
                 from app.memory.summary_manager import summarize_if_needed
-                fresh_context_msgs = get_context_for_llm(user_id, chat_id, resolved_personality_id)
+                fresh_context_msgs = get_context_for_llm(user_id, chat_id, resolved_personality_id, chat_mode)
                 await summarize_if_needed(user_id, chat_id, fresh_context_msgs, get_openrouter_client())
             except Exception as e:
                 print(f"[WS] Background history save failed: {e}")

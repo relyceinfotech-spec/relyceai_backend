@@ -34,7 +34,7 @@ from typing import Set, Optional
 
 ALLOWED_MODULES: Set[str] = {
     # Core language
-    "json", "math", "datetime", "re", "string", "copy",
+    "json", "math", "datetime", "re", "string", "copy", "ast",
     "decimal", "fractions", "statistics", "struct", "time",
 
     # Data structures
@@ -59,7 +59,8 @@ ALLOWED_MODULES: Set[str] = {
     "io",
 
     # Internal use
-    "_thread", "__future__",
+    "_thread", "__future__", "sys", "types",
+    "app",
 }
 
 # Prefixes that are allowed (for sub-module imports)
@@ -67,7 +68,7 @@ ALLOWED_PREFIXES = (
     "collections.", "typing.", "pathlib.",
     "json.", "dataclasses.", "enum.",
     "functools.", "itertools.",
-    "encodings.", "_",  # Python internals needed for boot
+    "encodings.", "_", "app.",  # Python internals needed for boot
 )
 
 # ============================================
@@ -167,6 +168,8 @@ def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 def _is_blocked(module_name: str) -> bool:
     """Check if a module name is blocked."""
+    if not module_name:
+        return False
     # Explicitly blocked
     if module_name in BLOCKED_MODULES:
         return True

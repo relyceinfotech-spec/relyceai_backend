@@ -164,6 +164,36 @@ class DashboardAggregator:
             "error_breakdown": cls.get_error_breakdown(),
         }
 
+    @staticmethod
+    def get_context_efficiency_dashboard(model_name: str = DEFAULT_MODEL) -> Dict:
+        _ = model_name
+        metrics = get_metrics_collector().get_metrics()
+        ctx = metrics.get("context_efficiency") or {}
+        by_endpoint_raw = ctx.get("by_endpoint") or {}
+        rows = []
+        for endpoint, values in by_endpoint_raw.items():
+            before = int((values or {}).get("before", 0))
+            after = int((values or {}).get("after", 0))
+            saved = max(0, before - after)
+            rows.append(
+                {
+                    "endpoint": endpoint,
+                    "events": int((values or {}).get("events", 0)),
+                    "before": before,
+                    "after": after,
+                    "saved": saved,
+                }
+            )
+        rows.sort(key=lambda x: x["saved"], reverse=True)
+        return {
+            "events": int(ctx.get("events", 0)),
+            "tokens_before": int(ctx.get("tokens_before", 0)),
+            "tokens_after": int(ctx.get("tokens_after", 0)),
+            "tokens_saved": int(ctx.get("tokens_saved", 0)),
+            "savings_pct": float(ctx.get("savings_pct", 0.0)),
+            "by_endpoint": rows,
+        }
+
 
 # ============================================
 # MODULE INSTANCE

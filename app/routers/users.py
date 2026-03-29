@@ -4,12 +4,14 @@ Handles user initialization and management.
 """
 from fastapi import APIRouter, HTTPException, Depends
 from app.auth import get_firestore_db, get_current_user, get_claim_role
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import os
 import threading
 from firebase_admin import firestore
 
 router = APIRouter()
 _id_lock = threading.Lock()
+MEMBERSHIP_EXPIRY_GRACE_HOURS = int(os.getenv("MEMBERSHIP_EXPIRY_GRACE_HOURS", "48"))
 
 def check_membership_expiry(user_ref, user_data, uid):
     """
@@ -45,7 +47,8 @@ def check_membership_expiry(user_ref, user_data, uid):
         now = datetime.now(timezone.utc)
         print(f"[Users] Expiry Check {uid}: Now={now} vs Expiry={expiry_date}")
 
-        if now <= expiry_date:
+        grace_cutoff = expiry_date + timedelta(hours=MEMBERSHIP_EXPIRY_GRACE_HOURS)
+        if now <= grace_cutoff:
             return
 
         db = get_firestore_db()
@@ -77,6 +80,9 @@ def check_membership_expiry(user_ref, user_data, uid):
                 return False
 
             updates = {
+                "membership.previousPlan": plan_current,
+                "membership.previousPlanName": membership_current.get("planName", str(plan_current).capitalize()),
+                "membership.expiredAt": datetime.now(timezone.utc),
                 "membership.plan": "free",
                 "membership.planName": "Free",
                 "membership.status": "expired",

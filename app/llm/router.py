@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncOpenAI
 from app.llm.guards import normalize_user_query, build_guard_system_messages
+from app.chat.mode_mapper import normalize_chat_mode
 from app.config import (
     OPENAI_API_KEY, SERPER_API_KEY, LLM_MODEL, SERPER_TOOLS,
     OPENROUTER_API_KEY, FAST_MODEL, ERNIE_THINKING_MODEL,
@@ -24,15 +25,49 @@ from app.llm.skill_router_runtime import inject_skill_capsules, select_skills
 from app.llm.prompts import (
     CORE_POLICY, BASE_FORMATTING_RULES,
     BASE_LANGUAGE_RULES,
-    EMOTIONAL_BLOCK, BUSINESS_LANGUAGE_RULES, DEFAULT_PERSONA,
+    DEFAULT_PERSONA,
     NORMAL_SYSTEM_PROMPT, BUSINESS_SYSTEM_PROMPT, DEEPSEARCH_SYSTEM_PROMPT,
-    AGENT_FORMAT_PROMPT, INTERNAL_SYSTEM_PROMPT, INTERNAL_MODE_PROMPTS,
-    STRUCTURE_PLANNING_RULE, COMPARISON_OPTIMIZATION, TONE_MAP
+    AGENT_FORMAT_PROMPT, INTERNAL_SYSTEM_PROMPT, INTERNAL_MODE_PROMPTS
 )
+
+# Compatibility exports consumed by processor/processor_parts.
+# Keep these in router to avoid startup import failures after refactors.
+EMOTIONAL_BLOCK = """
+Emotional adaptation:
+- Detect user emotional state and adapt tone while preserving accuracy.
+- If the user is frustrated/confused, simplify and prioritize actionable steps.
+- If urgent, keep the response short and immediately useful.
+"""
+
+TONE_MAP = {
+    "frustrated": "Tone: Calm, empathetic, and solution-focused. Avoid blame.",
+    "confused": "Tone: Clarify with simple language and step-by-step guidance.",
+    "excited": "Tone: Positive and energetic while keeping technical accuracy.",
+    "urgent": "Tone: Brief and direct. Prioritize next best action first.",
+    "curious": "Tone: Exploratory and explanatory. Include concise reasoning.",
+    "casual": "Tone: Friendly and natural; avoid excessive formal structure.",
+    "professional": "Tone: Professional, precise, and concise.",
+    "neutral": "Tone: Clear, balanced, and practical.",
+}
+
+NORMAL_MARKDOWN_POLISH = """
+Formatting polish:
+- Start with a direct answer for straightforward questions.
+- Use short bullets/sections only when they improve clarity.
+- Avoid over-formatting short conversational replies.
+"""
 
 # Initialize clients lazily
 _client: Optional[AsyncOpenAI] = None
 _openrouter_client: Optional[AsyncOpenAI] = None
+
+
+def _normalize_runtime_mode(mode: str) -> str:
+    raw = str(mode or "").strip().lower()
+    normalized = normalize_chat_mode(raw or "smart")
+    if raw in {"normal", "business", "hybrid_main", "deepsearch", "research"}:
+        print(f"[ModeCompat] legacy mode '{raw}' mapped to '{normalized}'")
+    return normalized
 
 def get_openai_client() -> AsyncOpenAI:
     global _client
@@ -114,9 +149,8 @@ DEEPSEARCH_TOOLS = SERPER_TOOLS.copy()
 
 def get_tools_for_mode(mode: str) -> Dict[str, Any]:
     """Helper to get tools for a specific mode."""
-    if mode == "business":
-        return BUSINESS_TOOLS
-    if mode == "agent":
+    mode = _normalize_runtime_mode(mode)
+    if mode in {"agent", "research_pro"}:
         return DEEPSEARCH_TOOLS
     return NORMAL_TOOLS
 
@@ -189,30 +223,28 @@ async def select_tools_for_mode(user_query: str, mode: str) -> List[str]:
     Imported from existing files.
     """
     user_query = normalize_user_query(user_query)
+    mode = _normalize_runtime_mode(mode)
     q = user_query.lower()
     
     # âš¡ FAST PATH: Obvious tools based on keywords or intent clues
     if any(k in q for k in ["news", "latest", "today", "current", "update"]):
-        return ["Search", "News"] if mode == "deepsearch" else ["Search"]
+        return ["Search", "News"] if mode == "research_pro" else ["Search"]
     
     if any(k in q for k in ["place", "location", "near me", "map", "direction"]):
-        return ["Places", "Search"] if mode == "deepsearch" else ["Search"]
+        return ["Places", "Search"] if mode == "research_pro" else ["Search"]
 
     guard_messages = build_guard_system_messages(user_query)
 
-    if mode == "normal":
+    if mode == "smart":
         tools = NORMAL_TOOLS
         mode_descriptor = "relevant tools"
-    elif mode == "business":
-        tools = BUSINESS_TOOLS
-        mode_descriptor = "relevant business tools"
-    else:  # deepsearch
+    else:  # agent/research_pro
         tools = DEEPSEARCH_TOOLS
         mode_descriptor = "top 3-5 tools for comprehensive research"
 
     tools_list = ", ".join(tools.keys())
 
-    if mode == "deepsearch":
+    if mode == "research_pro":
         system_prompt = f"""You are a Senior Research Architect.
 Available Tools: [{tools_list}]
 Select the top 3-5 tools that will provide the most comprehensive, detailed, and varied data.
@@ -242,13 +274,13 @@ Return the tool names as a comma-separated list (e.g., 'Search, News, Videos')."
     selected_tools = [t.strip() for t in cand if t.strip() in tools]
 
     if not selected_tools:
-        return ["Search", "News"] if mode == "deepsearch" else ["Search"]
+        return ["Search", "News"] if mode == "research_pro" else ["Search"]
 
     return selected_tools
 
 
 # ============================================
-# INTERNAL_MODE_PROMPTS and TONE_MAP are now in app.llm.prompts or removed if unused
+# Internal response helpers
 
 def _select_ui_implementation_sub_intent(user_query: str) -> str:
     q = user_query.lower()
@@ -271,6 +303,7 @@ async def analyze_and_route_query(
     Returns: {"intent": "INTERNAL", "sub_intent": "sql", "tools": []}
     """
     user_query = normalize_user_query(user_query)
+    mode = _normalize_runtime_mode(mode)
     # 0. PERSONALITY CONTENT MODE OVERRIDE (Only in Normal Mode)
     # If a personality forces a specific behavior, we obey it immediately.
     import time
@@ -310,7 +343,7 @@ async def analyze_and_route_query(
     is_tanglish = _is_tanglish_query(user_query)
     is_factual_q = any(m in q_lower for m in ["who is", "founder", "ceo", "owner", "board", "cbse", "matric", "price", "latest", "when was"])
     is_structured_q = any(m in q_lower for m in ["explain", "difference", "compare", "guide", "steps", "why", "quantum", "how does"])
-    force_non_casual_q = (mode == "normal" and any(m in q_lower for m in ["what is", "explain", "how", "why", "difference", "tell me", "overview", "comparison"]))
+    force_non_casual_q = (mode == "smart" and any(m in q_lower for m in ["what is", "explain", "how", "why", "difference", "tell me", "overview", "comparison"]))
 
     tone_flags = {"casual": False}
     if is_tanglish and not is_factual_q and not is_structured_q and not force_non_casual_q:
@@ -370,7 +403,7 @@ async def analyze_and_route_query(
     is_factual = any(m in q for m in ["who is", "founder", "ceo", "owner", "board", "cbse", "matric", "price", "latest", "when was"])
     is_structured = any(m in q for m in ["explain", "difference", "compare", "guide", "steps", "why", "quantum", "how does"])
     
-    force_non_casual = (mode == "normal" and any(m in q for m in ["what is", "explain", "how", "why", "difference", "tell me", "overview", "comparison"]))
+    force_non_casual = (mode == "smart" and any(m in q for m in ["what is", "explain", "how", "why", "difference", "tell me", "overview", "comparison"]))
 
     if force_non_casual or is_structured:
         return {"intent": "INTERNAL", "sub_intent": "general", "emotions": [e for e in detected_emotions if e != "casual"], "tone_flags": tone_flags}
@@ -409,7 +442,7 @@ async def analyze_and_route_query(
         return {"intent": "INTERNAL", "sub_intent": sub, "needs_reasoning": needs_reasoning, "emotions": detected_emotions, "tone_flags": tone_flags}
 
     # 1.3 Business Mode Logic
-    if mode == "business":
+    if mode in {"agent", "research_pro"}:
         if any(t in q for t in ["code", "math", "calculate"]):
              return {"intent": "INTERNAL", "sub_intent": "general", "emotions": detected_emotions, "tone_flags": tone_flags}
         
@@ -486,9 +519,13 @@ def _build_user_context_string(user_settings: Optional[Dict]) -> str:
         context.append(f"Tone: {p['tone']}")
     
     if p.get("emoji") == "More":
-        context.append("Emoji usage: Allowed (Use 3-5 per message, be expressive ðŸŒŸ)")
+        context.append(
+            "Emoji usage: Default none. Use one emoji only if the user used emoji or uses slang/very casual tone. "
+            "Never use emoji for technical/code/structured/instructional responses. "
+            "Tone resets each message; do not carry emoji tone forward."
+        )
     elif p.get("emoji") == "Less":
-        context.append("Emoji usage: Minimal or None")
+        context.append("Emoji usage: None, unless user explicitly asks for emojis.")
 
     # User Info
     if p.get("nickname"):
@@ -526,7 +563,7 @@ _SIMPLE_QUERY_KEYWORDS = (
 )
 
 
-def is_simple_query(text: str, mode: str = "normal") -> bool:
+def is_simple_query(text: str, mode: str = "smart") -> bool:
     """Heuristic: classify short/straightforward prompts for compact formatting."""
     if not text:
         return True
@@ -538,7 +575,7 @@ def is_simple_query(text: str, mode: str = "normal") -> bool:
     return any(k in cleaned for k in _SIMPLE_QUERY_KEYWORDS)
 
 
-def _build_format_complexity_hint(user_query: str, mode: str = "normal") -> str:
+def _build_format_complexity_hint(user_query: str, mode: str = "smart") -> str:
     if is_simple_query(user_query, mode=mode):
         return (
             "\n\n**FORMAT COMPLEXITY MODE: SIMPLE**\n"
@@ -555,6 +592,7 @@ def _build_format_complexity_hint(user_query: str, mode: str = "normal") -> str:
 
 
 def _build_followup_hint(mode: str, user_query: str) -> str:
+    mode = _normalize_runtime_mode(mode)
     q = (user_query or "").strip().lower()
     if not q:
         return "\n\nSkip follow-ups for this reply.\n"
@@ -564,12 +602,12 @@ def _build_followup_hint(mode: str, user_query: str) -> str:
     if len(q.split()) <= 4 and any(m in q for m in skip_markers):
         return "\n\nSkip follow-ups for this reply.\n"
 
-    if mode == "business":
-        pattern = "Use Business pattern: Impact -> Resources -> Risk."
+    if mode == "research_pro":
+        pattern = "Use Research pattern: Evidence -> Validation -> Caveat."
     elif mode == "agent":
         pattern = "Use Agent pattern: Data -> Execution -> Validation."
     else:
-        pattern = "Use Normal pattern: Clarify -> Implement -> Pitfall."
+        pattern = "Use Smart pattern: Clarify -> Implement -> Pitfall."
 
     return (
         "\n\nGenerate up to 3 distinct follow-up questions.\n"
@@ -581,14 +619,15 @@ def _build_followup_hint(mode: str, user_query: str) -> str:
 
 def get_system_prompt_for_mode(mode: str, user_settings: Optional[Dict] = None, user_id: Optional[str] = None, user_query: str = "", session_id: Optional[str] = None) -> str:
     """Get system prompt for mode with centralized context helpers"""
+    mode = _normalize_runtime_mode(mode)
     
     # 1. Select base prompt
     mode_prompts = {
-        "normal": NORMAL_SYSTEM_PROMPT,
-        "business": BUSINESS_SYSTEM_PROMPT,
-        "agent": AGENT_FORMAT_PROMPT
+        "smart": NORMAL_SYSTEM_PROMPT,
+        "agent": AGENT_FORMAT_PROMPT,
+        "research_pro": DEEPSEARCH_SYSTEM_PROMPT,
     }
-    base_sys = mode_prompts.get(mode, DEEPSEARCH_SYSTEM_PROMPT)
+    base_sys = mode_prompts.get(mode, NORMAL_SYSTEM_PROMPT)
 
     # 2. Inject Skills
     skill_selection = select_skills(user_query, mode, session_id=session_id)
@@ -613,13 +652,13 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
     
     # 1. Base Logic
     if p_id == "default_relyce" or p_name == "Relyce AI":
-        return get_system_prompt_for_mode("normal", user_settings, user_id, user_query, session_id=session_id)
+        return get_system_prompt_for_mode("smart", user_settings, user_id, user_query, session_id=session_id)
 
-    custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
+    custom_prompt = personality.get("prompt") or DEFAULT_PERSONA
     specialty = personality.get("specialty", "general")
     
     # 2. Inject Skills
-    skill_selection = select_skills(user_query, "normal", session_id=session_id)
+    skill_selection = select_skills(user_query, "smart", session_id=session_id)
     custom_prompt = inject_skill_capsules(custom_prompt, skill_selection, token_budget=4500)
 
     # 3. Build Context
@@ -648,7 +687,7 @@ def get_system_prompt_for_personality(personality: Dict[str, Any], user_settings
 {BASE_FORMATTING_RULES}
 {pref_ctx}"""
 
-def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, mode: str = "normal") -> str:
+def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user_settings: Optional[Dict] = None, user_id: Optional[str] = None, mode: str = "smart") -> str:
     """
     Get system prompt for INTERNAL queries with PERSONALITY.
     """
@@ -657,24 +696,19 @@ def get_internal_system_prompt_for_personality(personality: Dict[str, Any], user
 
     # Default Relyce
     if p_id == "default_relyce" or p_name == "Relyce AI":
-        base_prompt = INTERNAL_SYSTEM_PROMPT + "\n\n**CRITICAL OVERRIDE: DO NOT TRANSLATE HEADERS.**"
-        # Only inject emotional layer if NOT in a structured mode or if explicitly casual
-        emotional_layer = EMOTIONAL_BLOCK if mode == "normal" else ""
+        base_prompt = INTERNAL_SYSTEM_PROMPT + "\n\nResponse style: keep answers concise and adaptive to user intent."
         user_facts = _get_user_facts("", user_id) if user_id else ""
-        return f"{CORE_POLICY}\n{base_prompt}\n{user_facts}\n{emotional_layer}\n{_build_user_context_string(user_settings)}"
+        return f"{CORE_POLICY}\n{base_prompt}\n{user_facts}\n{_build_user_context_string(user_settings)}"
 
     # Custom Personalized
-    custom_prompt = personality.get("prompt", DEFAULT_PERSONA)
-    specialty = personality.get("specialty", "general")
+    custom_prompt = personality.get("prompt") or DEFAULT_PERSONA
     user_facts = _get_user_facts("", user_id) if user_id else ""
-    emotional_layer = EMOTIONAL_BLOCK if mode == "normal" else ""
     
     return f"""{CORE_POLICY}
 {custom_prompt}
 {user_facts}
 {BASE_LANGUAGE_RULES}
 {_build_user_context_string(user_settings)}
-{emotional_layer}
 **RESPONSE STYLE:**
 1. Be brief and natural for casual chat.
 2. For technical questions, provide clear code blocks.

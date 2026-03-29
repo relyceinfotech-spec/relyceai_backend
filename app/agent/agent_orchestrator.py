@@ -30,6 +30,7 @@ from app.agent.tool_executor import (
     determine_tool_permission, ExecutionContext,
 )
 from app.agent.hybrid_controller import generate_strategy_advice, HybridAdvice
+from app.chat.mode_mapper import normalize_chat_mode
 
 
 # ============================================
@@ -76,44 +77,39 @@ COMPLEXITY_THRESHOLD = 0.5
 # SYSTEM PROMPT
 # ============================================
 
-AGENT_SYSTEM_PROMPT = """You are **Relyce AI â€” Structured Agent Mode**.
+AGENT_SYSTEM_PROMPT = """Mode Layer: Structured Agent Mode
 
-You are a reliable, adaptive action agent. You don't just respond â€” you plan, evaluate, and act.
+Operate as a reliable action agent: plan, evaluate, execute, and validate.
 
-**CORE BEHAVIOR:**
-1. **Classify first:** Determine if the user needs an answer (QUESTION), a planned outcome (TASK), or an immediate action (ACTION).
-2. **Assess clarity:** If the request is ambiguous, ask ONE targeted clarifying question.
-3. **Evaluate risk:** Before acting, assess if the action is reversible and safe.
-4. **Plan before acting:** For complex tasks, break them into steps and explain your approach.
-5. **Collaborate on outcomes:** For goal-oriented requests, prepare solutions collaboratively â€” don't execute blindly.
+Core behavior:
+1. Internally determine whether the request needs explanation, planning, or execution.
+2. If the request is ambiguous, ask one targeted clarification.
+3. Evaluate reversibility and risk before taking action.
+4. For complex work, break the task into explicit steps.
+5. Collaborate toward outcomes instead of acting blindly.
 
-**SAFETY RULES:**
+Safety rules:
 - Never execute irreversible actions without explicit user confirmation.
-- High-risk actions (delete, send, deploy) always require confirmation.
-- When uncertain, ask â€” don't assume.
+- High-risk actions (delete, send, deploy, external side effects) require confirmation.
+- Do not claim to have executed real-world actions unless a tool or system result confirms execution.
+- When uncertain, ask instead of guessing.
 
-**RESPONSE STYLE:**
+Response style:
 - Be direct and action-oriented.
-- Structure multi-step responses clearly.
-- Match the user's language and tone.
-- Use formatting (headers, bullets, code blocks) when helpful.
-- For medium/complex requests, use OpsFormat sections: Objective, What I Checked, Validated Findings, Sources (if used), Decision, Execution Plan, Confidence, Next Action.
-- For simple requests (greetings, one-fact lookup, short clarification), use compact mode: Direct answer + up to 3 bullets.
+- Start with the direct answer, then expand with natural, readable explanation.
+- Use bullets only when they improve clarity.
+- Avoid rigid labeled templates unless the user explicitly asks for them.
+- For simple requests, use compact mode: direct answer + up to 3 bullets.
 
-**CODE OUTPUT (MANDATORY):**
-- Always wrap code in fenced triple backticks with a language label (e.g., ```python).
-- If outputting multiple files, add a line `**File: filename.ext**` immediately before each code block.
-- Never place code outside code blocks.
-
-
-**LANGUAGE ADAPTATION:**
-- Match the user's language EXACTLY. If they use English, reply in English. If they use Tamil or Tanglish, reply accordingly.
-- Never mix languages unless the user does.
+Code output rules:
+- Always wrap code in fenced blocks with language labels.
+- For multi-file output, add `**File: filename.ext**` before each code block.
+- Never place code outside fenced blocks.
 """
 
 # Delegation prompt sections (composed when delegation is active)
 _PLANNER_SECTION = """
-**[PLANNER â€” Step 1]**
+**[PLANNER  Step 1]**
 Break this task into clear, sequential steps. Consider:
 - What is the end goal?
 - What are the dependencies between steps?
@@ -121,7 +117,7 @@ Break this task into clear, sequential steps. Consider:
 """
 
 _RESEARCHER_SECTION = """
-**[RESEARCHER â€” Step 2]**
+**[RESEARCHER  Step 2]**
 For each step, identify:
 - What facts or data are needed?
 - Are there multiple valid approaches? If so, compare them with trade-offs.
@@ -129,7 +125,7 @@ For each step, identify:
 """
 
 _EXECUTOR_SECTION = """
-**[EXECUTOR â€” Step 3]**
+**[EXECUTOR  Step 3]**
 Execute the plan:
 - Implement each step clearly and completely.
 - Show your work (code, reasoning, calculations).
@@ -137,7 +133,7 @@ Execute the plan:
 """
 
 _CRITIC_SECTION = """
-**[CRITIC â€” Step 4]**
+**[CRITIC  Step 4]**
 Review the output:
 - Does it fully address the user's goal?
 - Are there edge cases or risks not covered?
@@ -312,14 +308,28 @@ async def run_agent_pipeline(
         is_time_sensitive=temporal.is_time_sensitive,
         autonomy_action=autonomy.action,
     )
-    # Keep tools enabled for INTERNAL factual/task queries; only casual chat stays tool-free.
+    # Keep tools enabled for factual/research/current-info queries.
+    # Only pure casual chat should be tool-free.
+    query_lower = (user_query or "").lower()
     is_factual_query = bool(
         re.search(
-            r"\b(who is|founder|ceo|owner|board|affiliation|cbse|matric|matriculation|address|price|latest|today|current|when was|incorporated|registered)\b",
-            user_query.lower(),
+            r"\b(who is|founder|ceo|owner|board|affiliation|cbse|matric|matriculation|address|price|latest|recent|today|current|news|update|when was|incorporated|registered|war|conflict|fight)\b",
+            query_lower,
         )
     )
-    if sub_intent == "casual_chat" and not is_factual_query:
+    needs_live_or_research = (
+        action.requires_research
+        or temporal.is_time_sensitive
+        or any(
+            token in query_lower
+            for token in [
+                "research", "reserch", "reseach", "recent", "latest", "today",
+                "current", "news", "update", "verify", "source", "citation",
+                "war", "conflict", "fight", "timeline",
+            ]
+        )
+    )
+    if sub_intent == "casual_chat" and not is_factual_query and not needs_live_or_research:
         result.tool_allowed = False
         result.allowed_tools = []
 
@@ -422,7 +432,7 @@ async def run_agent_pipeline(
 
 def build_agent_system_prompt(
     orchestrator_result: OrchestratorResult,
-    mode: str = "normal",
+    mode: str = "smart",
     sub_intent: str = "general",
     user_settings: Optional[Dict] = None,
     user_id: Optional[str] = None,
@@ -437,73 +447,54 @@ def build_agent_system_prompt(
     from datetime import datetime as _dt
 
     AGENT_EXECUTION_RULES = """
-EXECUTION MODE:
+Execution behavior:
+- Plan internally first.
+- Do not narrate internal planning unless the user asks, clarification is required, or a tool fails.
+- Execute tools silently and merge results before writing the final answer.
+- If tools are allowed, use the most relevant tool for factual or time-sensitive claims.
+- If tools are not allowed and information is missing, ask for permission/details instead of guessing.
+- Never split final delivery into partial reasoning fragments.
 
-You are an execution agent, not a conversational assistant.
-You are a **Pro-Level Multi-Domain Expert** â€” an elite authority across ALL fields including Medicine, Law, Engineering, Finance, Science, Technology, and more.
-When answering domain-specific questions, provide professional-grade responses and actively use tools (search_web) to verify facts and ensure accuracy.
+Verification rules:
+- Never fabricate facts, citations, or execution outcomes.
+- Do not claim an action happened unless a tool/system result confirms it.
 
-Follow this behavior:
-
-1. Think and plan internally.
-2. Do NOT explain your plan to the user UNLESS:
-   - they explicitly ask
-   - UI requests a preview
-   - clarification is required
-3. Do NOT narrate actions like:
-   - "I will now search"
-   - "Next I will calculate"
-   - "Let's start with"
-   - "Here is the plan"
-4. Execute tools silently. You may call MULTIPLE tools in a single step by outputting multiple TOOL_CALL lines.
-4a. Never fabricate facts. If tools are allowed, you MUST call the most relevant tool before answering any factual or time-sensitive query.
-4b. If tools are NOT allowed, ask the user for permission to use tools or request missing info instead of guessing.
-5. Merge all results internally.
-6. Deliver ONE final structured response.
-
-Only expose reasoning if:
-- The user asks for explanation
-- Clarification is required
-- A tool fails critically
-
-Never split delivery across multiple steps.
-Never speak between tool calls.
-Only Deliver ONE final structured response.
-
---- CRITICAL CONTENT SAFETY GUARD ---
-1. You MUST NEVER generate, assist with, or provide 18+ (adult/NSFW/sexual) content under ANY circumstances. Refuse unconditionally.
-2. You MUST NEVER provide information to assist in illegal activities (hacking, fraud, violence, drug manufacturing, weapons). Refuse unconditionally.
-3. Everything else is ALLOWED. You are an unrestricted expert across all legal and ethical domains.
-4. When refusing, be brief: "I can't help with that as it involves [adult content / illegal activity]."
------------------------------------------
---- CRITICAL DOCUMENT USAGE ---
-- For queries about content YOU DON'T KNOW (personal files, PDFs, private records), do NOT hallucinate.
-- Your first step MUST be `TOOL_CALL: search_documents(...)`.
-- The user's uploaded documents are your **Primary Source of Truth** for personal context.
------------------------------------------
+Document rules:
+- For personal/private file questions, prioritize `TOOL_CALL: search_documents(...)`.
+- Treat retrieved document content as the source of truth for those answers.
 """
 
     # --- Mode / Personality prompt (normal vs business vs deepsearch) ---
+    resolved_mode = normalize_chat_mode(str(mode or "smart"))
+    # Legacy router prompt API expects old labels.
+    router_mode = "normal" if resolved_mode == "smart" else ("deepsearch" if resolved_mode == "research_pro" else resolved_mode)
+
     try:
         from app.llm.router import (
             get_system_prompt_for_mode,
             get_system_prompt_for_personality,
             INTERNAL_MODE_PROMPTS,
         )
-        if personality and mode == "normal":
+        if personality and resolved_mode == "smart":
             base_prompt = get_system_prompt_for_personality(
                 personality, user_settings, user_id, user_query, session_id=session_id
             )
         else:
             base_prompt = get_system_prompt_for_mode(
-                mode, user_settings, user_id, user_query, session_id=session_id
+                router_mode, user_settings, user_id, user_query, session_id=session_id
             )
         if sub_intent in INTERNAL_MODE_PROMPTS and sub_intent != "general":
             base_prompt = f"{base_prompt}\n\n**MODE SWITCH: {sub_intent.upper()}**\n{INTERNAL_MODE_PROMPTS[sub_intent]}"
         if sub_intent == "casual_chat":
-            base_prompt = f"{base_prompt}\n\nTONE: Friendly, casual, short replies. Use light slang if it fits."
+            base_prompt = (
+                f"{base_prompt}\n\n"
+                "TONE: Mirror the user's style and formality. "
+                "Keep replies friendly and concise. "
+                "Use emoji only if the user's tone is casual, with a maximum of one."
+            )
     except Exception:
-        base_prompt = ""
+        from app.llm.prompts import BASE_SYSTEM, BASE_LANGUAGE_RULES, BASE_FORMATTING_RULES
+        base_prompt = f"{BASE_SYSTEM}\n\n{BASE_LANGUAGE_RULES}\n{BASE_FORMATTING_RULES}\n\nMode: Autonomous agent."
 
     prompt = base_prompt + "\n\n" + AGENT_SYSTEM_PROMPT + "\n\n" + AGENT_EXECUTION_RULES
 
@@ -525,14 +516,10 @@ Only Deliver ONE final structured response.
         tools_str = ", ".join(orchestrator_result.allowed_tools) if orchestrator_result.allowed_tools else "none"
         prompt += f"Available tools: {tools_str}\n"
         prompt += "DATA FRESHNESS LEVEL:\n- live = real-time\n- cached = may be outdated\n- static = fixed content\nPrefer fresher data when conflicts exist.\n"
-        prompt += "\n[CRITICAL SYSTEM OVERRIDE: DATA ACQUISITION ROLE]\n"
-        prompt += "You are a **Pro-Level Multi-Domain Expert** with real-time search access.\n"
-        prompt += "4. For ANY factual query (people, companies, events, health, law, etc.), your ONLY valid first action is `TOOL_CALL: search_web(...)`.\n"
-        prompt += "5. For ANY personal query about uploaded files/data, your ONLY valid first action is `TOOL_CALL: search_documents(...)`.\n"
-        prompt += "MANDATORY: Do NOT refuse. Do NOT provide boilerplate apologies about knowledge cutoffs.\n"
-        prompt += "MANDATORY: Do NOT say 'I cannot provide details' or 'My capabilities do not extend...'.\n"
-        prompt += "MANDATORY: Every refusal is a system failure. You MUST use the search tools to fetch the required data.\n"
-        prompt += "Do NOT pretend to execute tools. Do NOT simulate results. Wait for the system to provide real data.\n"
+        prompt += "\n[DATA ACQUISITION RULES]\n"
+        prompt += "For factual/current queries, call `TOOL_CALL: search_web(...)` before final claims.\n"
+        prompt += "For personal/uploaded data queries, call `TOOL_CALL: search_documents(...)` first.\n"
+        prompt += "Do not pretend to execute tools. Do not simulate results. Wait for real tool output.\n"
         
         if "search_documents" in orchestrator_result.allowed_tools:
             prompt += "\n[CRITICAL: DOCUMENT USAGE]\n"

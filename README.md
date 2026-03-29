@@ -28,7 +28,7 @@ Make sure your `.env` file has:
 ```env
 OPENAI_API_KEY=your_key
 SERPER_API_KEY=your_key
-LLM_MODEL=gpt-4o
+LLM_MODEL=your_configured_model
 
 # Firebase (already configured)
 FIREBASE_PROJECT_ID=...
@@ -55,12 +55,20 @@ python -m app.main
 | `/health` | GET | Health check |
 | `/chat` | POST | Send message (non-streaming) |
 | `/chat/stream` | POST | Send message (SSE streaming) |
+| `/chat/submit` | POST | Queue agent/deepsearch task |
+| `/chat/tasks/{task_id}` | GET | Get queued task status |
+| `/chat/tasks/{task_id}/events` | GET | Poll queued task events |
+| `/chat/tasks/{task_id}/stream` | GET | Stream queued task events/final answer |
 | `/search` | POST | Web search |
-| `/history/{user_id}/{session_id}` | GET | Get chat history |
+| `/history/{session_id}` | GET | Get chat history |
+| `/users/me` | GET | Get current user profile |
+| `/users/init` | POST | Initialize/update backend user profile |
+| `/personalities/{user_id}` | GET | List personalities |
+| `/files/upload` | POST | Upload a file |
 
 ### WebSocket
 
-Connect to: `ws://localhost:8080/ws/chat`
+Connect to: `ws://127.0.0.1:8080/ws/chat`
 
 **Message Types:**
 

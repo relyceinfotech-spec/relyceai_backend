@@ -46,6 +46,7 @@ from app.agent.strategy_engine import merge_reasoning_tracks
 from app.llm.skill_router_runtime import record_skill_outcome, get_last_skill_trace
 from app.llm.token_counter import estimate_tokens as rough_estimate_tokens
 from app.safety.content_policy import classify_nsfw
+from app.chat.mode_mapper import normalize_chat_mode
 
 active_executions = {}
 _session_followup_cache: Dict[str, List[str]] = {}
@@ -219,7 +220,7 @@ def _apply_reasoning(create_kwargs: Dict[str, Any], model_to_use: str, sub_inten
 REASONING_VISIBLE_SUB_INTENTS = REASONING_SUB_INTENTS
 
 def _should_show_reasoning_panel(mode: str, sub_intent: str, user_settings: Optional[Dict] = None) -> bool:
-    if mode != "normal":
+    if normalize_chat_mode(mode) != "smart":
         return False
     visibility = ((user_settings or {}).get("personalization") or {}).get("thinkingVisibility", "auto")
     if visibility == "on":
@@ -333,12 +334,13 @@ def _is_factual_lookup_query(query: str) -> bool:
 def _resolve_runtime_intent(mode: str, routed_intent: str, query: str = "") -> str:
     """
     Execution intent policy by mode:
-    - agent/business: always structured agent path
-    - normal: prefer fast direct LLM path, keep deep-search for external lookups
+    - agent/research_pro: always structured agent path
+    - smart: prefer fast direct LLM path, keep deep-search for external lookups
     """
-    if mode in {"agent", "business"}:
+    mode = normalize_chat_mode(mode)
+    if mode in {"agent", "research_pro"}:
         return "AGENT"
-    if mode == "normal":
+    if mode == "smart":
         if _is_factual_lookup_query(query):
             return "AGENT"
         if routed_intent in {"DEEP_SEARCH", "EXTERNAL"}:
@@ -399,10 +401,6 @@ def get_model_for_intent(mode: str, sub_intent: str, personality: Optional[Dict]
     if sub_intent in LOGIC_CODING_INTENTS:
         return ("openrouter", FAST_MODEL, None, False, "coding_fast")
 
-    # Business mode
-    if mode == "business":
-        return ("openrouter", LLM_MODEL, 0.4, False, "mode_override")
-
     # UI/creative requests: flash (cheap)
     if sub_intent in CREATIVE_INTENTS:
         return ("openrouter", FAST_MODEL, None, False, "creative_override")
@@ -427,6 +425,97 @@ class LLMProcessor:
     
     def __init__(self):
         self.model = LLM_MODEL
+
+    async def _call_model(self, messages: List[Dict[str, str]], **kwargs):
+        """
+        Backward-compatible model call hook used by older tests.
+        Returns (chunks, usage) shape.
+        """
+        client = get_openrouter_client()
+        req = {"model": self.model, "messages": messages, "stream": False}
+        req.update(kwargs or {})
+        response = await client.chat.completions.create(**req)
+        text = ""
+        if hasattr(response, "choices") and response.choices:
+            msg = response.choices[0].message
+            text = str(getattr(msg, "content", "") or "")
+        return [text], getattr(response, "usage", None)
+
+    async def stream_inference(
+        self,
+        *,
+        mode: str,
+        user_id: str,
+        user_query: str,
+        message_history: List[Dict[str, str]],
+        personality: Optional[Dict[str, Any]] = None,
+        sub_intent: str = "general_chat",
+        user_profile: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Legacy compatibility wrapper used by timeout/integration tests.
+        Keeps retrieval timeouts bounded and then streams model chunks.
+        """
+        _ = (mode, personality, sub_intent, user_profile)
+        try:
+            from app.context.query_planner import plan_query
+            plan = plan_query(user_query)
+        except Exception:
+            plan = {"needs_web": False, "needs_memory": False}
+
+        if plan.get("needs_memory"):
+            try:
+                from app.memory.knowledge_graph import retrieve_graph
+                from app.memory.vector_memory import retrieve_memories
+
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        retrieve_graph(user_id, user_query, limit=5),
+                        retrieve_memories(user_id, user_query, top_k=10, final_limit=5),
+                    ),
+                    timeout=0.6,
+                )
+            except Exception:
+                pass
+
+        if plan.get("needs_web"):
+            try:
+                from app.input_processing.web_fetch import fetch_and_extract
+
+                maybe_url = str(user_query or "").strip().split()[0]
+                await asyncio.wait_for(fetch_and_extract(maybe_url), timeout=5.0)
+            except Exception:
+                pass
+
+        chunks, _usage = await self._call_model(message_history or [])
+        for chunk in chunks:
+            yield str(chunk or "")
+
+    def normalize_headings(self, text: str) -> str:
+        """
+        Backward-compatible heading normalizer used by older formatting tests.
+        - Converts # to ##
+        - trims very long heading titles
+        - removes duplicate headings
+        """
+        seen = set()
+        out = []
+        for raw in str(text or "").splitlines():
+            line = raw.rstrip()
+            m = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+            if not m:
+                out.append(raw)
+                continue
+            heading = m.group(1).strip()
+            heading = re.sub(r"\s+", " ", heading)
+            if len(heading) > 48:
+                heading = heading[:48].rstrip()
+            key = heading.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f"## {heading}")
+        return "\n".join(out)
 
     @staticmethod
     def _inject_guard_messages(messages: List[Dict], user_query: Optional[str]) -> List[Dict]:
@@ -505,6 +594,7 @@ class LLMProcessor:
         
         sanitized = text
         sanitized = sanitized.replace("\u2014", " - ").replace("\u2013", " - ")
+        sanitized = sanitized.replace("\u2011", "-").replace("\u2019", "'").replace("\u2018", "'")
         # Remove mojibake emoji artifacts (e.g., "ðŸ¤”", "ðŸš€") caused by encoding mismatch.
         sanitized = re.sub(r"ðŸ[\x80-\xBF]{2,4}", "", sanitized)
         sanitized = re.sub(r"Ã[\x80-\xBF]+", "", sanitized)
@@ -519,11 +609,34 @@ class LLMProcessor:
         sanitized = re.sub(r"^\s*Search Result\s*\d+\s*[:\-].*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         # Strip raw tool dump artifacts so users only see the final answer.
         sanitized = re.sub(r"^\s*(Title|Snippet Details|Link|Source Link|Copy text|Export)\s*[:\-]?.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*(Thoughts|Progress)\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*(Searching|Searched)\s+\"?.*\"?\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*Step completed\s*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*Sources collected\..*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        sanitized = re.sub(r"^\s*Looking for relevant and recent sources.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*##\s*Verification.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*(Verification Report|Accuracy Assessment|Completeness Assessment|Uncertainties|Improvements Recommended).*", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*.*tools?\s+disabled.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
         sanitized = re.sub(r"^\s*.*no external fetches possible.*$", "", sanitized, flags=re.IGNORECASE | re.MULTILINE)
+        # Enforce product identity in final user-visible text.
+        sanitized = re.sub(
+            r"^\s*As\s+Grok,\s*built\s+by\s+xAI,\s*",
+            "As Relyce AI, ",
+            sanitized,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        sanitized = re.sub(r"\bGrok\b", "Relyce AI", sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r"\bxAI\b", "Relyce", sanitized, flags=re.IGNORECASE)
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+
+        # Collapse accidental exact duplication when the same full answer is repeated twice.
+        core = sanitized.strip()
+        if len(core) >= 60:
+            half = len(core) // 2
+            left = core[:half].strip()
+            right = core[half:].strip()
+            if left and left == right:
+                sanitized = left
 
         return sanitized.strip() if trim_outer else sanitized
 
@@ -789,7 +902,7 @@ class LLMProcessor:
         user_query: str,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
-        mode: str = "normal",
+        mode: str = "smart",
         sub_intent: str = "general",
         user_id: Optional[str] = None,
         emotions: List[str] = [],
@@ -800,16 +913,17 @@ class LLMProcessor:
         Now supports PERSONALITY customization.
         """
         user_query = normalize_user_query(user_query)
+        mode = normalize_chat_mode(mode)
         if personality:
             system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, mode=mode)
         else:
-            if mode == "normal" and sub_intent == "general":
+            if mode == "smart" and sub_intent == "general":
                 # Main mode: single canonical structured explainer format.
-                system_prompt = get_system_prompt_for_mode("normal", user_settings, user_id, user_query)
+                system_prompt = get_system_prompt_for_mode("smart", user_settings, user_id, user_query)
             else:
                 from app.llm.router import _build_user_context_string
                 system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
-                if mode == "normal":
+                if mode == "smart":
                     from app.llm.router import NORMAL_MARKDOWN_POLISH
                     system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
 
@@ -881,7 +995,7 @@ class LLMProcessor:
     async def process_deep_search_query(
         self, 
         user_query: str, 
-        mode: str = "normal",
+        mode: str = "smart",
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
@@ -897,6 +1011,7 @@ class LLMProcessor:
         Returns: (response, tools_activated)
         """
         user_query = normalize_user_query(user_query)
+        mode = normalize_chat_mode(mode)
         # Select tools based on mode
         selected_tools = await select_tools_for_mode(user_query, mode)
         tools_dict = get_tools_for_mode(mode)
@@ -914,7 +1029,7 @@ class LLMProcessor:
         context_str = json.dumps(aggregated_context, indent=2)
         
         # Determine system prompt
-        if personality and mode == "normal":
+        if personality and mode == "smart":
             # ?? Personalities are ONLY honored in Normal Mode
             from app.llm.router import get_system_prompt_for_personality
             system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query, session_id=session_id)
@@ -983,18 +1098,24 @@ class LLMProcessor:
     async def process_message(
         self, 
         user_query: str, 
-        mode: str = "normal",
+        mode: str = "smart",
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
         user_id: Optional[str] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        file_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Main entry point - routes to appropriate handler.
         Returns complete response dict.
         """
         user_query = normalize_user_query(user_query)
+        mode = normalize_chat_mode(mode)
+        if file_ids:
+            runtime_settings = dict(user_settings or {})
+            runtime_settings["_runtime_file_ids"] = list(file_ids)
+            user_settings = runtime_settings
         # Analyze intent using the consolidated router
         analysis = await analyze_and_route_query(user_query, mode, personality=personality)
         routed_intent = analysis.get("intent", "DEEP_SEARCH")
@@ -1146,20 +1267,26 @@ class LLMProcessor:
     async def process_message_stream(
         self, 
         user_query: str, 
-        mode: str = "normal",
+        mode: str = "smart",
         context_messages: Optional[List[Dict]] = None,
         personality: Optional[Dict] = None,
         user_settings: Optional[Dict] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
         task_id: Optional[str] = None,
-        resume_graph: Optional[Any] = None
+        resume_graph: Optional[Any] = None,
+        file_ids: Optional[List[str]] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Streaming version of process_message.
         Yields tokens as they're generated.
         """
         user_query = normalize_user_query(user_query)
+        mode = normalize_chat_mode(mode)
+        if file_ids:
+            runtime_settings = dict(user_settings or {})
+            runtime_settings["_runtime_file_ids"] = list(file_ids)
+            user_settings = runtime_settings
         import time
         start_time = time.time()
         print(f"[LATENCY] Processing Stream Request... (Time: 0.0000s)")
@@ -1232,17 +1359,17 @@ class LLMProcessor:
             if personality:
                 system_prompt = get_internal_system_prompt_for_personality(personality, user_settings, user_id, mode=mode)
             else:
-                if mode == "normal" and sub_intent == "general":
+                if mode == "smart" and sub_intent == "general":
                     # Main mode: single canonical structured explainer format.
-                    system_prompt = get_system_prompt_for_mode("normal", user_settings, user_id, user_query, session_id=session_id)
+                    system_prompt = get_system_prompt_for_mode("smart", user_settings, user_id, user_query, session_id=session_id)
                 else:
                     from app.llm.router import _build_user_context_string
                     system_prompt = INTERNAL_SYSTEM_PROMPT + _build_user_context_string(user_settings)
-                    if mode == "normal":
+                    if mode == "smart":
                         from app.llm.router import NORMAL_MARKDOWN_POLISH
                         system_prompt = f"{system_prompt}\n{NORMAL_MARKDOWN_POLISH}"
         else:
-            if personality and mode == "normal":
+            if personality and mode == "smart":
                 from app.llm.router import get_system_prompt_for_personality
                 system_prompt = get_system_prompt_for_personality(personality, user_settings, user_id, user_query, session_id=session_id)
             else:
@@ -2036,68 +2163,80 @@ class LLMProcessor:
         tokens_yielded = 0
         followups_preview_sent = False
         
-        async for chunk in stream:
-            if first_token_time is None:
-                first_token_time = time.time()
-                print(f"[METRICS] Normal Stream TTFT: {first_token_time - start_time:.4f}s")
-            if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
-                r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
-                if isinstance(chunk.usage, dict):
-                    r_tokens = chunk.usage.get("reasoning_tokens", 0)
-                if r_tokens:
-                    yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
-                    
-            if not hasattr(chunk, "choices") or not chunk.choices: continue
-            delta = chunk.choices[0].delta
-            
-            # Check for GLM/model built-in reasoning tokens
-            if allow_reasoning_tokens:
-                reasoning_chunks_to_emit = []
-                reasoning = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
-                if reasoning:
-                    reasoning_chunks_to_emit.append(reasoning)
-                details = getattr(delta, 'reasoning_details', None)
-                if details:
-                    for item in details:
-                        if isinstance(item, dict):
-                            text_part = item.get("text") or item.get("summary")
-                        else:
-                            text_part = getattr(item, "text", None) or getattr(item, "summary", None)
-                        if text_part:
-                            reasoning_chunks_to_emit.append(text_part)
-                if reasoning_chunks_to_emit:
-                    for reasoning in reasoning_chunks_to_emit:
+        try:
+            async for chunk in stream:
+                if first_token_time is None:
+                    first_token_time = time.time()
+                    print(f"[METRICS] Normal Stream TTFT: {first_token_time - start_time:.4f}s")
+                if hasattr(chunk, "usage") and getattr(chunk, "usage", None):
+                    r_tokens = getattr(chunk.usage, "reasoning_tokens", 0)
+                    if isinstance(chunk.usage, dict):
+                        r_tokens = chunk.usage.get("reasoning_tokens", 0)
+                    if r_tokens:
+                        yield f"[INFO]INTEL:{{\"reasoning_tokens\": {r_tokens}}}"
+
+                if not hasattr(chunk, "choices") or not chunk.choices: continue
+                delta = chunk.choices[0].delta
+
+                # Check for GLM/model built-in reasoning tokens
+                if allow_reasoning_tokens:
+                    reasoning_chunks_to_emit = []
+                    reasoning = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
+                    if reasoning:
+                        reasoning_chunks_to_emit.append(reasoning)
+                    details = getattr(delta, 'reasoning_details', None)
+                    if details:
+                        for item in details:
+                            if isinstance(item, dict):
+                                text_part = item.get("text") or item.get("summary")
+                            else:
+                                text_part = getattr(item, "text", None) or getattr(item, "summary", None)
+                            if text_part:
+                                reasoning_chunks_to_emit.append(text_part)
+                    if reasoning_chunks_to_emit:
+                        for reasoning in reasoning_chunks_to_emit:
+                            if emit_raw_reasoning:
+                                if not in_reasoning:
+                                    in_reasoning = True
+                                    trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+                                    yield "[THINKING]"
+                                yield self._sanitize_output_text(reasoning, trim_outer=False)
+                            else:
+                                if not in_reasoning:
+                                    in_reasoning = True
+                                    trace.log("REASONING_START", f"model={model_to_use} (built-in)")
+
+                # Regular content
+                if delta.content:
+                    if in_reasoning:
+                        in_reasoning = False
+                        trace.log("REASONING_COMPLETE", "built-in reasoning done")
                         if emit_raw_reasoning:
-                            if not in_reasoning:
-                                in_reasoning = True
-                                trace.log("REASONING_START", f"model={model_to_use} (built-in)")
-                                yield "[THINKING]"
-                            yield self._sanitize_output_text(reasoning, trim_outer=False)
-                        else:
-                            if not in_reasoning:
-                                in_reasoning = True
-                                trace.log("REASONING_START", f"model={model_to_use} (built-in)")
-            
-            # Regular content
-            if delta.content:
-                if in_reasoning:
-                    in_reasoning = False
-                    trace.log("REASONING_COMPLETE", "built-in reasoning done")
-                    if emit_raw_reasoning:
-                        yield "[/THINKING]"
-                sanitized_chunk = self._sanitize_output_text(delta.content, trim_outer=False)
-                streamed_output += sanitized_chunk
-                if strict_structured_mode:
-                    # Buffer full answer and enforce rigid structure at end.
+                            yield "[/THINKING]"
+                    sanitized_chunk = self._sanitize_output_text(delta.content, trim_outer=False)
+                    streamed_output += sanitized_chunk
+                    if strict_structured_mode:
+                        # Buffer full answer and enforce rigid structure at end.
+                        tokens_yielded += 1
+                        continue
+                    if not followups_preview_sent:
+                        preview_payload = self._build_followup_payload(streamed_output, mode, session_id, persist=False)
+                        if preview_payload.get("followups") or preview_payload.get("action_chips"):
+                            yield f"[INFO]{json.dumps(preview_payload)}"
+                            followups_preview_sent = True
+                    yield sanitized_chunk
                     tokens_yielded += 1
-                    continue
-                if not followups_preview_sent:
-                    preview_payload = self._build_followup_payload(streamed_output, mode, session_id, persist=False)
-                    if preview_payload.get("followups") or preview_payload.get("action_chips"):
-                        yield f"[INFO]{json.dumps(preview_payload)}"
-                        followups_preview_sent = True
-                yield sanitized_chunk
-                tokens_yielded += 1                
+        except RuntimeError as stream_err:
+            if "event loop is closed" in str(stream_err).lower():
+                print("[RECOVERY] Stream aborted due to closed event loop; emitting fallback answer.")
+                fallback = self._sanitize_output_text(
+                    "I hit a temporary streaming issue, but I can still help with a concise answer."
+                )
+                if fallback:
+                    streamed_output += fallback
+                    yield fallback
+            else:
+                raise
         # Close reasoning if stream ended during reasoning
         if in_reasoning:
             trace.log("REASONING_COMPLETE", "built-in reasoning done")
@@ -2109,8 +2248,10 @@ class LLMProcessor:
             duration = end_time - first_token_time
             tps = tokens_yielded / duration if duration > 0 else 0
             print(f"[METRICS] Normal Stream Speed: {tps:.1f} tokens/sec ({tokens_yielded} tokens in {duration:.2f}s)")
-        # No backend structural rewriting.
-        yield streamed_output
+        # Emit full buffered output only for strict structured mode.
+        # In normal streaming mode, chunks are already yielded incrementally.
+        if strict_structured_mode:
+            yield streamed_output
 
         followup_payload = self._build_followup_payload(streamed_output, mode, session_id)
         yield f"[INFO]{json.dumps(followup_payload)}"
@@ -2130,7 +2271,7 @@ class LLMProcessor:
         start_time: float = 0.0,
         task_id: Optional[str] = None,
         resume_graph: Optional[Any] = None,
-        mode: str = "normal",
+        mode: str = "smart",
         intent: str = "AGENT",
         sub_intent: str = "general"
     ) -> AsyncGenerator[str, None]:
@@ -2147,13 +2288,14 @@ class LLMProcessor:
         )
         MAX_AGENT_STEPS = 50  # Completion Guard: generous cognitive cycles
         MAX_TOTAL_TOOL_CALLS = 100  # Effectively unlimited tool invocations per turn
+        DEBUG_AGENT_MESSAGES = False
         is_casual_query = _is_casual_query(user_query)
         is_profile_query = _is_profile_query(user_query)
 
         # Adaptive verification depth to avoid meta-verification loops on simple prompts.
         MIN_AGENT_STEPS = 1
         if _is_factual_lookup_query(user_query) or self._estimate_query_complexity(user_query) > 0.58:
-            MIN_AGENT_STEPS = 3
+            MIN_AGENT_STEPS = 2
         if is_casual_query or is_profile_query:
             MIN_AGENT_STEPS = 1
 
@@ -2185,11 +2327,45 @@ class LLMProcessor:
 
         # Tool access policy by mode
         # - Agent mode: full tool access (as decided by pipeline)
-        # - Normal/Business: limit to essential tools only
-        if mode == "normal" and agent_result.tool_allowed:
+        mode = normalize_chat_mode(mode)
+        # - Smart: limit to essential tools only
+        if mode == "smart" and agent_result.tool_allowed:
             normal_tools = {
                 "get_current_time",
                 "search_web",
+                "search_news",
+                "search_images",
+                "search_videos",
+                "search_places",
+                "search_maps",
+                "search_reviews",
+                "search_shopping",
+                "search_scholar",
+                "search_patents",
+                "search_weather",
+                "search_finance",
+                "search_currency",
+                "search_company",
+                "search_legal",
+                "search_jobs",
+                "search_academic",
+                "search_tech_docs",
+                "compare_products",
+                "search_products",
+                "search_competitors",
+                "search_trends",
+                "search_documents",
+                "summarize_url",
+                "extract_tables",
+                "faq_builder",
+                "sentiment_scan",
+                "document_compare",
+                "data_cleaner",
+                "unit_cost_calc",
+                "extract_entities",
+                "validate_code",
+                "generate_tests",
+                "web_fetch",
                 "calculate",
             }
             agent_result.allowed_tools = [
@@ -2198,15 +2374,31 @@ class LLMProcessor:
             if not agent_result.allowed_tools:
                 agent_result.tool_allowed = False
 
-        if mode == "business" and agent_result.tool_allowed:
+        if mode == "research_pro" and agent_result.tool_allowed:
             business_tools = {
                 "get_current_time",
                 "search_web",
                 "search_news",
+                "search_images",
+                "search_videos",
+                "search_places",
+                "search_maps",
+                "search_reviews",
+                "search_shopping",
+                "search_scholar",
+                "search_patents",
                 "search_weather",
                 "search_finance",
                 "search_currency",
                 "search_company",
+                "search_legal",
+                "search_jobs",
+                "search_academic",
+                "search_tech_docs",
+                "compare_products",
+                "search_products",
+                "search_competitors",
+                "search_trends",
                 "search_documents",
                 "web_fetch",
                 "calculate",
@@ -2214,6 +2406,12 @@ class LLMProcessor:
                 "summarize_url",
                 "document_compare",
                 "faq_builder",
+                "sentiment_scan",
+                "data_cleaner",
+                "unit_cost_calc",
+                "extract_entities",
+                "validate_code",
+                "generate_tests",
             }
             agent_result.allowed_tools = [
                 t for t in agent_result.allowed_tools if t in business_tools
@@ -2291,7 +2489,11 @@ class LLMProcessor:
         # --- Register Execution Profile ---
         import uuid
         execution_id = str(uuid.uuid4())
-        active_executions[execution_id] = {"ctx": exec_ctx, "created_at": _time.time()}
+        active_executions[execution_id] = {
+            "ctx": exec_ctx,
+            "created_at": _time.time(),
+            "user_id": str(user_id or ""),
+        }
         yield f'[INFO]{_json.dumps({"execution_id": execution_id})}'
 
         if getattr(exec_ctx, 'memory_hits', 0) > 0:
@@ -2487,7 +2689,7 @@ class LLMProcessor:
             if resume_graph:
                 plan_graph = resume_graph
             else:
-                plan_graph = compile_plan_graph(session_id, task_id, user_query)
+                plan_graph = await compile_plan_graph(session_id, task_id, user_query)
             
             # Seed state with new graph snapshot
             update_task_graph(session_id, task_id, plan_graph.serialize(), new_status="RUNNING")
@@ -2653,9 +2855,10 @@ class LLMProcessor:
                 create_kwargs["temperature"] = temperature
             create_kwargs = self._guard_kwargs(create_kwargs, user_query)
             
-            print("\n\n--- MESSAGES DUMP ---")
-            print(repr(messages))
-            print("---------------------\n\n")
+            if DEBUG_AGENT_MESSAGES:
+                print("\n\n--- MESSAGES DUMP ---")
+                print(repr(messages))
+                print("---------------------\n\n")
                 
             def strip_execution_narration(text: str) -> str:
                 BLOCKED_PHRASES = [
@@ -2734,8 +2937,8 @@ class LLMProcessor:
                     break
 
                 tool_detected = True
-                if mode == "normal" and len(valid_calls) > 1:
-                    valid_calls = [valid_calls[0]]
+            if mode == "smart" and len(valid_calls) > 1:
+                valid_calls = [valid_calls[0]]
 
                 # Record the pre-tool text into full_response
                 first_call_idx = step_output.find("TOOL_CALL:")
@@ -2925,7 +3128,12 @@ class LLMProcessor:
                 break
 
         # --- FIX 3/7: Final Merge Response Pass (Silent Execution Mode) ---
-        if not exec_ctx.forced_finalize and not exec_ctx.final_delivery:
+        should_run_final_merge = (
+            not exec_ctx.forced_finalize
+            and not exec_ctx.final_delivery
+            and (step_count > 1 or bool(exec_ctx.tool_results) or bool(exec_ctx.degraded))
+        )
+        if should_run_final_merge:
             exec_ctx.final_delivery = True
             messages.append({
                 "role": "system",
@@ -3070,4 +3278,3 @@ Rules:
 
 # Global processor instance
 llm_processor = LLMProcessor()
-

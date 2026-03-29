@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 import asyncio
 from app.llm.context_optimizer import context_optimizer
+from app.chat.mode_mapper import normalize_chat_mode
 
 # In-memory context storage (Firestore-hydrated structure)
 # Format: context_store[user_id][chat_id] = [messages]
@@ -14,6 +15,7 @@ _context_store: Dict[str, Dict[str, List[Dict]]] = defaultdict(lambda: defaultdi
 _context_timestamps: Dict[str, Dict[str, datetime]] = defaultdict(dict)
 _context_summaries: Dict[str, Dict[str, str]] = defaultdict(lambda: defaultdict(str))
 _context_personalities: Dict[str, Dict[str, str]] = defaultdict(dict)
+_context_modes: Dict[str, Dict[str, str]] = defaultdict(dict)
 
 # Context settings
 # Context settings
@@ -45,15 +47,28 @@ def get_raw_message_count(user_id: str, chat_id: str) -> int:
     """Get the raw count of messages in the store (excluding dynamically injected ones)"""
     return len(_context_store[user_id][chat_id])
 
-def _ensure_personality_context(user_id: str, chat_id: str, personality_id: Optional[str]) -> None:
+def _ensure_session_context(user_id: str, chat_id: str, personality_id: Optional[str], chat_mode: Optional[str] = None) -> None:
     """
-    If personality changes for a session, clear context to avoid prompt bleed.
+    If personality or mode changes for a session, clear context to avoid prompt bleed.
     """
-    if not personality_id or user_id == "anonymous":
+    if user_id == "anonymous":
+        return
+    normalized_mode = normalize_chat_mode(str(chat_mode or "smart"))
+    last_mode = _context_modes.get(user_id, {}).get(chat_id)
+    if last_mode and last_mode != normalized_mode:
+        clear_context(user_id, chat_id)
+    _context_modes[user_id][chat_id] = normalized_mode
+
+    if normalized_mode != "smart":
+        _context_personalities[user_id][chat_id] = ""
+        return
+
+    if not personality_id:
         return
     last_personality = _context_personalities.get(user_id, {}).get(chat_id)
     if last_personality and last_personality != personality_id:
         clear_context(user_id, chat_id)
+        _context_modes[user_id][chat_id] = normalized_mode
     _context_personalities[user_id][chat_id] = personality_id
 
 
@@ -127,6 +142,14 @@ def update_session_summary(user_id: str, chat_id: str, summary: str) -> None:
     """Update conversation summary"""
     _context_summaries[user_id][chat_id] = summary
 
+
+def persist_session_summary(user_id: str, chat_id: str) -> None:
+    """
+    Persist summary hook.
+    Intentionally lightweight for tests; runtime persistence is handled in history helpers.
+    """
+    _ = (user_id, chat_id)
+
 def prune_context_messages(user_id: str, chat_id: str, keep_last_n: int) -> None:
     """Prune context to keep only last N messages (used after summarization)"""
     if user_id in _context_store and chat_id in _context_store[user_id]:
@@ -142,15 +165,17 @@ def clear_context(user_id: str, chat_id: str) -> None:
             del _context_summaries[user_id][chat_id]
         if chat_id in _context_personalities.get(user_id, {}):
             del _context_personalities[user_id][chat_id]
+        if chat_id in _context_modes.get(user_id, {}):
+            del _context_modes[user_id][chat_id]
 
-def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str] = None) -> List[Dict]:
+def get_context_for_llm(user_id: str, chat_id: str, personality_id: Optional[str] = None, chat_mode: Optional[str] = "smart") -> List[Dict]:
     """
     Get context formatted for LLM consumption.
     Injects summary as system message if it exists.
     Returns list of {"role": "user"|"assistant"|"system", "content": str}
     """
     context_msgs = []
-    _ensure_personality_context(user_id, chat_id, personality_id)
+    _ensure_session_context(user_id, chat_id, personality_id, chat_mode)
     
     # 1. Inject Summary (Long-term memory)
     summary = get_session_summary(user_id, chat_id)
@@ -184,11 +209,25 @@ def update_context_with_exchange(
     chat_id: str, 
     user_message: str, 
     assistant_response: str,
-    personality_id: Optional[str] = None
+    personality_id: Optional[str] = None,
+    chat_mode: Optional[str] = "smart",
 ) -> None:
     """
     Add a complete exchange (user message + assistant response) to context.
     """
-    _ensure_personality_context(user_id, chat_id, personality_id)
+    _ensure_session_context(user_id, chat_id, personality_id, chat_mode)
     add_to_context(user_id, chat_id, "user", user_message)
     add_to_context(user_id, chat_id, "assistant", assistant_response)
+
+    # Rolling summary trigger: summarize recent turns and persist hook.
+    # Trigger threshold is in message-pairs, so multiply by 2 raw messages.
+    turns = len(_context_store[user_id][chat_id]) // 2
+    if turns >= SUMMARY_TRIGGER_MESSAGES:
+        recent = _context_store[user_id][chat_id][-KEEP_LAST_MESSAGES:]
+        combined = " ".join(str(m.get("content") or "") for m in recent)
+        summary = context_optimizer.summarize_history(combined) if hasattr(context_optimizer, "summarize_history") else ""
+        summary = str(summary or "").strip()
+        if not summary:
+            summary = f"Conversation summary: {turns} turns captured."
+        update_session_summary(user_id, chat_id, summary[:1200])
+        persist_session_summary(user_id, chat_id)

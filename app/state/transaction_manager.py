@@ -31,6 +31,10 @@ TOOL_CLASSIFICATOR = {
     "run_terminal_command": ToolClass.NON_TRANSACTIONAL, # External side effects!
     "WebhookCall": ToolClass.NON_TRANSACTIONAL,
     "search_web": ToolClass.REVERSIBLE, # Read-only, safe to include in transactions
+    "search_news": ToolClass.REVERSIBLE,
+    "search_scholar": ToolClass.REVERSIBLE,
+    "search_patents": ToolClass.REVERSIBLE,
+    "search_documents": ToolClass.REVERSIBLE,
     "search_weather": ToolClass.REVERSIBLE,
     "search_finance": ToolClass.REVERSIBLE,
     "search_currency": ToolClass.REVERSIBLE,
@@ -44,6 +48,7 @@ TOOL_CLASSIFICATOR = {
     "validate_code": ToolClass.REVERSIBLE,
     "generate_tests": ToolClass.REVERSIBLE,
     "summarize_url": ToolClass.REVERSIBLE,
+    "web_fetch": ToolClass.REVERSIBLE,
     "extract_tables": ToolClass.REVERSIBLE,
     "search_products": ToolClass.REVERSIBLE,
     "search_competitors": ToolClass.REVERSIBLE,

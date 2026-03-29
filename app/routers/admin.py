@@ -2,13 +2,15 @@
 Admin Router
 Handles administrative actions like role management and audit logging.
 """
-from fastapi import APIRouter, HTTPException, Depends, Body
+from fastapi import APIRouter, HTTPException, Depends, Body, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any, Dict, List
 import time
 from app.auth import get_firestore_db, get_current_user, is_admin_user, is_superadmin_user, normalize_role
 from datetime import datetime, timedelta, timezone
 from firebase_admin import auth as firebase_auth
+from app.platform import get_ai_platform
+from app.api.routes import admin as high_stakes_admin
 # Import reusable expiry logic
 from app.routers.users import check_membership_expiry, generate_unique_id
 
@@ -26,6 +28,49 @@ class UpdateMembershipRequest(BaseModel):
     payment: Optional[dict] = None
 
 
+class UpdateAgentDebugConfigRequest(BaseModel):
+    auto_tuning_enabled: Optional[bool] = None
+    auto_tuning_min_runs: Optional[int] = None
+    auto_tuning_success_threshold: Optional[float] = None
+    auto_tuning_cooldown_runs: Optional[int] = None
+    auto_tuning_budget_step_ms: Optional[int] = None
+    auto_tuning_retry_step: Optional[int] = None
+    auto_tuning_max_budget_delta_ms: Optional[int] = None
+    auto_tuning_max_retry_delta: Optional[int] = None
+    failure_confidence_threshold: Optional[float] = None
+    adaptive_enabled: Optional[bool] = None
+    adaptive_ema_alpha: Optional[float] = None
+    adaptive_min_cluster_runs: Optional[int] = None
+    adaptive_low_conf_threshold: Optional[float] = None
+    adaptive_retry_threshold: Optional[float] = None
+    adaptive_cooldown_runs: Optional[int] = None
+    adaptive_max_bias_delta: Optional[float] = None
+    adaptive_state_cache_ttl_sec: Optional[int] = None
+    adaptive_state_write_every_runs: Optional[int] = None
+    adaptive_apply_ratio: Optional[float] = None
+    auto_remediation_enabled: Optional[bool] = None
+    auto_remediation_min_runs: Optional[int] = None
+    auto_remediation_cooldown_runs: Optional[int] = None
+    auto_remediation_step: Optional[float] = None
+    auto_remediation_min_apply_ratio: Optional[float] = None
+    auto_remediation_low_conf_trigger: Optional[float] = None
+    auto_remediation_retry_step_cap: Optional[int] = None
+    auto_remediation_window_runs: Optional[int] = None
+    slo_p95_latency_ms_max: Optional[float] = None
+    slo_low_conf_rate_max: Optional[float] = None
+    slo_avg_retries_max: Optional[float] = None
+    slo_parallel_exception_rate_max: Optional[float] = None
+
+
+class AgentModeCheckRequest(BaseModel):
+    input: str
+    requested_mode: str = "smart"
+
+
+class AdaptiveSnapshotRequest(BaseModel):
+    label: Optional[str] = None
+
+
 def require_admin(user_info: dict = Depends(get_current_user)):
     if not is_admin_user(user_info):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
@@ -35,6 +80,146 @@ def require_superadmin(user_info: dict = Depends(get_current_user)):
     if not is_superadmin_user(user_info):
         raise HTTPException(status_code=403, detail="Insufficient permissions: SuperAdmin only")
     return user_info
+
+
+def _get_research_service_or_503():
+    platform = get_ai_platform()
+    service = platform.get_service("research")
+    if service is None:
+        raise HTTPException(status_code=503, detail="Research service unavailable")
+    if not hasattr(service, "get_debug_snapshot"):
+        raise HTTPException(status_code=503, detail="Research debug instrumentation unavailable")
+    return service
+
+
+def _build_ops_insights(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    totals = dict(snapshot.get("totals") or {})
+    per_mode_stats = list(snapshot.get("per_mode_stats") or [])
+    per_role_stats = list(snapshot.get("per_role_stats") or [])
+    failure_analyzer = dict(snapshot.get("failure_analyzer") or {})
+    confidence_distribution = dict(snapshot.get("confidence_distribution") or {})
+    override_recent = list((snapshot.get("override_insights") or {}).get("recent") or [])
+    role_flow_recent = list((snapshot.get("role_flow") or {}).get("recent") or [])
+    slo = dict(snapshot.get("slo") or {})
+    adaptive_learning = dict(snapshot.get("adaptive_learning") or {})
+    canary_compare = dict(adaptive_learning.get("canary_compare") or {})
+    tool_reliability = dict(snapshot.get("tool_reliability") or {})
+
+    total_runs = int(totals.get("runs", 0) or 0)
+    success_rate = float(totals.get("success_rate", 0.0) or 0.0)
+    low_conf_rate = float(confidence_distribution.get("low_pct", 0.0) or 0.0)
+    p95_latency_ms = float((slo.get("current") or {}).get("p95_latency_ms", 0.0) or 0.0)
+    parallel_exception_rate = 0.0
+    researcher_stats = next((row for row in per_role_stats if str(row.get("role") or "") == "researcher"), None)
+    if researcher_stats:
+        parallel_exception_rate = float(researcher_stats.get("parallel_exception_rate", 0.0) or 0.0)
+    parallel_exception_rate_max = float((slo.get("targets") or {}).get("parallel_exception_rate_max", 0.30) or 0.30)
+    avg_latency_ms = 0.0
+    if per_mode_stats:
+        avg_latency_ms = sum(float(m.get("avg_latency_ms", 0.0) or 0.0) for m in per_mode_stats) / max(1, len(per_mode_stats))
+
+    failure_items = list(failure_analyzer.get("items") or [])
+    low_conf_outputs = [
+        {
+            "timestamp": str(row.get("timestamp") or ""),
+            "query": str(row.get("query") or ""),
+            "confidence_level": str(row.get("confidence_level") or "LOW"),
+            "retries": int(row.get("retries", 0) or 0),
+            "mode": str(row.get("mode") or "smart"),
+        }
+        for row in failure_items[-20:]
+    ]
+
+    recent_chats = []
+    for row in failure_items[-30:]:
+        recent_chats.append(
+            {
+                "timestamp": str(row.get("timestamp") or ""),
+                "query": str(row.get("query") or ""),
+                "mode": str(row.get("mode") or "smart"),
+                "success": bool(row.get("success", False)),
+                "confidence_level": str(row.get("confidence_level") or "LOW"),
+            }
+        )
+
+    alerts: List[Dict[str, Any]] = []
+    if success_rate < 0.85:
+        alerts.append({"severity": "high", "code": "high_failure_rate", "message": f"Failure rate is {round((1.0 - success_rate) * 100, 1)}%."})
+    if p95_latency_ms > 12000:
+        alerts.append({"severity": "medium", "code": "slow_responses", "message": f"P95 latency is {int(p95_latency_ms)} ms."})
+    if low_conf_rate > 0.35:
+        alerts.append({"severity": "medium", "code": "low_confidence_spike", "message": f"Low-confidence outputs are {round(low_conf_rate * 100, 1)}%."})
+    if parallel_exception_rate > parallel_exception_rate_max:
+        alerts.append(
+            {
+                "severity": "medium",
+                "code": "parallel_exception_spike",
+                "message": (
+                    f"Parallel exception rate is {round(parallel_exception_rate * 100, 1)}% "
+                    f"(threshold {round(parallel_exception_rate_max * 100, 1)}%)."
+                ),
+            }
+        )
+    tool_failures = sum(1 for item in failure_items if int(item.get("retries", 0) or 0) > 1)
+    if tool_failures > 0:
+        alerts.append({"severity": "low", "code": "tool_failures", "message": f"{tool_failures} runs required repeated retries."})
+
+    logs: List[Dict[str, Any]] = []
+    for row in override_recent[-15:]:
+        logs.append(
+            {
+                "timestamp": str(row.get("at") or ""),
+                "level": "info",
+                "source": "mode_override",
+                "message": f"{row.get('auto_selected')} -> {row.get('overridden_to')} ({row.get('reason')})",
+            }
+        )
+    for row in role_flow_recent[-20:]:
+        logs.append(
+            {
+                "timestamp": str(row.get("at") or ""),
+                "level": "info",
+                "source": "role_flow",
+                "message": f"{row.get('node_id', 'node')} [{row.get('role', 'executor')}] {row.get('status', 'completed')}",
+            }
+        )
+    for row in low_conf_outputs[-10:]:
+        logs.append(
+            {
+                "timestamp": str(row.get("timestamp") or ""),
+                "level": "warn",
+                "source": "low_confidence",
+                "message": f"{row.get('mode')} confidence={row.get('confidence_level')} retries={row.get('retries')}",
+            }
+        )
+    logs.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
+    return {
+        "usage": {
+            "total_chats": total_runs,
+            "active_users": int(total_runs > 0),
+            "api_usage": total_runs,
+            "response_latency_ms": round(avg_latency_ms, 2),
+            "error_rate": round(max(0.0, 1.0 - success_rate), 4),
+        },
+        "chat_monitoring": {
+            "recent_chats": recent_chats[-20:],
+            "flagged_responses": int(len(low_conf_outputs)),
+            "low_confidence_outputs": low_conf_outputs,
+        },
+        "alerts": alerts,
+        "logs": logs[:50],
+        "canary_compare": {
+            "baseline": dict(canary_compare.get("baseline") or {}),
+            "adaptive": dict(canary_compare.get("adaptive") or {}),
+            "delta": dict(canary_compare.get("delta") or {}),
+        },
+        "tool_reliability": {
+            "count": int(tool_reliability.get("count", 0) or 0),
+            "top_tools": list(tool_reliability.get("top_tools") or [])[:10],
+            "weak_tools": list(tool_reliability.get("weak_tools") or [])[:10],
+        },
+    }
 
 @router.post("/change-role")
 async def change_role(request: ChangeRoleRequest, user_info: dict = Depends(require_superadmin)):
@@ -93,6 +278,131 @@ async def change_role(request: ChangeRoleRequest, user_info: dict = Depends(requ
     except Exception as e:
         print(f"[Admin] Role change error: {e}")
         raise HTTPException(status_code=500, detail="Failed to update role")
+
+
+@router.get("/agent-debug")
+async def get_agent_debug(
+    range: str = Query(default="24h"),
+    limit: int = Query(default=25, ge=5, le=100),
+    user_info: dict = Depends(require_superadmin),
+):
+    """
+    Admin debug panel data for hybrid/agent behavior:
+    per-mode stats, override insights, confidence distribution, failure analyzer.
+    """
+    _ = user_info
+    service = _get_research_service_or_503()
+    snapshot = service.get_debug_snapshot(range_window=range, limit=limit)
+    return {"success": True, "data": snapshot}
+
+
+@router.get("/ops-insights")
+async def get_ops_insights(
+    range: str = Query(default="24h"),
+    limit: int = Query(default=25, ge=5, le=100),
+    user_info: dict = Depends(require_admin),
+):
+    """
+    Admin-safe operational insights:
+    usage dashboard, chat monitoring, alerts, and basic logs.
+    """
+    _ = user_info
+    service = _get_research_service_or_503()
+    snapshot = service.get_debug_snapshot(range_window=range, limit=limit)
+    return {"success": True, "data": _build_ops_insights(snapshot)}
+
+
+@router.post("/agent-debug/mode-check")
+async def get_agent_mode_check(
+    request: AgentModeCheckRequest,
+    user_info: dict = Depends(require_superadmin),
+):
+    """
+    One-shot mode/lane/override inspection for a specific input.
+    Useful for debugging mode mismatches and slow-path routing.
+    """
+    _ = user_info
+    if not str(request.input or "").strip():
+        raise HTTPException(status_code=400, detail="input is required")
+
+    service = _get_research_service_or_503()
+    if not hasattr(service, "get_mode_check"):
+        raise HTTPException(status_code=503, detail="Mode check instrumentation unavailable")
+
+    result = service.get_mode_check(
+        input_text=str(request.input or ""),
+        requested_mode=str(request.requested_mode or "smart"),
+    )
+    return {"success": True, "data": result}
+
+
+@router.get("/high-stakes-metrics")
+async def get_high_stakes_metrics(
+    range: str = Query(default="24h"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=5, le=100),
+    user_info: dict = Depends(require_admin),
+):
+    return await high_stakes_admin.high_stakes_metrics(
+        range=range,
+        page=page,
+        page_size=page_size,
+        user_info=user_info,
+    )
+
+
+@router.get("/high-stakes-thresholds")
+async def get_high_stakes_thresholds(
+    user_info: dict = Depends(require_admin),
+):
+    return await high_stakes_admin.get_thresholds(user_info=user_info)
+
+
+@router.put("/high-stakes-thresholds")
+async def update_high_stakes_thresholds(
+    payload: dict = Body(default={}),
+    user_info: dict = Depends(require_superadmin),
+):
+    return await high_stakes_admin.update_thresholds(payload=payload, user_info=user_info)
+
+
+@router.put("/agent-debug-config")
+async def update_agent_debug_config(
+    request: UpdateAgentDebugConfigRequest,
+    user_info: dict = Depends(require_superadmin),
+):
+    """
+    SuperAdmin-only tuning knobs for auto self-improvement hooks + failure analyzer.
+    """
+    _ = user_info
+    service = _get_research_service_or_503()
+    cfg = service.update_debug_config(request.model_dump(exclude_none=True))
+    return {"success": True, "config": cfg}
+
+
+@router.post("/agent-debug/adaptive/snapshot")
+async def create_adaptive_snapshot(
+    request: AdaptiveSnapshotRequest = Body(default=AdaptiveSnapshotRequest()),
+    user_info: dict = Depends(require_superadmin),
+):
+    _ = user_info
+    service = _get_research_service_or_503()
+    if not hasattr(service, "create_adaptive_snapshot"):
+        raise HTTPException(status_code=503, detail="Adaptive snapshot tooling unavailable")
+    result = service.create_adaptive_snapshot(label=str(request.label or "manual"))
+    return {"success": True, "data": result}
+
+
+@router.post("/agent-debug/adaptive/rollback")
+async def rollback_adaptive_snapshot(
+    user_info: dict = Depends(require_superadmin),
+):
+    _ = user_info
+    service = _get_research_service_or_503()
+    if not hasattr(service, "rollback_latest_adaptive_snapshot"):
+        raise HTTPException(status_code=503, detail="Adaptive rollback tooling unavailable")
+    result = service.rollback_latest_adaptive_snapshot()
+    return {"success": True, "data": result}
 
 
 @router.post("/membership/update")
