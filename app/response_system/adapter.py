@@ -106,6 +106,7 @@ def build_final_answer_payload(raw_result: Dict[str, Any], user_query: str = "",
     if is_structured_mode(mode):
         structured = dict(normalized.get("structured_response", {}) or {})
         structured["answer"] = answer
+        structured["response"] = str(normalized.get("response") or "")
         structured.setdefault("summary", answer)
         metadata = structured.get("metadata") if isinstance(structured.get("metadata"), dict) else {}
         metadata.setdefault("mode", mode)

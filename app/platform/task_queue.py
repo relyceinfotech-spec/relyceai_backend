@@ -243,7 +243,9 @@ class AgentTaskQueue:
                 return out
 
             user_query = str(getattr(task.request, "user_query", "") or "").strip()
-            answer = str(out.get("answer") or out.get("response") or "").strip()
+            # Persist the full normalized response first so refresh/history
+            # matches what users saw during streaming; fallback to answer.
+            answer = str(out.get("response") or out.get("answer") or "").strip()
             if not user_query or not answer:
                 return out
 
@@ -328,11 +330,13 @@ class AgentTaskQueue:
                         text=text,
                     )
         payload = build_final_answer_payload(
-            {"response": final_answer or full_response, "confidence": confidence},
+            {"response": full_response or final_answer, "confidence": confidence},
             user_query=task.request.user_query,
             chat_mode=task.request.chat_mode,
         )
         normalized = self._ensure_final_payload_shape(payload, task.request)
+        if not str(normalized.get("response") or "").strip():
+            normalized["response"] = str(full_response or final_answer or "").strip()
         if not str(normalized.get("answer") or "").strip():
             normalized["answer"] = str(final_answer or full_response or "").strip()
         metadata = normalized.get("metadata")

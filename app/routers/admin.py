@@ -3,9 +3,12 @@ Admin Router
 Handles administrative actions like role management and audit logging.
 """
 from fastapi import APIRouter, HTTPException, Depends, Body, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional, Any, Dict, List
 import time
+import io
+import csv
 from app.auth import get_firestore_db, get_current_user, is_admin_user, is_superadmin_user, normalize_role
 from datetime import datetime, timedelta, timezone
 from firebase_admin import auth as firebase_auth
@@ -69,6 +72,12 @@ class AgentModeCheckRequest(BaseModel):
 
 class AdaptiveSnapshotRequest(BaseModel):
     label: Optional[str] = None
+
+
+class BulkMembershipRequest(BaseModel):
+    target_uids: List[str]
+    plan: str
+    billing_cycle: str = "monthly"
 
 
 def require_admin(user_info: dict = Depends(get_current_user)):
@@ -221,6 +230,73 @@ def _build_ops_insights(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
+
+def _to_iso(value: Any) -> str:
+    try:
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value or "")
+    except Exception:
+        return ""
+
+
+def _build_admin_debug_readonly(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    totals = dict(snapshot.get("totals") or {})
+    per_mode_stats = list(snapshot.get("per_mode_stats") or [])
+    per_role_stats = list(snapshot.get("per_role_stats") or [])
+    confidence_distribution = dict(snapshot.get("confidence_distribution") or {})
+    override = dict(snapshot.get("override_insights") or {})
+    role_flow = dict(snapshot.get("role_flow") or {})
+    failure = dict(snapshot.get("failure_analyzer") or {})
+
+    recent_failure_items = list(failure.get("items") or [])[-20:]
+    safe_failures = [
+        {
+            "timestamp": str(item.get("timestamp") or ""),
+            "mode": str(item.get("mode") or "smart"),
+            "confidence_level": str(item.get("confidence_level") or "LOW"),
+            "retries": int(item.get("retries", 0) or 0),
+            "success": bool(item.get("success", False)),
+            "query_preview": str(item.get("query") or "")[:180],
+        }
+        for item in recent_failure_items
+    ]
+
+    safe_role_recent = []
+    for row in list(role_flow.get("recent") or [])[-25:]:
+        safe_role_recent.append(
+            {
+                "at": str(row.get("at") or ""),
+                "node_id": str(row.get("node_id") or ""),
+                "role": str(row.get("role") or "executor"),
+                "status": str(row.get("status") or ""),
+            }
+        )
+
+    return {
+        "totals": {
+            "runs": int(totals.get("runs", 0) or 0),
+            "successes": int(totals.get("successes", 0) or 0),
+            "success_rate": float(totals.get("success_rate", 0.0) or 0.0),
+        },
+        "per_mode_stats": per_mode_stats,
+        "per_role_stats": per_role_stats,
+        "confidence_distribution": confidence_distribution,
+        "override_insights": {
+            "count": int(override.get("count", 0) or 0),
+            "reason_counts": dict(override.get("reason_counts") or {}),
+            "recent": list(override.get("recent") or [])[-20:],
+        },
+        "role_flow": {
+            "count": int(role_flow.get("count", 0) or 0),
+            "recent": safe_role_recent,
+        },
+        "failure_analyzer": {
+            "count": int(failure.get("count", 0) or 0),
+            "items": safe_failures,
+        },
+    }
+
 @router.post("/change-role")
 async def change_role(request: ChangeRoleRequest, user_info: dict = Depends(require_superadmin)):
     """
@@ -294,6 +370,22 @@ async def get_agent_debug(
     service = _get_research_service_or_503()
     snapshot = service.get_debug_snapshot(range_window=range, limit=limit)
     return {"success": True, "data": snapshot}
+
+
+@router.get("/agent-debug-readonly")
+async def get_agent_debug_readonly(
+    range: str = Query(default="24h"),
+    limit: int = Query(default=25, ge=5, le=100),
+    user_info: dict = Depends(require_admin),
+):
+    """
+    Admin-safe read-only AI debug snapshot.
+    Excludes tuning knobs and mutation controls.
+    """
+    _ = user_info
+    service = _get_research_service_or_503()
+    snapshot = service.get_debug_snapshot(range_window=range, limit=limit)
+    return {"success": True, "data": _build_admin_debug_readonly(snapshot)}
 
 
 @router.get("/ops-insights")
@@ -481,6 +573,181 @@ async def update_membership(request: UpdateMembershipRequest, user_info: dict = 
     })
 
     return {"success": True, "message": "Membership updated"}
+
+
+@router.post("/membership/bulk-update")
+async def bulk_update_membership(request: BulkMembershipRequest, user_info: dict = Depends(require_admin)):
+    """
+    Bulk membership updater for Admin/SuperAdmin operations.
+    """
+    db = get_firestore_db()
+    now = datetime.now(timezone.utc)
+    plan = normalize_role(request.plan)
+    if plan not in ["free", "starter", "plus", "pro", "business", "premium", "student"]:
+        raise HTTPException(status_code=400, detail="Invalid plan for bulk update")
+
+    results: List[Dict[str, Any]] = []
+    success = 0
+    failed = 0
+
+    for raw_uid in list(request.target_uids or []):
+        uid = str(raw_uid or "").strip()
+        if not uid:
+            continue
+        try:
+            target_ref = db.collection("users").document(uid)
+            target_doc = target_ref.get()
+            if not target_doc.exists:
+                failed += 1
+                results.append({"uid": uid, "ok": False, "error": "user_not_found"})
+                continue
+
+            base_date = now
+            membership = (target_doc.to_dict() or {}).get("membership", {}) or {}
+            existing_expiry_str = membership.get("expiryDate")
+            if existing_expiry_str:
+                try:
+                    existing_expiry = datetime.fromisoformat(str(existing_expiry_str).replace("Z", "+00:00"))
+                    if existing_expiry > now:
+                        base_date = existing_expiry
+                except Exception:
+                    pass
+
+            if request.billing_cycle == "yearly":
+                expiry_date = base_date + timedelta(days=365)
+            else:
+                expiry_date = base_date + timedelta(days=30)
+
+            updates = {
+                "membership.plan": plan,
+                "membership.planName": str(plan).capitalize(),
+                "membership.status": "active",
+                "membership.billingCycle": request.billing_cycle,
+                "membership.paymentStatus": "paid" if plan != "free" else "free",
+                "membership.startDate": now.isoformat(),
+                "membership.expiryDate": None if plan == "free" else expiry_date.isoformat(),
+                "membership.updatedAt": now,
+            }
+            target_ref.update(updates)
+            success += 1
+            results.append({"uid": uid, "ok": True})
+        except Exception as e:
+            failed += 1
+            results.append({"uid": uid, "ok": False, "error": str(e)[:180]})
+
+    db.collection("auditLogs").add({
+        "action": "BULK_MEMBERSHIP_CHANGED",
+        "by": user_info["uid"],
+        "target_count": len(list(request.target_uids or [])),
+        "details": {
+            "plan": plan,
+            "billingCycle": request.billing_cycle,
+            "success": success,
+            "failed": failed,
+        },
+        "timestamp": now,
+        "time": now.timestamp(),
+    })
+
+    return {
+        "success": True,
+        "summary": {"requested": len(list(request.target_uids or [])), "success": success, "failed": failed},
+        "results": results[-200:],
+    }
+
+
+@router.get("/audit-logs")
+async def get_audit_logs(
+    limit: int = Query(default=50, ge=5, le=500),
+    action: str = Query(default=""),
+    actor_uid: str = Query(default=""),
+    target_uid: str = Query(default=""),
+    user_info: dict = Depends(require_admin),
+):
+    _ = user_info
+    db = get_firestore_db()
+    rows: List[Dict[str, Any]] = []
+    try:
+        docs = db.collection("auditLogs").order_by("timestamp", direction="DESCENDING").limit(limit).stream()
+        for doc in docs:
+            data = doc.to_dict() or {}
+            rows.append(
+                {
+                    "id": doc.id,
+                    "action": str(data.get("action") or ""),
+                    "by": str(data.get("by") or ""),
+                    "target": str(data.get("target") or ""),
+                    "details": data.get("details") if isinstance(data.get("details"), dict) else {},
+                    "timestamp": _to_iso(data.get("timestamp")) or str(data.get("time") or ""),
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch audit logs: {e}")
+
+    if action:
+        rows = [r for r in rows if str(r.get("action") or "").lower() == str(action).lower()]
+    if actor_uid:
+        rows = [r for r in rows if str(r.get("by") or "") == str(actor_uid)]
+    if target_uid:
+        rows = [r for r in rows if str(r.get("target") or "") == str(target_uid)]
+
+    return {"success": True, "items": rows, "count": len(rows)}
+
+
+@router.get("/export/users")
+async def export_users(
+    format: str = Query(default="json"),
+    user_info: dict = Depends(require_admin),
+):
+    _ = user_info
+    db = get_firestore_db()
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        docs = db.collection("users").stream()
+        for doc in docs:
+            data = doc.to_dict() or {}
+            membership = data.get("membership") if isinstance(data.get("membership"), dict) else {}
+            rows.append(
+                {
+                    "uid": doc.id,
+                    "email": str(data.get("email") or ""),
+                    "displayName": str(data.get("displayName") or ""),
+                    "role": str(data.get("role") or "user"),
+                    "plan": str(membership.get("plan") or "free"),
+                    "billingCycle": str(membership.get("billingCycle") or ""),
+                    "status": str(membership.get("status") or ""),
+                    "expiryDate": str(membership.get("expiryDate") or ""),
+                    "createdAt": _to_iso(data.get("createdAt")),
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to export users: {e}")
+
+    if str(format or "").lower() == "json":
+        return {"success": True, "count": len(rows), "items": rows}
+
+    if str(format or "").lower() != "csv":
+        raise HTTPException(status_code=400, detail="unsupported format")
+
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["uid", "email", "display_name", "role", "plan", "billing_cycle", "status", "expiry_date", "created_at"])
+    for row in rows:
+        writer.writerow(
+            [
+                row.get("uid", ""),
+                row.get("email", ""),
+                row.get("displayName", ""),
+                row.get("role", ""),
+                row.get("plan", ""),
+                row.get("billingCycle", ""),
+                row.get("status", ""),
+                row.get("expiryDate", ""),
+                row.get("createdAt", ""),
+            ]
+        )
+    return Response(content=out.getvalue().encode("utf-8"), media_type="text/csv")
 
 @router.get("/users/{target_uid}")
 async def get_user(target_uid: str, user_info: dict = Depends(require_admin)):

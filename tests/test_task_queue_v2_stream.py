@@ -14,6 +14,13 @@ class _FakePlatform:
         yield " world"
 
 
+class _FakePlatformWithShortFinalAnswer:
+    async def run_stream(self, request):
+        yield '[INFO] {"event":"task_progress","message":"Planning","percent":10}'
+        yield "Full streamed answer with rich details and context."
+        yield '[INFO] {"event":"final_answer","answer":"Short summary"}'
+
+
 async def _collect_until_done(queue: AgentTaskQueue, task_id: str, timeout_s: float = 5.0):
     deadline = asyncio.get_running_loop().time() + timeout_s
     last_seq = 0
@@ -160,5 +167,51 @@ def test_streamed_tasks_persist_history_with_auth_uid(monkeypatch):
         assert captured["chat_mode"] == "normal"
         assert captured["include_message_count"] is True
         assert task and task.result and task.result.get("message_id") == "msg-123"
+
+    asyncio.run(_run())
+
+
+def test_streamed_tasks_persist_full_response_not_short_final_answer(monkeypatch):
+    async def _run():
+        captured = {}
+
+        def _fake_persist_exchange_and_schedule_summary(
+            *,
+            user_id,
+            session_id,
+            user_text,
+            assistant_text,
+            personality_id,
+            chat_mode="normal",
+            include_message_count=True,
+        ):
+            captured["assistant_text"] = assistant_text
+            return "msg-456"
+
+        monkeypatch.setattr(task_queue_mod, "get_ai_platform", lambda: _FakePlatformWithShortFinalAnswer())
+        monkeypatch.setattr(
+            runtime_helpers,
+            "persist_exchange_and_schedule_summary",
+            _fake_persist_exchange_and_schedule_summary,
+        )
+
+        queue = AgentTaskQueue()
+        await queue.start(fast_workers=1, heavy_workers=1)
+        try:
+            req = CapabilityRequest(
+                user_query="persist full streamed content",
+                chat_mode="research_pro",
+                user_id="memory-user-id",
+                session_id="session-88",
+                metadata={"auth_uid": "firebase-uid-10"},
+            )
+            task_id = await queue.submit(req)
+            await _collect_until_done(queue, task_id)
+        finally:
+            await queue.shutdown()
+
+        saved = str(captured.get("assistant_text") or "")
+        assert "Full streamed answer with rich details and context." in saved
+        assert saved != "Short summary"
 
     asyncio.run(_run())
